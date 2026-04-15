@@ -12,7 +12,7 @@ model:
 
 campaign:
   type: register
-  fault_duration: permanent_infer   # "transient" = per-operator (MicroFI), "permanent" = whole inference
+  fault_duration: permanent   # "transient" = per-operator (MicroFI), "permanent" = whole inference
   register:
     target_ops:
       - CONV_2D
