@@ -257,8 +257,9 @@ def capture(
     lq: queue.Queue[str] = queue.Queue()
     stop = threading.Event()
 
-    with serial.Serial(serial_cfg.port, serial_cfg.baud, timeout=0.05) as ser:
-        print(f"[uart] Listening on {serial_cfg.port} @ {serial_cfg.baud} baud", file=sys.stderr)
+    port = serial_cfg.resolve_port()
+    with serial.Serial(port, serial_cfg.baud, timeout=0.05) as ser:
+        print(f"[uart] Listening on {port} @ {serial_cfg.baud} baud", file=sys.stderr)
 
         # Hardware reset
         ser.dtr = False
