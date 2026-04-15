@@ -114,7 +114,7 @@ def _uart_reader_thread(
         try:
             waiting = ser.in_waiting
             chunk = ser.read(waiting) if waiting else ser.read(1)
-        except serial.SerialException:
+        except (serial.SerialException, OSError, TypeError):
             break
         if not chunk:
             continue
@@ -254,6 +254,7 @@ def capture(
 
     valid = 0
     campaign_done = False
+    boot_ok = False
     lq: queue.Queue[str] = queue.Queue()
     stop = threading.Event()
 
@@ -278,72 +279,88 @@ def capture(
             try:
                 line = lq.get(timeout=float(serial_cfg.boot_timeout_s))
             except queue.Empty:
-                print("[ERROR] Boot timeout.", file=sys.stderr)
-                stop.set()
-                return
+                print(
+                    f"[ERROR] Boot timeout — device did not respond within "
+                    f"{serial_cfg.boot_timeout_s}s.\n"
+                    f"[ERROR] Possible causes:\n"
+                    f"[ERROR]   • Flash memory size mismatch (check PlatformIO warnings above)\n"
+                    f"[ERROR]   • Firmware crash at startup\n"
+                    f"[ERROR]   • Incorrect baud rate or serial port\n"
+                    f"[ERROR]   • Device not connected or not powered",
+                    file=sys.stderr,
+                )
+                break
             try:
                 payload = json.loads(line)
             except json.JSONDecodeError:
                 continue
             if payload.get("event") == "boot":
                 print("[uart] Boot received — campaign running.", file=sys.stderr)
+                boot_ok = True
                 break
 
-        # Main receive loop
-        while True:
-            line = lq.get()
-            if not line:
-                continue
+        # Main receive loop (only if boot succeeded)
+        if boot_ok:
+            while True:
+                line = lq.get()
+                if not line:
+                    continue
 
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                low = line.lower()
-                is_panic = any(m in low for m in _PANIC_MARKERS)
-                is_warn = any(m in low for m in _SYSTEM_WARNING_MARKERS)
-                if is_panic or is_warn:
-                    _append_jsonl(jsonl_path, {
-                        "event": "_system_warning",
-                        "warning_type": "panic" if is_panic else "system_warning",
-                        "uart_line": line[:500],
-                    })
-                else:
-                    print(f"[WARN] Non-JSON: {line[:200]}", file=sys.stderr)
-                continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    low = line.lower()
+                    is_panic = any(m in low for m in _PANIC_MARKERS)
+                    is_warn = any(m in low for m in _SYSTEM_WARNING_MARKERS)
+                    if is_panic or is_warn:
+                        _append_jsonl(jsonl_path, {
+                            "event": "_system_warning",
+                            "warning_type": "panic" if is_panic else "system_warning",
+                            "uart_line": line[:500],
+                        })
+                    else:
+                        print(f"[WARN] Non-JSON: {line[:200]}", file=sys.stderr)
+                    continue
 
-            event = payload.get("event")
+                event = payload.get("event")
 
-            if event == "progress":
-                phase = payload.get("phase", "?")
-                cur, tot = payload.get("current", 0), payload.get("total", 0)
-                pct = (cur / tot * 100) if tot else 0
-                print(f"[PROGRESS] {phase}: {cur}/{tot} ({pct:.1f}%)", file=sys.stderr)
-                continue
+                if event == "progress":
+                    phase = payload.get("phase", "?")
+                    cur, tot = payload.get("current", 0), payload.get("total", 0)
+                    pct = (cur / tot * 100) if tot else 0
+                    print(f"[PROGRESS] {phase}: {cur}/{tot} ({pct:.1f}%)", file=sys.stderr)
+                    continue
 
-            if event == "done":
-                campaign_done = True
-                print("[uart] Campaign finished.", file=sys.stderr)
-                break
+                if event == "done":
+                    campaign_done = True
+                    print("[uart] Campaign finished.", file=sys.stderr)
+                    break
 
-            _append_jsonl(jsonl_path, payload)
-            valid += 1
+                _append_jsonl(jsonl_path, payload)
+                valid += 1
 
-            if event == "result":
-                phase = payload.get("phase", payload.get("mode", "?"))
-                fid = payload.get("fault_id", "?")
-                img = payload.get("image_id", "?")
-                st = payload.get("injection_status", "?")
-                print(f"[RX {valid}] phase={phase} fault_id={fid} image={img} inj={st}", file=sys.stderr)
-                if on_result:
-                    on_result(payload)
+                if event == "result":
+                    phase = payload.get("phase", payload.get("mode", "?"))
+                    fid = payload.get("fault_id", "?")
+                    img = payload.get("image_id", "?")
+                    st = payload.get("injection_status", "?")
+                    print(f"[RX {valid}] phase={phase} fault_id={fid} image={img} inj={st}", file=sys.stderr)
+                    if on_result:
+                        on_result(payload)
 
-            if stop_after is not None and valid >= stop_after:
-                break
+                if stop_after is not None and valid >= stop_after:
+                    break
 
         stop.set()
         reader.join(timeout=2.0)
 
-    if not campaign_done:
+    if not boot_ok:
+        print(
+            "[ERROR] No data captured — aborting experiment.\n"
+            "[ERROR] No results file will be generated.",
+            file=sys.stderr,
+        )
+    elif not campaign_done:
         print("[WARN] Capture ended WITHOUT 'done' event — results may be incomplete.", file=sys.stderr)
 
     build_csv(jsonl_path, csv_path, campaign_type=campaign_type,

@@ -220,7 +220,7 @@ class Experiment:
     # Step 5: ANALYZE — classify
     # ------------------------------------------------------------------ #
 
-    def analyze(self, results_csv: Optional[Path] = None) -> Path | Dict[str, Path]:
+    def analyze(self, results_csv: Optional[Path] = None) -> Optional[Path | Dict[str, Path]]:
         """Classify captured results. Returns the classified CSV path(s)."""
         if self.cfg.campaign.type == "hybrid" and results_csv is None:
             classified: Dict[str, Path] = {}
@@ -238,6 +238,14 @@ class Experiment:
             return classified
         if results_csv is None:
             results_csv = self.out_dir / "results.csv"
+        if not results_csv.exists():
+            print(
+                f"[ERROR] Results file not found: {results_csv}\n"
+                "[ERROR] Cannot classify — the UART capture did not produce results.\n"
+                "[ERROR] Check earlier messages for boot timeout or flash warnings.",
+                file=sys.stderr,
+            )
+            return None
         classified_csv = self.out_dir / "classified_results.csv"
         print(f"[experiment] Classifying {results_csv}...", file=sys.stderr)
         classify_results(results_csv, classified_csv)
@@ -297,7 +305,13 @@ class Experiment:
             self.flash(verbose=verbose)
 
         self.run(stop_after=stop_after)
-        return self.analyze()
+        result = self.analyze()
+        if result is None:
+            print(
+                "[experiment] Experiment finished with errors — no classified results produced.",
+                file=sys.stderr,
+            )
+        return result
 
     # ------------------------------------------------------------------ #
     # Hybrid: sequential register + memory sub-campaigns
@@ -359,6 +373,13 @@ class Experiment:
 
             # Classify
             classified = sub_dir / "classified_results.csv"
+            if not csv.exists():
+                print(
+                    f"[ERROR] Results file not found for {sub_type}: {csv}\n"
+                    "[ERROR] Skipping classification — check boot timeout or flash warnings above.",
+                    file=sys.stderr,
+                )
+                continue
             print(f"[experiment] Classifying {csv}...", file=sys.stderr)
             classify_results(csv, classified)
             results[sub_type] = classified
