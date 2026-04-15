@@ -1,0 +1,49 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+
+# --- Pacotes / build ---
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# --- Testes / qualidade ---
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Segredos / ambiente local ---
+.env
+.env.*
+!.env.example
+
+# --- IDE / SO ---
+.idea/
+.vscode/*
+!.vscode/extensions.json
+.DS_Store
+Thumbs.db
+
+# --- Saídas de experimentos (descomente se NÃO quiser ignorar) ---
+runs/
+
+# --- PlatformIO (já listado em firmware/.gitignore; reforço na raiz) ---
+firmware/.pio/
+
+# --- Artefatos grandes gerados localmente (adicione pastas seus dados aqui) ---
+# *.csv
+# data/

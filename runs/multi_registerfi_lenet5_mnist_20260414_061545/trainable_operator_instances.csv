@@ -1,6 +1,0 @@
-op_index,op_name,num_inputs,num_outputs
-0,CONV_2D,3,1
-2,CONV_2D,3,1
-4,CONV_2D,3,1
-9,FULLY_CONNECTED,3,1
-10,FULLY_CONNECTED,3,1
