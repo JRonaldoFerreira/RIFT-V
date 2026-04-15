@@ -1,0 +1,3 @@
+dependencies:
+  espressif/esp-tflite-micro:
+    override_path: ../components/espressif__esp-tflite-micro

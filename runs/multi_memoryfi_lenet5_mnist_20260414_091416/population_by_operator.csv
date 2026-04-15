@@ -1,0 +1,11 @@
+op_index,op_name,tensor_index,tensor_name,population_items
+0,CONV_2D,12,le_net5_1/lenet5_1/conv1_1/Relu;le_net5_1/lenet5_1/conv1_1/BiasAdd;le_net5_1/lenet5_1/conv1_1/convolution;le_net5_1/lenet5_1/conv1_1/Squeeze,192
+0,CONV_2D,13,le_net5_1/lenet5_1/conv1_1/convolution,1200
+2,CONV_2D,10,le_net5_1/lenet5_1/conv2_1/Relu;le_net5_1/lenet5_1/conv2_1/BiasAdd;le_net5_1/lenet5_1/conv2_1/convolution;le_net5_1/lenet5_1/conv2_1/Squeeze,512
+2,CONV_2D,11,le_net5_1/lenet5_1/conv2_1/convolution,19200
+4,CONV_2D,8,le_net5_1/lenet5_1/conv3_1/Relu;le_net5_1/lenet5_1/conv3_1/BiasAdd;le_net5_1/lenet5_1/conv3_1/convolution;le_net5_1/lenet5_1/conv3_1/Squeeze,3840
+4,CONV_2D,9,le_net5_1/lenet5_1/conv3_1/convolution,384000
+9,FULLY_CONNECTED,6,le_net5_1/lenet5_1/fc1_1/Relu;le_net5_1/lenet5_1/fc1_1/BiasAdd,2688
+9,FULLY_CONNECTED,7,le_net5_1/lenet5_1/fc1_1/MatMul,80640
+10,FULLY_CONNECTED,4,le_net5_1/lenet5_1/fc2_1/BiasAdd,320
+10,FULLY_CONNECTED,5,le_net5_1/lenet5_1/fc2_1/MatMul,6720

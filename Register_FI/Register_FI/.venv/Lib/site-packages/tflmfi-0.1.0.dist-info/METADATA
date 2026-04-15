@@ -1,0 +1,185 @@
+Metadata-Version: 2.4
+Name: tflmfi
+Version: 0.1.0
+Summary: Unified Fault-Injection Framework for TFLite-Micro on ESP32
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.24
+Requires-Dist: pandas>=2.0
+Requires-Dist: pyserial>=3.5
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: tflite>=2.10
+Requires-Dist: flatbuffers>=23.5
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: ruff; extra == "dev"
+
+# tflmfi — Unified Fault-Injection Framework for TFLite-Micro
+
+Framework Python-orchestrado para campanhas de injeção de falhas (Register-FI e Memory-FI) em modelos TFLite-Micro executados em ESP32-C3.
+
+## Arquitetura
+
+```
+┌─────────────────────────────────────────────┐
+│  Python Control Plane  (tflmfi/)            │
+│                                             │
+│  YAML Config → prepare → build → flash      │
+│              → run (UART) → analyze          │
+├─────────────────────────────────────────────┤
+│  C++ Execution Plane  (firmware/)           │
+│                                             │
+│  main_unified.cpp + register_fi + memory_fi │
+│  Golden phase → Fault injection loop        │
+│  JSON-line UART protocol                    │
+└─────────────────────────────────────────────┘
+```
+
+## Estrutura do Projeto
+
+```
+framework_jose/
+├── tflmfi/                  # Pacote Python principal
+│   ├── __init__.py
+│   ├── config.py            # Loader de YAML + schema
+│   ├── population.py        # Parsing do modelo + geração de populações
+│   ├── headers.py           # Geração de headers C/C++
+│   ├── builder.py           # Orquestração PlatformIO (build/flash)
+│   ├── uart.py              # Receptor UART (JSONL + CSV)
+│   ├── classify.py          # Classificação de resultados
+│   └── experiment.py        # Ciclo de vida do experimento
+├── firmware/                # Firmware PlatformIO (C++)
+│   ├── src/
+│   │   ├── main_unified.cpp
+│   │   ├── register_fi.cc/h
+│   │   └── memory_fi.cc/h
+│   └── platformio.ini
+├── configs/                 # Exemplos de configuração YAML
+│   ├── memoryfi_example.yaml
+│   ├── registerfi_example.yaml
+│   └── hybrid_campaign.yaml
+├── models/                  # Modelo .tflite + subset .npz
+├── runs/                    # Saída gerada por experimentos
+├── tests/                   # Testes de integração
+├── legacy/                  # Scripts e projetos antigos (referência)
+├── run_experiment.py        # CLI entry point
+├── pyproject.toml           # Packaging / pip install
+└── requirements.txt
+```
+
+## Instalação
+
+```bash
+pip install -r requirements.txt
+```
+
+## Uso Rápido
+
+### Via CLI (pipeline completo)
+
+```bash
+# Campanha Memory-FI completa:
+python run_experiment.py configs/memoryfi_example.yaml
+
+# Campanha Register-FI completa:
+python run_experiment.py configs/registerfi_example.yaml
+```
+
+### Passos individuais
+
+```bash
+# Apenas preparar (população + headers):
+python run_experiment.py configs/memoryfi_example.yaml --step prepare
+
+# Apenas build:
+python run_experiment.py configs/memoryfi_example.yaml --step build
+
+# Apenas flash:
+python run_experiment.py configs/memoryfi_example.yaml --step flash
+
+# Apenas captura UART:
+python run_experiment.py configs/memoryfi_example.yaml --step run
+
+# Apenas análise:
+python run_experiment.py configs/memoryfi_example.yaml --step analyze --results runs/my_run/results.csv
+```
+
+### Via API Python
+
+```python
+from tflmfi import Experiment, load_config
+
+cfg = load_config("configs/registerfi_example.yaml")
+exp = Experiment(cfg)
+
+# Pipeline completo
+exp.execute()
+
+# Ou passo a passo
+exp.prepare()       # gera populações, amostra, headers, instala no firmware
+exp.build()         # pio run -e registerfi
+exp.flash()         # pio run -e registerfi -t upload
+exp.run()           # captura UART → results.csv + results.jsonl
+exp.analyze()       # classifica → classified_results.csv
+```
+
+## Configuração YAML
+
+O YAML define completamente o experimento. Exemplo mínimo:
+
+```yaml
+experiment:
+  name: meu_experimento
+  description: "Descrição do experimento"
+
+model:
+  tflite: "caminho/para/modelo.tflite"
+  subset_npz: "caminho/para/mnist_subset.npz"
+
+campaign:
+  type: memory   # ou "register" ou "hybrid"
+
+serial:
+  port: COM3
+  baud: 460800
+
+firmware:
+  src_dir: "Register_FI/Register_FI/src"
+```
+
+Seções opcionais (com defaults):
+- **sampling**: confidence=0.95, margin=0.05, seed=1337
+- **output**: dir="runs/{name}_{timestamp}"
+- **firmware**: platform, board, framework, arena_size_kb
+
+## Protocolo UART
+
+O firmware envia JSON lines via UART:
+
+| Evento | Exemplo |
+|--------|---------|
+| boot | `{"event":"boot","status":"ready"}` |
+| progress | `{"event":"progress","phase":"golden","current":50,"total":100}` |
+| result | `{"event":"result","phase":"fault","fault_model":"register",...}` |
+| done | `{"event":"done"}` |
+
+## Classificação de Resultados
+
+| Classe | Descrição |
+|--------|-----------|
+| Masked | Saída idêntica ao golden |
+| Acceptable | Mesma classe, variação < 5% |
+| Observed | Classe correta mas confiança alterada |
+| Warning | Mesma classe, queda > 5% na confiança |
+| Critical | Classe errada ou confiança < 80% |
+| Crash | Firmware crashed (WDT, panic) |
+| Good | Falha corrigiu uma predição errada |
+| NoInjection | Timer não disparou (só Register-FI) |
+
+## Requisitos
+
+- Python ≥ 3.10
+- PlatformIO CLI
+- ESP32-C3 conectado via USB
+- Modelo .tflite quantizado (int8)
+- Subconjunto MNIST em .npz

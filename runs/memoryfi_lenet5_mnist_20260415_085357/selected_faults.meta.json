@@ -1,0 +1,8 @@
+{
+  "method": "stratified_memory",
+  "population_size_total": 499312,
+  "selected_faults_total": 1811,
+  "confidence": 0.95,
+  "margin": 0.05,
+  "p": 0.5
+}

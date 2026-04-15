@@ -1,0 +1,53 @@
+# ──────────────────────────────────────────────────
+# Multi-Injection Register Campaign — Example Config
+# ──────────────────────────────────────────────────
+# Injects multiple simultaneous bit-flip faults per
+# inference (Multi-Event Upset / MEU simulation).
+
+experiment:
+  name: multi_registerfi_lenet5_mnist
+  description: "Multi-injection register-FI campaign on LeNet-5 (MNIST, int8) — 2 simultaneous faults"
+
+model:
+  tflite: "../models/lenet5_mnist_int8.tflite"
+  subset_npz: "../models/mnist_subset.npz"
+
+campaign:
+  type: register
+  fault_duration: permanent   # "transient" = per-operator (MicroFI), "permanent" = whole inference
+  register:
+    target_ops:
+      - CONV_2D
+      - DEPTHWISE_CONV_2D
+      - FULLY_CONNECTED
+    slot_count: 3
+    registers: all
+  multi_injection:
+    enabled: true
+    count: 2          # number of simultaneous faults per group
+    num_groups: 500   # how many random groups to generate
+    seed: 42          # reproducibility seed for group generation
+
+sampling:
+  method: stratified
+  confidence: 0.95
+  margin: 0.05
+  p_prior: 0.5
+  seed: 1337
+  group_by: [op_index, op_name]
+
+firmware:
+  src_dir: "../firmware/src"
+  platform: espressif32
+  board: esp32-c3-devkitm-1
+  framework: espidf
+  monitor_speed: 460800
+
+serial:
+  port: COM17
+  baud: 460800
+  boot_timeout_s: 30
+
+output:
+  dir: "../runs/{name}_{timestamp}"
+  formats: [csv, jsonl]

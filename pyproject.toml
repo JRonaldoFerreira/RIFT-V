@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tflmfi"
+version = "0.1.0"
+description = "Unified Fault-Injection Framework for TFLite-Micro on ESP32"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "pyserial>=3.5",
+    "pyyaml>=6.0",
+    "tflite>=2.10",
+    "flatbuffers>=23.5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+tflmfi = "tflmfi.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["tflmfi*"]

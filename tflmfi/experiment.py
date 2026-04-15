@@ -1,0 +1,372 @@
+"""Experiment lifecycle: prepare → build → flash → run → analyze."""
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from typing import Dict, Optional
+
+from tflmfi.config import ExperimentConfig, load_config
+from tflmfi.population import (
+    CampaignArtifacts,
+    ModelIntrospector,
+    prepare_memory_campaign,
+    prepare_register_campaign,
+)
+from tflmfi.headers import install_headers, write_headers
+from tflmfi import builder as pio_builder
+from tflmfi.uart import capture as uart_capture
+from tflmfi.classify import classify_results
+from tflmfi.analysis import generate_physical_report, PhysicalAnalysisReport
+
+
+class Experiment:
+    """High-level orchestrator for a fault-injection experiment.
+
+    Usage::
+
+        from tflmfi import Experiment, load_config
+
+        cfg = load_config("configs/memoryfi.yaml")
+        exp = Experiment(cfg)
+
+        exp.prepare()       # generate population, sample, headers
+        exp.build()         # pio build
+        exp.flash()         # pio upload
+        exp.run()           # UART capture
+        exp.analyze()       # classify results
+
+        # Or run the full pipeline:
+        exp.execute()
+    """
+
+    def __init__(self, cfg: ExperimentConfig):
+        self.cfg = cfg
+        self.out_dir: Path = cfg.resolve_output_dir()
+        self.artifacts: Optional[CampaignArtifacts] = None
+        self._reg_artifacts: Optional[CampaignArtifacts] = None
+        self._mem_artifacts: Optional[CampaignArtifacts] = None
+        self._introspector: Optional[ModelIntrospector] = None
+
+    # ------------------------------------------------------------------ #
+    # Step 1: PREPARE — population + sampling + header generation
+    # ------------------------------------------------------------------ #
+
+    def prepare(self) -> CampaignArtifacts:
+        """Generate population, sample, write headers, install into firmware."""
+        print(f"[experiment] Preparing campaign '{self.cfg.campaign.type}' → {self.out_dir}", file=sys.stderr)
+
+        self._introspector = ModelIntrospector(self.cfg.tflite_path)
+        ctype = self.cfg.campaign.type
+
+        if ctype == "register":
+            self.artifacts = prepare_register_campaign(
+                self._introspector, self.cfg.campaign, self.cfg.sampling, self.out_dir,
+            )
+            trainable_csv = self.out_dir / "trainable_operator_instances.csv"
+            mi = self.artifacts.multi_injection
+            write_headers(
+                "register",
+                self.artifacts.headers_dir,
+                self.cfg.tflite_path,
+                self.cfg.subset_npz_path,
+                self.artifacts.selected_csv,
+                trainable_ops_csv=trainable_csv,
+                groups_csv=self.artifacts.groups_csv,
+                multi_count=mi.count if mi and mi.enabled else 0,
+            )
+
+        elif ctype == "memory":
+            self.artifacts = prepare_memory_campaign(
+                self._introspector, self.cfg.campaign, self.cfg.sampling, self.out_dir,
+            )
+            tensor_records = list(self._introspector.collect_tensor_records().values())
+            mi = self.artifacts.multi_injection
+            write_headers(
+                "memory",
+                self.artifacts.headers_dir,
+                self.cfg.tflite_path,
+                self.cfg.subset_npz_path,
+                self.artifacts.selected_csv,
+                tensor_records=tensor_records,
+                groups_csv=self.artifacts.groups_csv,
+                multi_count=mi.count if mi and mi.enabled else 0,
+            )
+
+        elif ctype == "hybrid":
+            # Run both campaigns into sub-directories
+            reg_dir = self.out_dir / "register"
+            mem_dir = self.out_dir / "memory"
+
+            reg_artifacts = prepare_register_campaign(
+                self._introspector, self.cfg.campaign, self.cfg.sampling, reg_dir,
+            )
+            trainable_csv = reg_dir / "trainable_operator_instances.csv"
+            mi_reg = reg_artifacts.multi_injection
+            write_headers(
+                "register", reg_artifacts.headers_dir,
+                self.cfg.tflite_path, self.cfg.subset_npz_path,
+                reg_artifacts.selected_csv, trainable_ops_csv=trainable_csv,
+                groups_csv=reg_artifacts.groups_csv,
+                multi_count=mi_reg.count if mi_reg and mi_reg.enabled else 0,
+            )
+
+            mem_artifacts = prepare_memory_campaign(
+                self._introspector, self.cfg.campaign, self.cfg.sampling, mem_dir,
+            )
+            tensor_records = list(self._introspector.collect_tensor_records().values())
+            mi_mem = mem_artifacts.multi_injection
+            write_headers(
+                "memory", mem_artifacts.headers_dir,
+                self.cfg.tflite_path, self.cfg.subset_npz_path,
+                mem_artifacts.selected_csv, tensor_records=tensor_records,
+                groups_csv=mem_artifacts.groups_csv,
+                multi_count=mi_mem.count if mi_mem and mi_mem.enabled else 0,
+            )
+
+            self._reg_artifacts = reg_artifacts
+            self._mem_artifacts = mem_artifacts
+            # Use register as primary artifacts for header installation below
+            self.artifacts = reg_artifacts
+            print("[experiment] Hybrid: both register/ and memory/ artifacts generated.", file=sys.stderr)
+        else:
+            raise ValueError(f"Unknown campaign type: {ctype}")
+
+        # Install headers into firmware
+        installed = install_headers(
+            self.artifacts.campaign_type,
+            self.artifacts.headers_dir,
+            self.cfg.firmware_src_path,
+        )
+        print(f"[experiment] Installed {len(installed)} headers → {self.cfg.firmware_src_path}", file=sys.stderr)
+
+        # Write run manifest
+        manifest = {
+            "experiment": self.cfg.name,
+            "campaign_type": ctype,
+            "fault_duration": self.cfg.campaign.fault_duration,
+            "output_dir": str(self.out_dir),
+            "tflite": str(self.cfg.tflite_path),
+            "subset_npz": str(self.cfg.subset_npz_path),
+            "sampling": {
+                "confidence": self.cfg.sampling.confidence,
+                "margin": self.cfg.sampling.margin,
+                "p_prior": self.cfg.sampling.p_prior,
+                "seed": self.cfg.sampling.seed,
+            },
+        }
+        manifest_path = self.out_dir / "run_manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        print(f"[experiment] Manifest → {manifest_path}", file=sys.stderr)
+
+        return self.artifacts
+
+    # ------------------------------------------------------------------ #
+    # Step 2: BUILD
+    # ------------------------------------------------------------------ #
+
+    def build(self, verbose: bool = False) -> None:
+        """Build firmware for the configured campaign type."""
+        if self.cfg.campaign.type == "hybrid":
+            for ctype in ("register", "memory"):
+                print(f"[experiment] Building firmware (env={ctype})...", file=sys.stderr)
+                pio_builder.build(self.cfg, ctype, verbose=verbose)
+            print("[experiment] Both builds succeeded.", file=sys.stderr)
+            return
+        ctype = self.cfg.campaign.type
+        print(f"[experiment] Building firmware (env={ctype})...", file=sys.stderr)
+        pio_builder.build(self.cfg, ctype, verbose=verbose)
+        print("[experiment] Build succeeded.", file=sys.stderr)
+
+    # ------------------------------------------------------------------ #
+    # Step 3: FLASH
+    # ------------------------------------------------------------------ #
+
+    def flash(self, upload_port: Optional[str] = None, verbose: bool = False) -> None:
+        """Flash firmware onto the target board."""
+        if self.cfg.campaign.type == "hybrid":
+            print("[experiment] Note: standalone flash with hybrid only flashes register.", file=sys.stderr)
+            print("[experiment]       Use execute() for the full hybrid pipeline.", file=sys.stderr)
+        ctype = self.cfg.campaign.type if self.cfg.campaign.type != "hybrid" else "register"
+        port = upload_port or self.cfg.serial.port
+        print(f"[experiment] Flashing via {port} (env={ctype})...", file=sys.stderr)
+        pio_builder.flash(self.cfg, ctype, upload_port=port, verbose=verbose)
+        print("[experiment] Flash succeeded.", file=sys.stderr)
+
+    # ------------------------------------------------------------------ #
+    # Step 4: RUN — UART capture
+    # ------------------------------------------------------------------ #
+
+    def run(self, stop_after: Optional[int] = None) -> Path:
+        """Capture campaign results via UART. Returns the CSV path."""
+        jsonl = self.out_dir / "results.jsonl"
+        csv = self.out_dir / "results.csv"
+        ctype = self.cfg.campaign.type
+        mi = self.cfg.campaign.multi_injection
+        is_multi = bool(mi and mi.enabled)
+        groups_csv = self.artifacts.groups_csv if self.artifacts else None
+        print(f"[experiment] Capturing UART → {csv}", file=sys.stderr)
+        uart_capture(
+            self.cfg.serial, jsonl, csv,
+            stop_after=stop_after,
+            campaign_type=ctype,
+            is_multi=is_multi,
+            groups_csv=groups_csv,
+        )
+        print(f"[experiment] Capture complete → {csv}", file=sys.stderr)
+        return csv
+
+    # ------------------------------------------------------------------ #
+    # Step 5: ANALYZE — classify
+    # ------------------------------------------------------------------ #
+
+    def analyze(self, results_csv: Optional[Path] = None) -> Path | Dict[str, Path]:
+        """Classify captured results. Returns the classified CSV path(s)."""
+        if self.cfg.campaign.type == "hybrid" and results_csv is None:
+            classified: Dict[str, Path] = {}
+            for sub_type in ("register", "memory"):
+                sub_dir = self.out_dir / sub_type
+                csv = sub_dir / "results.csv"
+                out = sub_dir / "classified_results.csv"
+                if csv.exists():
+                    print(f"[experiment] Classifying {sub_type}: {csv}...", file=sys.stderr)
+                    classify_results(csv, out)
+                    classified[sub_type] = out
+                    print(f"[experiment] Classified {sub_type} → {out}", file=sys.stderr)
+                else:
+                    print(f"[experiment] Skipping {sub_type}: no results at {csv}", file=sys.stderr)
+            return classified
+        if results_csv is None:
+            results_csv = self.out_dir / "results.csv"
+        classified_csv = self.out_dir / "classified_results.csv"
+        print(f"[experiment] Classifying {results_csv}...", file=sys.stderr)
+        classify_results(results_csv, classified_csv)
+        print(f"[experiment] Classified → {classified_csv}", file=sys.stderr)
+        return classified_csv
+
+    # ------------------------------------------------------------------ #
+    # Step 5b: PHYSICAL ANALYSIS — model/RAM spatial analysis
+    # ------------------------------------------------------------------ #
+
+    def physical_analysis(
+        self,
+        run_dir: Optional[Path] = None,
+        bin_size: int = 128,
+    ) -> PhysicalAnalysisReport:
+        """Run model-physical analysis on classified results.
+
+        Returns a :class:`PhysicalAnalysisReport` with all tables.
+        """
+        target_dir = run_dir or self.out_dir
+        print(f"[experiment] Running physical memory analysis on {target_dir}...", file=sys.stderr)
+        report = generate_physical_report(target_dir, bin_size=bin_size)
+
+        saved = report.save(target_dir)
+        print(f"[experiment] Physical analysis: {len(saved)} files saved.", file=sys.stderr)
+        print(report.summary(), file=sys.stderr)
+        return report
+
+    # ------------------------------------------------------------------ #
+    # Full pipeline
+    # ------------------------------------------------------------------ #
+
+    def execute(
+        self,
+        skip_build: bool = False,
+        skip_flash: bool = False,
+        stop_after: Optional[int] = None,
+        verbose: bool = False,
+    ) -> Path | Dict[str, Path]:
+        """Run the full experiment pipeline: prepare → build → flash → run → analyze.
+
+        Returns the path to the classified results CSV.
+        For hybrid campaigns, returns a dict mapping sub-campaign name to CSV path.
+        """
+        self.prepare()
+
+        if self.cfg.campaign.type == "hybrid":
+            return self._execute_hybrid(
+                skip_build=skip_build, skip_flash=skip_flash,
+                stop_after=stop_after, verbose=verbose,
+            )
+
+        if not skip_build:
+            self.build(verbose=verbose)
+
+        if not skip_flash:
+            self.flash(verbose=verbose)
+
+        self.run(stop_after=stop_after)
+        return self.analyze()
+
+    # ------------------------------------------------------------------ #
+    # Hybrid: sequential register + memory sub-campaigns
+    # ------------------------------------------------------------------ #
+
+    def _execute_hybrid(
+        self,
+        skip_build: bool = False,
+        skip_flash: bool = False,
+        stop_after: Optional[int] = None,
+        verbose: bool = False,
+    ) -> Dict[str, Path]:
+        """Run register and memory sub-campaigns sequentially on the target."""
+        results: Dict[str, Path] = {}
+
+        for sub_type, artifacts in [
+            ("register", self._reg_artifacts),
+            ("memory", self._mem_artifacts),
+        ]:
+            sub_dir = self.out_dir / sub_type
+            print(f"\n[experiment] {'='*50}", file=sys.stderr)
+            print(f"[experiment]  Hybrid sub-campaign: {sub_type.upper()}", file=sys.stderr)
+            print(f"[experiment] {'='*50}", file=sys.stderr)
+
+            # Install sub-campaign headers into firmware src
+            installed = install_headers(
+                sub_type, artifacts.headers_dir, self.cfg.firmware_src_path,
+            )
+            print(f"[experiment] Installed {len(installed)} headers → {self.cfg.firmware_src_path}", file=sys.stderr)
+
+            # Build
+            if not skip_build:
+                print(f"[experiment] Building firmware (env={sub_type})...", file=sys.stderr)
+                pio_builder.build(self.cfg, sub_type, verbose=verbose)
+                print(f"[experiment] Build succeeded.", file=sys.stderr)
+
+            # Flash
+            if not skip_flash:
+                port = self.cfg.serial.port
+                print(f"[experiment] Flashing via {port} (env={sub_type})...", file=sys.stderr)
+                pio_builder.flash(self.cfg, sub_type, verbose=verbose)
+                print(f"[experiment] Flash succeeded.", file=sys.stderr)
+
+            # UART capture
+            jsonl = sub_dir / "results.jsonl"
+            csv = sub_dir / "results.csv"
+            mi = self.cfg.campaign.multi_injection
+            is_multi = bool(mi and mi.enabled)
+            groups_csv_path = artifacts.groups_csv if artifacts else None
+            print(f"[experiment] Capturing UART → {csv}", file=sys.stderr)
+            uart_capture(
+                self.cfg.serial, jsonl, csv,
+                stop_after=stop_after,
+                campaign_type=sub_type,
+                is_multi=is_multi,
+                groups_csv=groups_csv_path,
+            )
+            print(f"[experiment] Capture complete → {csv}", file=sys.stderr)
+
+            # Classify
+            classified = sub_dir / "classified_results.csv"
+            print(f"[experiment] Classifying {csv}...", file=sys.stderr)
+            classify_results(csv, classified)
+            results[sub_type] = classified
+            print(f"[experiment] {sub_type} classified → {classified}", file=sys.stderr)
+
+        print(f"\n[experiment] {'='*50}", file=sys.stderr)
+        print(f"[experiment]  Hybrid campaign complete", file=sys.stderr)
+        print(f"[experiment] {'='*50}", file=sys.stderr)
+        print(f"[experiment]   Register → {results.get('register')}", file=sys.stderr)
+        print(f"[experiment]   Memory   → {results.get('memory')}", file=sys.stderr)
+        return results
