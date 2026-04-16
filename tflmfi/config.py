@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -68,11 +69,74 @@ class FirmwareConfig:
     extra_build_flags: List[str] = field(default_factory=list)
 
 
+# ---------------------------------------------------------------------------
+# ESP32 serial port auto-detection
+# ---------------------------------------------------------------------------
+
+# Known USB VID:PID pairs for ESP32 USB-to-serial chips
+_ESP32_VID_PIDS = {
+    (0x303A, 0x1001),  # ESP32-C3 / ESP32-S3 built-in USB-JTAG/Serial
+    (0x303A, 0x0002),  # ESP32-S2 built-in USB
+    (0x10C4, 0xEA60),  # CP2102 / CP210x (Silicon Labs)
+    (0x1A86, 0x7523),  # CH340 / CH341
+    (0x1A86, 0x55D4),  # CH9102
+    (0x0403, 0x6001),  # FTDI FT232R
+    (0x0403, 0x6015),  # FTDI FT231X
+}
+
+
+def detect_esp32_port() -> Optional[str]:
+    """Auto-detect the serial port of a connected ESP32 device.
+
+    Searches for known ESP32 USB-to-serial VID:PID pairs.  Falls back to
+    heuristic matching on port description if no VID:PID matches.
+    Returns *None* if no candidate is found.
+    """
+    from serial.tools.list_ports import comports
+
+    candidates = []
+    for info in comports():
+        if info.vid is not None and (info.vid, info.pid) in _ESP32_VID_PIDS:
+            candidates.append(info)
+
+    # Heuristic fallback: description contains "CP210", "CH340", "ESP", etc.
+    if not candidates:
+        _HINTS = ("cp210", "ch340", "ch910", "ftdi", "esp32", "esp")
+        for info in comports():
+            desc = (info.description or "").lower()
+            mfr = (info.manufacturer or "").lower()
+            if any(h in desc or h in mfr for h in _HINTS):
+                candidates.append(info)
+
+    if not candidates:
+        return None
+
+    # Prefer Espressif's own built-in USB (VID 0x303A)
+    espressif = [c for c in candidates if c.vid == 0x303A]
+    if espressif:
+        return espressif[0].device
+
+    return candidates[0].device
+
+
 @dataclass
 class SerialConfig:
-    port: str = "COM3"
+    port: str = "auto"
     baud: int = 460800
     boot_timeout_s: int = 30
+
+    def resolve_port(self) -> str:
+        """Return the effective serial port, auto-detecting if needed."""
+        if self.port.lower() != "auto":
+            return self.port
+        detected = detect_esp32_port()
+        if detected is None:
+            raise RuntimeError(
+                "serial.port is 'auto' but no ESP32 device was detected. "
+                "Connect the board or set an explicit port in the YAML config."
+            )
+        print(f"[serial] Auto-detected ESP32 on {detected}", file=sys.stderr)
+        return detected
 
 
 @dataclass
@@ -120,6 +184,15 @@ class ExperimentConfig:
     @property
     def firmware_src_path(self) -> Path:
         return self.resolve_path(self.firmware.src_dir)
+
+    def apply_board(self, board: "BoardSpec") -> None:  # noqa: F821
+        """Override firmware settings with values from a ``BoardSpec``."""
+        self.firmware.board = board.pio_board
+        self.firmware.platform = board.platform
+        self.firmware.framework = board.framework
+        self.firmware.monitor_speed = board.monitor_speed
+        if board.extra_build_flags:
+            self.firmware.extra_build_flags = list(board.extra_build_flags)
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +279,7 @@ def _parse_serial(raw: Optional[Dict[str, Any]]) -> SerialConfig:
     if raw is None:
         return SerialConfig()
     return SerialConfig(
-        port=raw.get("port", "COM3"),
+        port=raw.get("port", "auto"),
         baud=raw.get("baud", 460800),
         boot_timeout_s=raw.get("boot_timeout_s", 30),
     )

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -37,6 +38,35 @@ def _build_env(cfg: ExperimentConfig) -> dict:
     return env
 
 
+def _ensure_clean_cmake_cache(project_dir: Path, pio_env: str) -> None:
+    """Remove stale CMake cache when managed_components is missing.
+
+    If *managed_components/* was deleted (e.g. to force a fresh component
+    download) but *.pio/build/* still holds a cached CMake configuration that
+    references those paths, PlatformIO will skip component resolution and the
+    build will fail.  Cleaning the CMake artefacts forces a full
+    reconfiguration on the next ``pio run``.
+    """
+    managed = project_dir / "managed_components"
+    if managed.exists():
+        return
+    env_build = project_dir / ".pio" / "build" / pio_env
+    if not env_build.exists():
+        return
+    cmake_cache = env_build / "CMakeCache.txt"
+    cmake_files = env_build / "CMakeFiles"
+    if cmake_cache.exists() or cmake_files.exists():
+        if cmake_cache.exists():
+            cmake_cache.unlink()
+        if cmake_files.exists():
+            shutil.rmtree(cmake_files)
+        print(
+            "[builder] Cleaned stale CMake cache "
+            "(managed_components missing, forcing re-resolution).",
+            file=sys.stderr,
+        )
+
+
 def build(
     cfg: ExperimentConfig,
     campaign_type: str,
@@ -46,6 +76,7 @@ def build(
     """Run ``pio run -e <env>`` for the given campaign type."""
     project_dir = _find_project_dir(cfg)
     pio_env = _pio_env_name(campaign_type)
+    _ensure_clean_cmake_cache(project_dir, pio_env)
     cmd = ["pio", "run", "-e", pio_env, "-d", str(project_dir)]
 
     if verbose:
@@ -80,10 +111,35 @@ def flash(
 
     run_env = _build_env(cfg)
     print(f"[builder] Running: {' '.join(cmd)}", file=sys.stderr)
-    result = subprocess.run(cmd, capture_output=False, env=run_env)
-    if result.returncode != 0:
-        raise RuntimeError(f"PlatformIO flash failed (exit {result.returncode}).")
-    return result
+
+    flash_warnings: List[str] = []
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, env=run_env,
+    )
+    for line in proc.stdout:
+        sys.stderr.write(line)
+        low = line.lower()
+        if "flash memory size mismatch" in low:
+            flash_warnings.append(line.strip())
+
+    proc.wait()
+
+    if flash_warnings:
+        print(f"\n[WARNING] {'='*60}", file=sys.stderr)
+        print("[WARNING] PlatformIO detected flash memory issues:", file=sys.stderr)
+        for w in flash_warnings:
+            print(f"[WARNING]   {w}", file=sys.stderr)
+        print(
+            "[WARNING] This may prevent the device from booting correctly.\n"
+            "[WARNING] Adjust flash size in sdkconfig.defaults or via 'pio run -t menuconfig'.",
+            file=sys.stderr,
+        )
+        print(f"[WARNING] {'='*60}\n", file=sys.stderr)
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"PlatformIO flash failed (exit {proc.returncode}).")
+    return subprocess.CompletedProcess(cmd, proc.returncode)
 
 
 def build_and_flash(

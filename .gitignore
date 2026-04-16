@@ -1,5 +1,5 @@
 # --- Python ---
-__pycache__/
+__pycache__
 *.py[cod]
 *$py.class
 *.so
@@ -47,3 +47,5 @@ firmware/.pio/
 # --- Artefatos grandes gerados localmente (adicione pastas seus dados aqui) ---
 # *.csv
 # data/
+
+analise

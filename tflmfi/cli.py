@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from tflmfi.boards import find_board, select_board_interactive
 from tflmfi.config import load_config
 from tflmfi.experiment import Experiment
 
@@ -44,9 +45,27 @@ def main() -> None:
     parser.add_argument("--stop-after", type=int, default=None, help="Stop UART capture after N messages")
     parser.add_argument("--results", type=Path, default=None, help="Existing results CSV for analyze step")
     parser.add_argument("--upload-port", type=str, default=None, help="Override serial upload port")
+    parser.add_argument(
+        "--board", type=str, default=None,
+        help="Board name, PIO board id, or YAML stem from configs/esp32/ "
+             "(e.g. 'esp32_c3_super_mini'). Overrides firmware.board in the config.",
+    )
+    parser.add_argument(
+        "--select-board", action="store_true",
+        help="Show interactive board selection menu before running.",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+
+    # ── Board selection ──────────────────────────────────────────────
+    if args.board:
+        board = find_board(args.board)
+        cfg.apply_board(board)
+    elif args.select_board:
+        board = select_board_interactive()
+        cfg.apply_board(board)
+
     exp = Experiment(cfg)
 
     steps = set(args.step) if args.step else {"all"}
