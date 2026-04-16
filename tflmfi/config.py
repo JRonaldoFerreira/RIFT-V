@@ -185,6 +185,15 @@ class ExperimentConfig:
     def firmware_src_path(self) -> Path:
         return self.resolve_path(self.firmware.src_dir)
 
+    def apply_board(self, board: "BoardSpec") -> None:  # noqa: F821
+        """Override firmware settings with values from a ``BoardSpec``."""
+        self.firmware.board = board.pio_board
+        self.firmware.platform = board.platform
+        self.firmware.framework = board.framework
+        self.firmware.monitor_speed = board.monitor_speed
+        if board.extra_build_flags:
+            self.firmware.extra_build_flags = list(board.extra_build_flags)
+
 
 # ---------------------------------------------------------------------------
 # YAML loader
