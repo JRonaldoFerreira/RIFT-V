@@ -66,6 +66,7 @@ class FirmwareConfig:
     board: str = "esp32-c3-devkitm-1"
     framework: str = "espidf"
     monitor_speed: int = 460800
+    pio_env: Optional[str] = None
     extra_build_flags: List[str] = field(default_factory=list)
 
 
@@ -185,14 +186,13 @@ class ExperimentConfig:
     def firmware_src_path(self) -> Path:
         return self.resolve_path(self.firmware.src_dir)
 
-    def apply_board(self, board: "BoardSpec") -> None:  # noqa: F821
-        """Override firmware settings with values from a ``BoardSpec``."""
-        self.firmware.board = board.pio_board
+    def apply_board(self, board: "BoardEnv") -> None:  # noqa: F821
+        """Override firmware settings with values from a ``BoardEnv``."""
+        self.firmware.board = board.board
         self.firmware.platform = board.platform
         self.firmware.framework = board.framework
         self.firmware.monitor_speed = board.monitor_speed
-        if board.extra_build_flags:
-            self.firmware.extra_build_flags = list(board.extra_build_flags)
+        self.firmware.pio_env = board.env_name
 
 
 # ---------------------------------------------------------------------------

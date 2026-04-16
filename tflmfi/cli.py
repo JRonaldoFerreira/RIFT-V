@@ -47,8 +47,8 @@ def main() -> None:
     parser.add_argument("--upload-port", type=str, default=None, help="Override serial upload port")
     parser.add_argument(
         "--board", type=str, default=None,
-        help="Board name, PIO board id, or YAML stem from configs/esp32/ "
-             "(e.g. 'esp32_c3_super_mini'). Overrides firmware.board in the config.",
+        help="PIO environment name, board id, or friendly name from "
+             "firmware/platformio.ini (e.g. 'esp32-c3-12F').",
     )
     parser.add_argument(
         "--select-board", action="store_true",

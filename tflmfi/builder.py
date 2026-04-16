@@ -11,7 +11,15 @@ from typing import List, Optional
 from tflmfi.config import ExperimentConfig
 
 
-def _pio_env_name(campaign_type: str) -> str:
+def _pio_env_name(campaign_type: str, cfg: ExperimentConfig) -> str:
+    """Return the PIO environment name.
+
+    If a board was explicitly selected (``cfg.firmware.pio_env`` is set),
+    that environment takes priority.  Otherwise fall back to the
+    campaign-type mapping (register → registerfi, memory → memoryfi).
+    """
+    if cfg.firmware.pio_env:
+        return cfg.firmware.pio_env
     return {"register": "registerfi", "memory": "memoryfi"}.get(campaign_type, campaign_type)
 
 
@@ -75,7 +83,7 @@ def build(
 ) -> subprocess.CompletedProcess:
     """Run ``pio run -e <env>`` for the given campaign type."""
     project_dir = _find_project_dir(cfg)
-    pio_env = _pio_env_name(campaign_type)
+    pio_env = _pio_env_name(campaign_type, cfg)
     _ensure_clean_cmake_cache(project_dir, pio_env)
     cmd = ["pio", "run", "-e", pio_env, "-d", str(project_dir)]
 
@@ -101,7 +109,7 @@ def flash(
 ) -> subprocess.CompletedProcess:
     """Run ``pio run -e <env> -t upload`` for the given campaign type."""
     project_dir = _find_project_dir(cfg)
-    pio_env = _pio_env_name(campaign_type)
+    pio_env = _pio_env_name(campaign_type, cfg)
     cmd = ["pio", "run", "-e", pio_env, "-t", "upload", "-d", str(project_dir)]
 
     if upload_port:
