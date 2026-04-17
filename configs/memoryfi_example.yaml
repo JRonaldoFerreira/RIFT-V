@@ -3,12 +3,12 @@
 # ──────────────────────────────────────────────────
 
 experiment:
-  name: memoryfi_lenet5_mnist
-  description: "Memory-FI bit-flip campaign on LeNet-5 (MNIST, int8)"
+  name: memoryfi_image_classification
+  description: "Memory-FI bit-flip campaign on image_classification (Fashion MNIST, int8)"
 
 model:
-  tflite: "../models/lenet5_mnist_int8.tflite"
-  subset_npz: "../models/mnist_subset.npz"
+  tflite: "../models/image_classification_fashionmnist_int8.tflite"
+  subset_npz: "../models/fashion_mnist_100_subset.npz"
 
 campaign:
   type: memory
@@ -16,7 +16,6 @@ campaign:
   memory:
     target_ops:
       - CONV_2D
-      - DEPTHWISE_CONV_2D
       - FULLY_CONNECTED
 
 sampling:

@@ -4,6 +4,7 @@ __version__ = "0.2.0"
 
 from tflmfi.config import ExperimentConfig, load_config
 from tflmfi.experiment import Experiment
+from tflmfi.model_utils import quantize_model, prepare_test_subset
 from tflmfi.analysis import (
     CampaignData,
     PhysicalAnalysisReport,
@@ -24,6 +25,9 @@ __all__ = [
     "ExperimentConfig",
     "Experiment",
     "load_config",
+    # Model utilities
+    "quantize_model",
+    "prepare_test_subset",
     # Analysis
     "CampaignData",
     "PhysicalAnalysisReport",

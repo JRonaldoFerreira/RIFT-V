@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 
 from tflmfi.config import ExperimentConfig, load_config
 from tflmfi.population import (
@@ -18,6 +18,10 @@ from tflmfi import builder as pio_builder
 from tflmfi.uart import capture as uart_capture
 from tflmfi.classify import classify_results
 from tflmfi.analysis import generate_physical_report, PhysicalAnalysisReport
+from tflmfi.model_utils import (
+    quantize_model as _quantize_model,
+    prepare_test_subset as _prepare_test_subset,
+)
 
 
 class Experiment:
@@ -49,6 +53,133 @@ class Experiment:
         self._introspector: Optional[ModelIntrospector] = None
 
     # ------------------------------------------------------------------ #
+    # Step 0a: QUANTIZE — convert Keras model to int8 TFLite
+    # ------------------------------------------------------------------ #
+
+    def quantize_model(
+        self,
+        model_path: str | Path,
+        output_path: Optional[str | Path] = None,
+        representative_data: Optional["np.ndarray"] = None,
+        dataset_name: Optional[str] = None,
+        num_calibration_samples: int = 500,
+        preprocess_fn=None,
+    ) -> Path:
+        """Quantize a Keras model to int8 TFLite and save it.
+
+        The resulting ``.tflite`` is placed at *output_path* (defaults to the
+        path declared in ``model.tflite`` in the config), ready to be used by
+        ``prepare()``.
+
+        Parameters
+        ----------
+        model_path:
+            ``.h5`` / ``.keras`` file or SavedModel directory.
+        output_path:
+            Where to write the ``.tflite`` file.  Defaults to
+            ``cfg.model.tflite``.
+        representative_data:
+            NumPy array for calibration.  When *None* and *dataset_name* is
+            provided, the training split is loaded automatically.
+        dataset_name:
+            ``"mnist"``, ``"fashion_mnist"``, ``"cifar10"``, or
+            ``"cifar100"``.  Used for auto-loading calibration data.
+        num_calibration_samples:
+            How many samples to use for calibration (default 500).
+        preprocess_fn:
+            Optional callable ``(np.ndarray) -> np.ndarray`` applied to
+            calibration data.  Must match training preprocessing.  When
+            *None*, divides by 255 if data looks like uint8.
+
+        Returns
+        -------
+        Path
+            The written ``.tflite`` file.
+        """
+        if output_path is None:
+            output_path = self.cfg.tflite_path
+        result = _quantize_model(
+            model_path=model_path,
+            output_path=output_path,
+            representative_data=representative_data,
+            dataset_name=dataset_name,
+            num_calibration_samples=num_calibration_samples,
+            preprocess_fn=preprocess_fn,
+        )
+        print(
+            f"[experiment] Quantized model ready at {result}",
+            file=sys.stderr,
+        )
+        return result
+
+    # ------------------------------------------------------------------ #
+    # Step 0b: SUBSET — build random test-subset .npz
+    # ------------------------------------------------------------------ #
+
+    def prepare_test_subset(
+        self,
+        subset_size: int = 100,
+        output_path: Optional[str | Path] = None,
+        x: Optional["np.ndarray"] = None,
+        y: Optional["np.ndarray"] = None,
+        dataset_name: Optional[str] = None,
+        test_data_path: Optional[Union[str, Path]] = None,
+        seed: int = 42,
+        preprocess_fn=None,
+    ) -> Path:
+        """Create a random test-subset ``.npz`` for the firmware.
+
+        The file is saved at *output_path* (defaults to ``model.subset_npz``
+        in the config) with the keys ``images``, ``labels``, and
+        ``test_indices`` expected by the header generator.
+
+        Parameters
+        ----------
+        subset_size:
+            Number of test samples to draw (default 100).
+        output_path:
+            Destination ``.npz`` file.  Defaults to ``cfg.model.subset_npz``.
+        x, y:
+            Full test images and labels.  If omitted, *test_data_path* or
+            *dataset_name* is used.
+        dataset_name:
+            ``"mnist"``, ``"fashion_mnist"``, ``"cifar10"``, or
+            ``"cifar100"``.  The test split is loaded automatically.
+        test_data_path:
+            Path to an ``.npz`` file with the full test set.  Must contain
+            one of these key pairs: ``(images, labels)``,
+            ``(x_test, y_test)``, or ``(x, y)``.
+        seed:
+            Random seed for reproducibility.
+        preprocess_fn:
+            Optional callable ``(np.ndarray) -> np.ndarray`` applied to
+            the image batch.  Must match training preprocessing.  When
+            *None*, divides by 255 if data looks like uint8.
+
+        Returns
+        -------
+        Path
+            The written ``.npz`` file.
+        """
+        if output_path is None:
+            output_path = self.cfg.subset_npz_path
+        result = _prepare_test_subset(
+            output_path=output_path,
+            subset_size=subset_size,
+            x=x,
+            y=y,
+            dataset_name=dataset_name,
+            test_data_path=test_data_path,
+            seed=seed,
+            preprocess_fn=preprocess_fn,
+        )
+        print(
+            f"[experiment] Test subset ready at {result}",
+            file=sys.stderr,
+        )
+        return result
+
+    # ------------------------------------------------------------------ #
     # Step 1: PREPARE — population + sampling + header generation
     # ------------------------------------------------------------------ #
 
@@ -57,6 +188,7 @@ class Experiment:
         print(f"[experiment] Preparing campaign '{self.cfg.campaign.type}' → {self.out_dir}", file=sys.stderr)
 
         self._introspector = ModelIntrospector(self.cfg.tflite_path)
+        model_op_names = [op.op_name for op in self._introspector.collect_operators()]
         ctype = self.cfg.campaign.type
 
         if ctype == "register":
@@ -74,6 +206,7 @@ class Experiment:
                 trainable_ops_csv=trainable_csv,
                 groups_csv=self.artifacts.groups_csv,
                 multi_count=mi.count if mi and mi.enabled else 0,
+                model_op_names=model_op_names,
             )
 
         elif ctype == "memory":
@@ -91,6 +224,7 @@ class Experiment:
                 tensor_records=tensor_records,
                 groups_csv=self.artifacts.groups_csv,
                 multi_count=mi.count if mi and mi.enabled else 0,
+                model_op_names=model_op_names,
             )
 
         elif ctype == "hybrid":
@@ -109,6 +243,7 @@ class Experiment:
                 reg_artifacts.selected_csv, trainable_ops_csv=trainable_csv,
                 groups_csv=reg_artifacts.groups_csv,
                 multi_count=mi_reg.count if mi_reg and mi_reg.enabled else 0,
+                model_op_names=model_op_names,
             )
 
             mem_artifacts = prepare_memory_campaign(
@@ -122,6 +257,7 @@ class Experiment:
                 mem_artifacts.selected_csv, tensor_records=tensor_records,
                 groups_csv=mem_artifacts.groups_csv,
                 multi_count=mi_mem.count if mi_mem and mi_mem.enabled else 0,
+                model_op_names=model_op_names,
             )
 
             self._reg_artifacts = reg_artifacts

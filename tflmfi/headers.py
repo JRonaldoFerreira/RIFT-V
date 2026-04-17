@@ -17,8 +17,115 @@ from tflmfi.population import TensorRecord
 # ---------------------------------------------------------------------------
 
 CAMPAIGN_HEADERS: Dict[str, List[str]] = {
-    "register": ["model_data.h", "mnist_subset.h", "register_fault_list.h", "register_operator_map.h"],
-    "memory": ["model_data.h", "mnist_subset.h", "fault_list.h", "tensor_map.h"],
+    "register": ["model_data.h", "mnist_subset.h", "register_fault_list.h", "register_operator_map.h", "resolver_ops.h"],
+    "memory": ["model_data.h", "mnist_subset.h", "fault_list.h", "tensor_map.h", "resolver_ops.h"],
+}
+
+
+# ---------------------------------------------------------------------------
+# Builtin op name → MicroMutableOpResolver method mapping
+# ---------------------------------------------------------------------------
+
+_BUILTIN_OP_TO_RESOLVER: Dict[str, str] = {
+    "ABS": "AddAbs",
+    "ADD": "AddAdd",
+    "ADD_N": "AddAddN",
+    "ARG_MAX": "AddArgMax",
+    "ARG_MIN": "AddArgMin",
+    "ASSIGN_VARIABLE": "AddAssignVariable",
+    "AVERAGE_POOL_2D": "AddAveragePool2D",
+    "BATCH_MATMUL": "AddBatchMatMul",
+    "BATCH_TO_SPACE_ND": "AddBatchToSpaceNd",
+    "BROADCAST_ARGS": "AddBroadcastArgs",
+    "BROADCAST_TO": "AddBroadcastTo",
+    "CALL_ONCE": "AddCallOnce",
+    "CAST": "AddCast",
+    "CEIL": "AddCeil",
+    "CONCATENATION": "AddConcatenation",
+    "CONV_2D": "AddConv2D",
+    "COS": "AddCos",
+    "CUMSUM": "AddCumSum",
+    "DEPTH_TO_SPACE": "AddDepthToSpace",
+    "DEPTHWISE_CONV_2D": "AddDepthwiseConv2D",
+    "DEQUANTIZE": "AddDequantize",
+    "DIV": "AddDiv",
+    "DYNAMIC_UPDATE_SLICE": "AddDynamicUpdateSlice",
+    "ELU": "AddElu",
+    "EMBEDDING_LOOKUP": "AddEmbeddingLookup",
+    "EQUAL": "AddEqual",
+    "EXP": "AddExp",
+    "EXPAND_DIMS": "AddExpandDims",
+    "FILL": "AddFill",
+    "FLOOR": "AddFloor",
+    "FLOOR_DIV": "AddFloorDiv",
+    "FLOOR_MOD": "AddFloorMod",
+    "FULLY_CONNECTED": "AddFullyConnected",
+    "GATHER": "AddGather",
+    "GATHER_ND": "AddGatherNd",
+    "GREATER": "AddGreater",
+    "GREATER_EQUAL": "AddGreaterEqual",
+    "HARD_SWISH": "AddHardSwish",
+    "IF": "AddIf",
+    "L2_NORMALIZATION": "AddL2Normalization",
+    "L2_POOL_2D": "AddL2Pool2D",
+    "LEAKY_RELU": "AddLeakyRelu",
+    "LESS": "AddLess",
+    "LESS_EQUAL": "AddLessEqual",
+    "LOG": "AddLog",
+    "LOGICAL_AND": "AddLogicalAnd",
+    "LOGICAL_NOT": "AddLogicalNot",
+    "LOGICAL_OR": "AddLogicalOr",
+    "LOGISTIC": "AddLogistic",
+    "LOG_SOFTMAX": "AddLogSoftmax",
+    "MAXIMUM": "AddMaximum",
+    "MAX_POOL_2D": "AddMaxPool2D",
+    "MEAN": "AddMean",
+    "MINIMUM": "AddMinimum",
+    "MIRROR_PAD": "AddMirrorPad",
+    "MUL": "AddMul",
+    "NEG": "AddNeg",
+    "NOT_EQUAL": "AddNotEqual",
+    "PACK": "AddPack",
+    "PAD": "AddPad",
+    "PADV2": "AddPadV2",
+    "PRELU": "AddPrelu",
+    "QUANTIZE": "AddQuantize",
+    "READ_VARIABLE": "AddReadVariable",
+    "REDUCE_MAX": "AddReduceMax",
+    "REDUCE_MIN": "AddReduceMin",
+    "RELU": "AddRelu",
+    "RELU6": "AddRelu6",
+    "RESHAPE": "AddReshape",
+    "RESIZE_BILINEAR": "AddResizeBilinear",
+    "RESIZE_NEAREST_NEIGHBOR": "AddResizeNearestNeighbor",
+    "REVERSE_V2": "AddReverseV2",
+    "ROUND": "AddRound",
+    "RSQRT": "AddRsqrt",
+    "SELECT_V2": "AddSelectV2",
+    "SHAPE": "AddShape",
+    "SIN": "AddSin",
+    "SLICE": "AddSlice",
+    "SOFTMAX": "AddSoftmax",
+    "SPACE_TO_BATCH_ND": "AddSpaceToBatchNd",
+    "SPACE_TO_DEPTH": "AddSpaceToDepth",
+    "SPLIT": "AddSplit",
+    "SPLIT_V": "AddSplitV",
+    "SQUEEZE": "AddSqueeze",
+    "SQRT": "AddSqrt",
+    "SQUARE": "AddSquare",
+    "SQUARED_DIFFERENCE": "AddSquaredDifference",
+    "STRIDED_SLICE": "AddStridedSlice",
+    "SUB": "AddSub",
+    "SUM": "AddSum",
+    "SVDF": "AddSvdf",
+    "TANH": "AddTanh",
+    "TRANSPOSE": "AddTranspose",
+    "TRANSPOSE_CONV": "AddTransposeConv",
+    "UNPACK": "AddUnpack",
+    "UNIDIRECTIONAL_SEQUENCE_LSTM": "AddUnidirectionalSequenceLSTM",
+    "VAR_HANDLE": "AddVarHandle",
+    "WHILE": "AddWhile",
+    "ZEROS_LIKE": "AddZerosLike",
 }
 
 
@@ -40,6 +147,45 @@ def format_c_array_u8(name: str, data: bytes, cols: int = 12) -> str:
 # ---------------------------------------------------------------------------
 # Individual header generators
 # ---------------------------------------------------------------------------
+
+def generate_resolver_header(model_op_names: List[str]) -> str:
+    """Generate ``resolver_ops.h`` that registers exactly the ops the model needs."""
+    unique_ops = sorted(set(model_op_names))
+
+    resolver_calls: List[str] = []
+    skipped: List[str] = []
+    for op in unique_ops:
+        method = _BUILTIN_OP_TO_RESOLVER.get(op)
+        if method:
+            resolver_calls.append(f"  resolver.{method}();")
+        else:
+            skipped.append(op)
+
+    if skipped:
+        import warnings
+        warnings.warn(
+            f"[tflmfi] Ops not in resolver mapping (skipped): {skipped}. "
+            "You may need to register them manually."
+        )
+
+    count = len(resolver_calls)
+    lines = [
+        "#pragma once",
+        "// Auto-generated by tflmfi from model ops — do not edit manually.",
+        f"// {count} unique builtin operator(s) detected.",
+        "",
+        '#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"',
+        "",
+        f"#define TFLMFI_RESOLVER_OP_COUNT {count}",
+        "",
+        "inline void tflmfi_populate_resolver(",
+        "    tflite::MicroMutableOpResolver<TFLMFI_RESOLVER_OP_COUNT>& resolver) {",
+    ]
+    lines.extend(resolver_calls)
+    lines.append("}")
+    lines.append("")
+    return "\n".join(lines)
+
 
 def generate_model_header(tflite_path: Path) -> str:
     data = tflite_path.read_bytes()
@@ -294,6 +440,7 @@ def write_headers(
     tensor_records: List[TensorRecord] | None = None,
     groups_csv: Path | None = None,
     multi_count: int = 0,
+    model_op_names: List[str] | None = None,
 ) -> List[Path]:
     """Generate all campaign headers into *headers_dir*."""
     headers_dir.mkdir(parents=True, exist_ok=True)
@@ -307,6 +454,12 @@ def write_headers(
     p = headers_dir / "mnist_subset.h"
     p.write_text(generate_subset_header(subset_npz), encoding="utf-8")
     written.append(p)
+
+    # Resolver header (auto-detected from model)
+    if model_op_names is not None:
+        p = headers_dir / "resolver_ops.h"
+        p.write_text(generate_resolver_header(model_op_names), encoding="utf-8")
+        written.append(p)
 
     # Campaign-specific headers
     if campaign_type == "register":

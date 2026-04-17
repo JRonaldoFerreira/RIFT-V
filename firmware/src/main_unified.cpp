@@ -35,8 +35,9 @@
 
 #include "tensorflow/lite/c/common.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
-#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/schema/schema_generated.h"
+
+#include "resolver_ops.h"
 
 #if defined(FI_CAMPAIGN_REGISTER)
 static RTC_NOINIT_ATTR uint32_t g_rtc_magic;
@@ -418,17 +419,8 @@ extern "C" void app_main(void) {
     return;
   }
 
-  tflite::MicroMutableOpResolver<10> resolver;
-  resolver.AddConv2D();
-  resolver.AddAveragePool2D();
-  resolver.AddReshape();
-  resolver.AddFullyConnected();
-  resolver.AddSoftmax();
-  resolver.AddQuantize();
-  resolver.AddDequantize();
-  resolver.AddShape();
-  resolver.AddStridedSlice();
-  resolver.AddPack();
+  tflite::MicroMutableOpResolver<TFLMFI_RESOLVER_OP_COUNT> resolver;
+  tflmfi_populate_resolver(resolver);
 
   tflite::MicroInterpreter interpreter(model, resolver, g_tensor_arena, kTensorArenaSize);
   if (interpreter.AllocateTensors() != kTfLiteOk) {
