@@ -20,7 +20,7 @@ tflmfi/                  # Pacote Python principal
   cli.py                 # Entry point CLI
   config.py              # Schema YAML e loader de configuração
   population.py          # Introspecção do modelo, geração de população e amostragem
-  experiment.py          # Orquestrador do ciclo prepare → build → flash → run → analyze
+  experiment.py          # Orquestrador: fases opcionais quantize/subset, depois prepare → build → …
   headers.py             # Geração de headers C para o firmware
   builder.py             # Build e flash via PlatformIO
   uart.py                # Captura UART (JSON lines do firmware)
@@ -96,13 +96,26 @@ tflmfi configs/registerfi_example.yaml --step analyze
 
 ### Uso programático
 
+O ciclo principal continua a ser `prepare()` → `build()` → `flash()` → `run()` → `analyze()` (ou `execute()` para tudo de seguida). **Antes** de `prepare()`, o `Experiment` expõe duas fases **opcionais** para gerar os artefactos referenciados no YAML em `model.tflite` e `model.subset_npz`:
+
+| Fase | Método | O que faz |
+|------|--------|-----------|
+| **0a — Quantização** | `exp.quantize_model(...)` | Converte um modelo Keras (`.h5` / `.keras` / SavedModel) para **TFLite int8** e grava o ficheiro `.tflite`. Por omissão escreve em `cfg.model.tflite` (o mesmo caminho que `prepare()` usa para introspecção e headers). Aceita `dataset_name` (`"mnist"`, `"fashion_mnist"`, `"cifar10"`, `"cifar100"`) para dados de calibração automáticos, ou `representative_data` em NumPy; `preprocess_fn` e `num_calibration_samples` alinham o pré-processamento com o treino. |
+| **0b — Subconjunto de teste** | `exp.prepare_test_subset(...)` | Cria um `.npz` aleatório com amostras de teste para o firmware, com as chaves `images`, `labels` e `test_indices` esperadas pelo gerador de headers. Por omissão grava em `cfg.model.subset_npz`. Pode carregar o conjunto de teste via `dataset_name`, `test_data_path` (`.npz` com `(images,labels)`, `(x_test,y_test)` ou `(x,y)`), ou arrays `x`/`y`; `subset_size`, `seed` e `preprocess_fn` controlam o subconjunto e o pré-processamento. |
+
+**Quando usar:** se já tiver um `.tflite` int8 e um `.npz` de teste compatíveis com o YAML, pode ir directamente a `prepare()`. Se parte do pipeline for «do zero» (por exemplo só existe `.h5`), chame primeiro `quantize_model()` e/ou `prepare_test_subset()` para materializar os caminhos configurados; só depois `prepare()` gera população, amostragem e headers C.
+
 ```python
 from tflmfi import load_config, Experiment
 
 cfg = load_config("configs/memoryfi_example.yaml")
 exp = Experiment(cfg)
 
-exp.prepare()   # população + amostragem + headers
+# Opcional — só se precisar de gerar estes ficheiros a partir do modelo / dados:
+# exp.quantize_model("models/meu_modelo.h5", dataset_name="fashion_mnist")
+# exp.prepare_test_subset(subset_size=100, dataset_name="fashion_mnist")
+
+exp.prepare()   # introspecção do .tflite + população + amostragem + headers + instalação no firmware
 exp.build()     # pio build
 exp.flash()     # pio upload
 exp.run()       # captura UART
