@@ -43,6 +43,7 @@ runs/
 
 # --- PlatformIO (já listado em firmware/.gitignore; reforço na raiz) ---
 firmware/.pio/
+firmware/.tflmfi/
 
 # --- Artefatos grandes gerados localmente (adicione pastas seus dados aqui) ---
 # *.csv

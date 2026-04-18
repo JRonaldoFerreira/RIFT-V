@@ -66,6 +66,9 @@ class FirmwareConfig:
     framework: str = "espidf"
     monitor_speed: int = 460800
     extra_build_flags: List[str] = field(default_factory=list)
+    flash_size: Optional[str] = None          # e.g. "2MB", "4MB" — overrides board default
+    idf_target: Optional[str] = None          # e.g. "esp32c6" — override IDF_TARGET
+    sdkconfig_defaults: List[str] = field(default_factory=list)  # extra sdkconfig fragments
 
 
 @dataclass
@@ -192,6 +195,9 @@ def _parse_sampling(raw: Optional[Dict[str, Any]]) -> SamplingConfig:
 def _parse_firmware(raw: Optional[Dict[str, Any]]) -> FirmwareConfig:
     if raw is None:
         return FirmwareConfig()
+    sdk_defaults = raw.get("sdkconfig_defaults", [])
+    if isinstance(sdk_defaults, str):
+        sdk_defaults = [sdk_defaults]
     return FirmwareConfig(
         src_dir=raw.get("src_dir", FirmwareConfig.src_dir),
         platform=raw.get("platform", FirmwareConfig.platform),
@@ -199,6 +205,9 @@ def _parse_firmware(raw: Optional[Dict[str, Any]]) -> FirmwareConfig:
         framework=raw.get("framework", FirmwareConfig.framework),
         monitor_speed=raw.get("monitor_speed", FirmwareConfig.monitor_speed),
         extra_build_flags=raw.get("extra_build_flags", []),
+        flash_size=raw.get("flash_size", None),
+        idf_target=raw.get("idf_target", None),
+        sdkconfig_defaults=sdk_defaults,
     )
 
 

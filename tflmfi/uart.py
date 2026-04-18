@@ -114,7 +114,7 @@ def _uart_reader_thread(
         try:
             waiting = ser.in_waiting
             chunk = ser.read(waiting) if waiting else ser.read(1)
-        except serial.SerialException:
+        except (serial.SerialException, TypeError, OSError):
             break
         if not chunk:
             continue
@@ -256,22 +256,65 @@ def capture(
     campaign_done = False
     lq: queue.Queue[str] = queue.Queue()
     stop = threading.Event()
+    port = serial_cfg.port
+    baud = serial_cfg.baud
 
-    with serial.Serial(serial_cfg.port, serial_cfg.baud, timeout=0.05) as ser:
-        print(f"[uart] Listening on {serial_cfg.port} @ {serial_cfg.baud} baud", file=sys.stderr)
+    # ---- Phase 1: trigger a hardware reset via DTR/RTS ----
+    print(f"[uart] Listening on {port} @ {baud} baud", file=sys.stderr)
+    try:
+        with serial.Serial(port, baud, timeout=0.05) as rst:
+            rst.dtr = False
+            rst.rts = True
+            time.sleep(0.1)
+            rst.rts = False
+            rst.dtr = False
+            time.sleep(0.05)
+    except (serial.SerialException, OSError) as exc:
+        print(f"[uart] Reset toggle warning: {exc}", file=sys.stderr)
 
-        # Hardware reset
-        ser.dtr = False
-        ser.rts = True
-        time.sleep(0.1)
-        ser.rts = False
-        time.sleep(0.1)
-        ser.reset_input_buffer()
+    # ---- Phase 2: wait for USB re-enumeration ----
+    # On boards that use the built-in USB Serial/JTAG (ESP32-C6, C3, H2),
+    # the chip reset causes the USB device to disconnect and reconnect.
+    # First check whether the port actually disappeared (reset worked),
+    # then poll until it reappears.
+    print("[uart] Waiting for port after reset...", file=sys.stderr)
 
+    port_disappeared = False
+    vanish_deadline = time.monotonic() + 1.5
+    while time.monotonic() < vanish_deadline:
+        try:
+            probe = serial.Serial(port, baud, timeout=0.05)
+            probe.close()
+            time.sleep(0.1)
+        except (serial.SerialException, OSError):
+            port_disappeared = True
+            break
+
+    if not port_disappeared:
+        print(
+            "[uart] Port stayed open — DTR/RTS reset may not have worked. "
+            "Will look for an existing boot event.",
+            file=sys.stderr,
+        )
+
+    ser: Optional[serial.Serial] = None
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        try:
+            ser = serial.Serial(port, baud, timeout=0.05)
+            break
+        except (serial.SerialException, OSError):
+            time.sleep(0.25)
+
+    if ser is None:
+        print(f"[ERROR] Could not reopen {port} after reset.", file=sys.stderr)
+        return
+
+    try:
         reader = threading.Thread(target=_uart_reader_thread, args=(ser, lq, stop), daemon=True)
         reader.start()
 
-        # Wait for boot
+        # Wait for boot (or detect firmware already running)
         print("[uart] Waiting for boot event...", file=sys.stderr)
         while True:
             try:
@@ -279,13 +322,29 @@ def capture(
             except queue.Empty:
                 print("[ERROR] Boot timeout.", file=sys.stderr)
                 stop.set()
+                reader.join(timeout=2.0)
                 return
             try:
                 payload = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if payload.get("event") == "boot":
-                print("[uart] Boot received — campaign running.", file=sys.stderr)
+            evt = payload.get("event")
+            if evt == "boot":
+                print("[uart] Boot received — sending start signal.", file=sys.stderr)
+                try:
+                    ser.write(b'{"cmd":"start"}\n')
+                    ser.flush()
+                except (serial.SerialException, OSError) as exc:
+                    print(f"[uart] Warning: could not send start: {exc}", file=sys.stderr)
+                print("[uart] Campaign running.", file=sys.stderr)
+                break
+            if evt in ("result", "progress", "done"):
+                print(
+                    f"[uart] Firmware already running ('{evt}' before boot) "
+                    "— joining campaign.",
+                    file=sys.stderr,
+                )
+                lq.put(line)
                 break
 
         # Main receive loop
@@ -341,6 +400,9 @@ def capture(
 
         stop.set()
         reader.join(timeout=2.0)
+    finally:
+        stop.set()
+        ser.close()
 
     if not campaign_done:
         print("[WARN] Capture ended WITHOUT 'done' event — results may be incomplete.", file=sys.stderr)

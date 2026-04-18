@@ -1,0 +1,48 @@
+# ──────────────────────────────────────────────────
+# Memory Fault-Injection Campaign — ESP32-C6 Example
+# ──────────────────────────────────────────────────
+# Use this config when your target board is an ESP32-C6.
+# If your module has 2MB flash instead of the board-default 4MB,
+# set flash_size: 2MB under firmware.
+
+experiment:
+  name: memoryfi_image_classification_c6
+  description: "Memory-FI bit-flip campaign on image_classification (Fashion MNIST, int8) — ESP32-C6"
+
+model:
+  tflite: "../models/image_classification_fashionmnist_int8.tflite"
+  subset_npz: "../models/fashion_mnist_100_subset.npz"
+
+campaign:
+  type: memory
+  fault_duration: transient
+  memory:
+    target_ops:
+      - CONV_2D
+      - FULLY_CONNECTED
+
+sampling:
+  method: stratified
+  confidence: 0.95
+  margin: 0.05
+  p_prior: 0.5
+  seed: 1337
+  group_by: [op_index, op_name]
+
+firmware:
+  src_dir: "../firmware/src"
+  platform: espressif32
+  board: esp32-c6-devkitm-1
+  flash_size: 4MB
+  framework: espidf
+  monitor_speed: 460800
+  # flash_size: 2MB   # uncomment if your C6 module has 2MB flash
+
+serial:
+  port: COM18
+  baud: 460800
+  boot_timeout_s: 30
+
+output:
+  dir: "../runs/{name}_{timestamp}"
+  formats: [csv, jsonl]
