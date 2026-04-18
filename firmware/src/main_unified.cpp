@@ -4,6 +4,9 @@
 #include <string.h>
 
 #include "driver/uart.h"
+#if defined(FI_TRANSPORT_USB_SERIAL_JTAG)
+#include "driver/usb_serial_jtag.h"
+#endif
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -78,8 +81,11 @@ static memory_fi_context_t g_memory_fi_ctx;
 #endif
 
 // -------------------------------------------------------------------
-// Protocol UART — writes directly to UART0 at compile-time baud rate,
-// completely independent of the ESP-IDF console configuration.
+// Protocol transport — abstracts UART0 vs USB Serial/JTAG.
+// When FI_TRANSPORT_USB_SERIAL_JTAG is defined the firmware talks
+// through the chip's built-in USB Serial/JTAG controller (ESP32-C3,
+// C5, C6, H2, P4 boards whose USB connector is wired to the native
+// USB pins).  Otherwise the classic UART0 path is used.
 // -------------------------------------------------------------------
 #ifndef FI_PROTOCOL_BAUD
 #define FI_PROTOCOL_BAUD 460800
@@ -88,6 +94,13 @@ static memory_fi_context_t g_memory_fi_ctx;
 static char g_proto_buf[2048];
 
 static void protocol_init_uart(void) {
+#if defined(FI_TRANSPORT_USB_SERIAL_JTAG)
+  usb_serial_jtag_driver_config_t usb_cfg = {
+      .tx_buffer_size = 2048,
+      .rx_buffer_size = 256,
+  };
+  ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usb_cfg));
+#else
   const uart_config_t ucfg = {
       .baud_rate  = FI_PROTOCOL_BAUD,
       .data_bits  = UART_DATA_8_BITS,
@@ -98,6 +111,7 @@ static void protocol_init_uart(void) {
   };
   ESP_ERROR_CHECK(uart_param_config(UART_NUM_0, &ucfg));
   ESP_ERROR_CHECK(uart_driver_install(UART_NUM_0, 256, 2048, 0, NULL, 0));
+#endif
 }
 
 static void proto_printf(const char *fmt, ...) {
@@ -106,8 +120,20 @@ static void proto_printf(const char *fmt, ...) {
   int n = vsnprintf(g_proto_buf, sizeof(g_proto_buf), fmt, ap);
   va_end(ap);
   if (n > 0) {
+#if defined(FI_TRANSPORT_USB_SERIAL_JTAG)
+    usb_serial_jtag_write_bytes(g_proto_buf, n, pdMS_TO_TICKS(1000));
+#else
     uart_write_bytes(UART_NUM_0, g_proto_buf, n);
+#endif
   }
+}
+
+static int proto_read_byte(uint8_t *byte, TickType_t timeout) {
+#if defined(FI_TRANSPORT_USB_SERIAL_JTAG)
+  return usb_serial_jtag_read_bytes(byte, 1, timeout);
+#else
+  return uart_read_bytes(UART_NUM_0, byte, 1, timeout);
+#endif
 }
 
 float dequantize_value(int8_t q, float scale, int32_t zero_point) {
@@ -276,7 +302,7 @@ void protocol_wait_for_start(void) {
   size_t len = 0;
   while (true) {
     uint8_t byte = 0;
-    int n = uart_read_bytes(UART_NUM_0, &byte, 1, pdMS_TO_TICKS(1000));
+    int n = proto_read_byte(&byte, pdMS_TO_TICKS(1000));
     if (n <= 0) {
       protocol_send_boot();
       continue;

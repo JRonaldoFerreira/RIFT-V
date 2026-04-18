@@ -33,7 +33,7 @@ firmware:
   src_dir: "../firmware/src"
   platform: espressif32
   board: esp32-c6-devkitm-1
-  flash_size: 4MB
+  flash_size: 2MB
   framework: espidf
   monitor_speed: 460800
   # flash_size: 2MB   # uncomment if your C6 module has 2MB flash
@@ -41,6 +41,8 @@ firmware:
 serial:
   port: COM18
   baud: 460800
+  transport: uart0   # use "uart0" if your C6 board has a USB-UART bridge
+  # run_port: COM18            # uncomment if capture port differs from flash port
   boot_timeout_s: 30
 
 output:

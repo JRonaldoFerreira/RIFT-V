@@ -212,6 +212,85 @@ def build_csv(
     print(f"[CSV] {jsonl_path} -> {csv_path}", file=sys.stderr)
 
 
+def _resolve_reset_flag(serial_cfg: SerialConfig) -> bool:
+    """Decide whether to attempt a DTR/RTS hardware reset before capture."""
+    if serial_cfg.reset_before_capture is not None:
+        return serial_cfg.reset_before_capture
+    # Auto: reset makes sense only when a USB-UART bridge drives DTR/RTS.
+    return serial_cfg.transport == "uart0"
+
+
+def _open_port_after_reset(
+    port: str,
+    baud: int,
+    do_reset: bool,
+    transport: str,
+) -> Optional[serial.Serial]:
+    """Phase 1+2: optionally reset the board, then (re-)open the capture port.
+
+    For ``uart0`` (bridge) boards the existing DTR/RTS toggle + re-enumeration
+    logic is used.  For ``usb_serial_jtag`` (native USB) boards the reset is
+    skipped and we simply wait for the port to appear (it may vanish briefly
+    after a flash-induced chip reset).
+    """
+
+    if do_reset:
+        # ---- DTR/RTS reset (classic UART bridge) ----
+        print(f"[uart] Triggering DTR/RTS reset on {port}...", file=sys.stderr)
+        try:
+            with serial.Serial(port, baud, timeout=0.05) as rst:
+                rst.dtr = False
+                rst.rts = True
+                time.sleep(0.1)
+                rst.rts = False
+                rst.dtr = False
+                time.sleep(0.05)
+        except (serial.SerialException, OSError) as exc:
+            print(f"[uart] Reset toggle warning: {exc}", file=sys.stderr)
+
+        # Check whether the port vanished (indicates real reset)
+        print("[uart] Waiting for port after reset...", file=sys.stderr)
+        port_disappeared = False
+        vanish_deadline = time.monotonic() + 1.5
+        while time.monotonic() < vanish_deadline:
+            try:
+                probe = serial.Serial(port, baud, timeout=0.05)
+                probe.close()
+                time.sleep(0.1)
+            except (serial.SerialException, OSError):
+                port_disappeared = True
+                break
+
+        if not port_disappeared:
+            print(
+                "[uart] Port stayed open \u2014 DTR/RTS reset may not have worked. "
+                "Will look for an existing boot event.",
+                file=sys.stderr,
+            )
+    else:
+        # ---- USB native: no DTR/RTS, wait for port after flash-induced reset ----
+        print(
+            f"[uart] Transport={transport} \u2014 skipping DTR/RTS reset. "
+            "Waiting for port to appear...",
+            file=sys.stderr,
+        )
+        # Give the chip time to reboot after flash
+        time.sleep(0.5)
+
+    # Poll until the capture port is available
+    ser: Optional[serial.Serial] = None
+    reopen_timeout = 8.0 if transport == "usb_serial_jtag" else 5.0
+    deadline = time.monotonic() + reopen_timeout
+    while time.monotonic() < deadline:
+        try:
+            ser = serial.Serial(port, baud, timeout=0.05)
+            break
+        except (serial.SerialException, OSError):
+            time.sleep(0.25)
+
+    return ser
+
+
 def capture(
     serial_cfg: SerialConfig,
     jsonl_path: Path,
@@ -227,7 +306,7 @@ def capture(
     Parameters
     ----------
     serial_cfg : SerialConfig
-        Port, baud, and boot timeout settings.
+        Port, baud, transport and boot timeout settings.
     jsonl_path : Path
         Where to stream JSON lines.
     csv_path : Path
@@ -256,81 +335,66 @@ def capture(
     campaign_done = False
     lq: queue.Queue[str] = queue.Queue()
     stop = threading.Event()
-    port = serial_cfg.port
+
+    transport = serial_cfg.transport
+    port = serial_cfg.run_port or serial_cfg.port
     baud = serial_cfg.baud
+    do_reset = _resolve_reset_flag(serial_cfg)
 
-    # ---- Phase 1: trigger a hardware reset via DTR/RTS ----
-    print(f"[uart] Listening on {port} @ {baud} baud", file=sys.stderr)
-    try:
-        with serial.Serial(port, baud, timeout=0.05) as rst:
-            rst.dtr = False
-            rst.rts = True
-            time.sleep(0.1)
-            rst.rts = False
-            rst.dtr = False
-            time.sleep(0.05)
-    except (serial.SerialException, OSError) as exc:
-        print(f"[uart] Reset toggle warning: {exc}", file=sys.stderr)
+    print(f"[uart] Listening on {port} @ {baud} baud  (transport={transport})", file=sys.stderr)
 
-    # ---- Phase 2: wait for USB re-enumeration ----
-    # On boards that use the built-in USB Serial/JTAG (ESP32-C6, C3, H2),
-    # the chip reset causes the USB device to disconnect and reconnect.
-    # First check whether the port actually disappeared (reset worked),
-    # then poll until it reappears.
-    print("[uart] Waiting for port after reset...", file=sys.stderr)
-
-    port_disappeared = False
-    vanish_deadline = time.monotonic() + 1.5
-    while time.monotonic() < vanish_deadline:
-        try:
-            probe = serial.Serial(port, baud, timeout=0.05)
-            probe.close()
-            time.sleep(0.1)
-        except (serial.SerialException, OSError):
-            port_disappeared = True
-            break
-
-    if not port_disappeared:
-        print(
-            "[uart] Port stayed open — DTR/RTS reset may not have worked. "
-            "Will look for an existing boot event.",
-            file=sys.stderr,
-        )
-
-    ser: Optional[serial.Serial] = None
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        try:
-            ser = serial.Serial(port, baud, timeout=0.05)
-            break
-        except (serial.SerialException, OSError):
-            time.sleep(0.25)
+    # ---- Phase 1+2: reset (if applicable) and open the capture port ----
+    ser = _open_port_after_reset(port, baud, do_reset, transport)
 
     if ser is None:
-        print(f"[ERROR] Could not reopen {port} after reset.", file=sys.stderr)
+        print(f"[ERROR] Could not open {port} after reset.", file=sys.stderr)
         return
 
     try:
         reader = threading.Thread(target=_uart_reader_thread, args=(ser, lq, stop), daemon=True)
         reader.start()
 
-        # Wait for boot (or detect firmware already running)
+        # ---- Phase 3: handshake — wait for boot or send proactive start ----
+        # For USB native boards the boot event may already have been emitted
+        # before the host opened the port.  The firmware re-emits boot every
+        # ~1 s, so we should eventually see it.  As a safety net we also send
+        # a proactive start after a short grace period.
+        if transport == "usb_serial_jtag":
+            # Give the firmware a moment, then send start proactively
+            time.sleep(0.3)
+            print("[uart] Sending proactive start (USB native)...", file=sys.stderr)
+            try:
+                ser.write(b'{"cmd":"start"}\n')
+                ser.flush()
+            except (serial.SerialException, OSError) as exc:
+                print(f"[uart] Warning: could not send proactive start: {exc}", file=sys.stderr)
+
         print("[uart] Waiting for boot event...", file=sys.stderr)
         while True:
             try:
                 line = lq.get(timeout=float(serial_cfg.boot_timeout_s))
             except queue.Empty:
-                print("[ERROR] Boot timeout.", file=sys.stderr)
-                stop.set()
-                reader.join(timeout=2.0)
-                return
+                # Last-resort: send start one more time before giving up
+                print("[uart] No boot yet \u2014 sending start command...", file=sys.stderr)
+                try:
+                    ser.write(b'{"cmd":"start"}\n')
+                    ser.flush()
+                except (serial.SerialException, OSError):
+                    pass
+                try:
+                    line = lq.get(timeout=5.0)
+                except queue.Empty:
+                    print("[ERROR] Boot timeout.", file=sys.stderr)
+                    stop.set()
+                    reader.join(timeout=2.0)
+                    return
             try:
                 payload = json.loads(line)
             except json.JSONDecodeError:
                 continue
             evt = payload.get("event")
             if evt == "boot":
-                print("[uart] Boot received — sending start signal.", file=sys.stderr)
+                print("[uart] Boot received \u2014 sending start signal.", file=sys.stderr)
                 try:
                     ser.write(b'{"cmd":"start"}\n')
                     ser.flush()
@@ -341,13 +405,13 @@ def capture(
             if evt in ("result", "progress", "done"):
                 print(
                     f"[uart] Firmware already running ('{evt}' before boot) "
-                    "— joining campaign.",
+                    "\u2014 joining campaign.",
                     file=sys.stderr,
                 )
                 lq.put(line)
                 break
 
-        # Main receive loop
+        # ---- Phase 4: main receive loop ----
         while True:
             line = lq.get()
             if not line:
@@ -405,7 +469,7 @@ def capture(
         ser.close()
 
     if not campaign_done:
-        print("[WARN] Capture ended WITHOUT 'done' event — results may be incomplete.", file=sys.stderr)
+        print("[WARN] Capture ended WITHOUT 'done' event \u2014 results may be incomplete.", file=sys.stderr)
 
     build_csv(jsonl_path, csv_path, campaign_type=campaign_type,
               is_multi=is_multi, groups_csv=groups_csv)

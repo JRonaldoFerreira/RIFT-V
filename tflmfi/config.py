@@ -71,11 +71,18 @@ class FirmwareConfig:
     sdkconfig_defaults: List[str] = field(default_factory=list)  # extra sdkconfig fragments
 
 
+# Valid serial transports — extend this tuple when adding new channels.
+VALID_TRANSPORTS = ("uart0", "usb_serial_jtag")
+
+
 @dataclass
 class SerialConfig:
     port: str = "COM3"
     baud: int = 460800
     boot_timeout_s: int = 30
+    transport: str = "uart0"              # "uart0" or "usb_serial_jtag"
+    run_port: Optional[str] = None        # capture port (defaults to *port* when None)
+    reset_before_capture: Optional[bool] = None  # None = auto (True for uart0, False for usb_serial_jtag)
 
 
 @dataclass
@@ -214,10 +221,19 @@ def _parse_firmware(raw: Optional[Dict[str, Any]]) -> FirmwareConfig:
 def _parse_serial(raw: Optional[Dict[str, Any]]) -> SerialConfig:
     if raw is None:
         return SerialConfig()
+    transport = raw.get("transport", "uart0")
+    if transport not in VALID_TRANSPORTS:
+        raise ValueError(
+            f"serial.transport must be one of {VALID_TRANSPORTS}, got '{transport}'"
+        )
+    reset_val = raw.get("reset_before_capture", None)
     return SerialConfig(
         port=raw.get("port", "COM3"),
         baud=raw.get("baud", 460800),
         boot_timeout_s=raw.get("boot_timeout_s", 30),
+        transport=transport,
+        run_port=raw.get("run_port", None),
+        reset_before_capture=reset_val,
     )
 
 
