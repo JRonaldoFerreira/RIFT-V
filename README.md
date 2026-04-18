@@ -133,10 +133,38 @@ Cada experiência é definida por um ficheiro YAML com as seguintes secções:
 | `campaign` | Tipo (`register`/`memory`/`hybrid`), duração, operadores alvo |
 | `sampling` | Método estratificado, confiança, margem, seed |
 | `firmware` | Directório src, plataforma, board |
-| `serial` | Porta, baud rate, timeout |
+| `serial` | Porta, baud rate, timeout, **transporte** (`uart0` ou `usb_serial_jtag`) |
 | `output` | Directório de saída, formatos |
 
-Veja os exemplos em `configs/` para referência.
+Veja os exemplos em `configs/` para referência — em particular `memoryfi_esp32_c6_example.yaml` e `memoryfi_esp32_c3_supermini_example.yaml`.
+
+### Transporte serial (`serial.transport`)
+
+O canal usado pelo firmware para falar com o host depende de **como o conector USB da placa está ligado**:
+
+| Valor | Quando usar | Reset DTR/RTS |
+|-------|-------------|---------------|
+| `uart0` (default) | Placas com **USB-UART bridge** (CP2102, CH340, FTDI) — ex.: ESP32-C2, DevKits clássicos com chip bridge | Ativado automaticamente |
+| `usb_serial_jtag` | Placas em que o USB vai **directo ao controlador USB Serial/JTAG nativo** do chip — ex.: ESP32-C3 Super Mini, C6/H2/P4 DevKitM com USB nativo | Desativado (não funciona sem bridge) |
+
+Quando `transport: usb_serial_jtag`:
+
+- O builder injecta `-DFI_TRANSPORT_USB_SERIAL_JTAG=1` e `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` no `sdkconfig`, fazendo o firmware usar o driver `usb_serial_jtag` em vez de `UART0`.
+- O host salta o toggle DTR/RTS (que não reseta o chip nesse modo) e envia um `{"cmd":"start"}` proativo — o firmware re-emite o evento `boot` a cada ~1 s como rede de segurança.
+
+Campos opcionais relacionados:
+
+```yaml
+serial:
+  port: COM17
+  baud: 460800
+  transport: usb_serial_jtag
+  run_port: COM17              # porta de captura se for diferente da de flash
+  reset_before_capture: null   # null=auto, true=forçar DTR/RTS, false=nunca
+  boot_timeout_s: 30
+```
+
+> **Como saber qual usar?** Procure o número do chip USB na placa: se encontrar um CP2102, CH340, FT232 ou similar, é `uart0`; se o conector USB-C/micro-USB vai directo ao SoC (ex.: C3 Super Mini), é `usb_serial_jtag`.
 
 ## Classificação de Resultados
 
