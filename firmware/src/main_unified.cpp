@@ -1,7 +1,9 @@
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
+#include "driver/uart.h"
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -74,6 +76,39 @@ static register_fi_context_t g_register_fi_ctx;
 #if defined(FI_CAMPAIGN_MEMORY)
 static memory_fi_context_t g_memory_fi_ctx;
 #endif
+
+// -------------------------------------------------------------------
+// Protocol UART — writes directly to UART0 at compile-time baud rate,
+// completely independent of the ESP-IDF console configuration.
+// -------------------------------------------------------------------
+#ifndef FI_PROTOCOL_BAUD
+#define FI_PROTOCOL_BAUD 460800
+#endif
+
+static char g_proto_buf[2048];
+
+static void protocol_init_uart(void) {
+  const uart_config_t ucfg = {
+      .baud_rate  = FI_PROTOCOL_BAUD,
+      .data_bits  = UART_DATA_8_BITS,
+      .parity     = UART_PARITY_DISABLE,
+      .stop_bits  = UART_STOP_BITS_1,
+      .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+      .source_clk = UART_SCLK_DEFAULT,
+  };
+  ESP_ERROR_CHECK(uart_param_config(UART_NUM_0, &ucfg));
+  ESP_ERROR_CHECK(uart_driver_install(UART_NUM_0, 256, 2048, 0, NULL, 0));
+}
+
+static void proto_printf(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(g_proto_buf, sizeof(g_proto_buf), fmt, ap);
+  va_end(ap);
+  if (n > 0) {
+    uart_write_bytes(UART_NUM_0, g_proto_buf, n);
+  }
+}
 
 float dequantize_value(int8_t q, float scale, int32_t zero_point) {
   return (static_cast<int32_t>(q) - zero_point) * scale;
@@ -230,8 +265,32 @@ InferenceSummary run_inference(tflite::MicroInterpreter* interpreter,
 extern "C" {
 
 void protocol_send_boot(void) {
-  printf("{\"event\":\"boot\",\"status\":\"ready\"}\n");
-  fflush(stdout);
+  proto_printf("{\"event\":\"boot\",\"status\":\"ready\"}\n");
+}
+
+// Block until the host sends a newline-terminated command over UART.
+// Re-emits the boot event every second so the host can recover if the
+// original boot was missed (USB re-enumeration, buffer overflow, etc.).
+void protocol_wait_for_start(void) {
+  char buf[64];
+  size_t len = 0;
+  while (true) {
+    uint8_t byte = 0;
+    int n = uart_read_bytes(UART_NUM_0, &byte, 1, pdMS_TO_TICKS(1000));
+    if (n <= 0) {
+      protocol_send_boot();
+      continue;
+    }
+    if (byte == '\n' || byte == '\r') {
+      if (len > 0) {
+        return;
+      }
+      continue;
+    }
+    if (len < sizeof(buf) - 1) {
+      buf[len++] = (char)byte;
+    }
+  }
 }
 
 void protocol_send_golden_result(int32_t image_id,
@@ -239,12 +298,11 @@ void protocol_send_golden_result(int32_t image_id,
                                  int32_t pred_class,
                                  float top1_prob,
                                  const char* status) {
-  printf(
+  proto_printf(
       "{\"event\":\"result\",\"phase\":\"golden\",\"mode\":\"golden\","
       "\"fault_model\":\"none\",\"fault_id\":-1,\"image_id\":%ld,\"label\":%ld,"
       "\"pred_class\":%ld,\"top1_prob\":%.6f,\"status\":\"%s\",\"injection_status\":\"none\"}\n",
       static_cast<long>(image_id), static_cast<long>(label), static_cast<long>(pred_class), top1_prob, status);
-  fflush(stdout);
 }
 
 #if defined(FI_CAMPAIGN_REGISTER)
@@ -264,7 +322,7 @@ void protocol_send_fault_result(int32_t fault_id,
                                 uint8_t bit_index,
                                 const char* status,
                                 const char* injection_status) {
-  printf(
+  proto_printf(
       "{\"event\":\"result\",\"phase\":\"fault\",\"mode\":\"fault\","
       "\"fault_model\":\"register\","
       "\"fault_id\":%ld,\"image_id\":%ld,\"label\":%ld,\"pred_class\":%ld,"
@@ -277,19 +335,17 @@ void protocol_send_fault_result(int32_t fault_id,
       golden_top1_prob, static_cast<unsigned long>(operator_index), static_cast<unsigned>(register_id),
       register_name, static_cast<unsigned>(time_slot_index), static_cast<unsigned>(time_slot_count),
       static_cast<unsigned long>(delay_us), static_cast<unsigned>(bit_index), status, injection_status);
-  fflush(stdout);
 }
 
 void protocol_send_operator_profile(uint32_t operator_index,
                                     const char* op_name,
                                     uint32_t mean_duration_us,
                                     uint32_t samples) {
-  printf(
+  proto_printf(
       "{\"event\":\"op_profile\",\"fault_model\":\"register\",\"operator_index\":%lu,"
       "\"operator_name\":\"%s\",\"mean_duration_us\":%lu,\"samples\":%lu}\n",
       static_cast<unsigned long>(operator_index), op_name, static_cast<unsigned long>(mean_duration_us),
       static_cast<unsigned long>(samples));
-  fflush(stdout);
 }
 #endif
 
@@ -307,7 +363,7 @@ void protocol_send_fault_result(int32_t fault_id,
                                 uint8_t bit_index,
                                 const char* status,
                                 const char* injection_status) {
-  printf(
+  proto_printf(
       "{\"event\":\"result\",\"phase\":\"fault\",\"mode\":\"fault\","
       "\"fault_model\":\"memory\","
       "\"fault_id\":%ld,\"image_id\":%ld,\"label\":%ld,\"pred_class\":%ld,"
@@ -318,7 +374,6 @@ void protocol_send_fault_result(int32_t fault_id,
       static_cast<long>(pred_class), top1_prob, static_cast<long>(golden_pred_class),
       golden_top1_prob, static_cast<unsigned long>(operator_index), static_cast<unsigned long>(tensor_index),
       static_cast<unsigned long>(byte_in_tensor), static_cast<unsigned>(bit_index), status, injection_status);
-  fflush(stdout);
 }
 #endif
 
@@ -335,7 +390,7 @@ void protocol_send_multi_fault_result_register(
     float golden_top1_prob,
     const char* status,
     const char* injection_status) {
-  printf(
+  proto_printf(
       "{\"event\":\"result\",\"phase\":\"fault\",\"mode\":\"multi_fault\","
       "\"fault_model\":\"register\","
       "\"group_id\":%ld,\"fault_count\":%u,\"image_id\":%ld,\"label\":%ld,"
@@ -347,7 +402,6 @@ void protocol_send_multi_fault_result_register(
       static_cast<long>(pred_class), top1_prob,
       static_cast<long>(golden_pred_class), golden_top1_prob,
       status, injection_status);
-  fflush(stdout);
 }
 #endif
 
@@ -363,7 +417,7 @@ void protocol_send_multi_fault_result_memory(
     float golden_top1_prob,
     const char* status,
     const char* injection_status) {
-  printf(
+  proto_printf(
       "{\"event\":\"result\",\"phase\":\"fault\",\"mode\":\"multi_fault\","
       "\"fault_model\":\"memory\","
       "\"group_id\":%ld,\"fault_count\":%u,\"image_id\":%ld,\"label\":%ld,"
@@ -375,28 +429,27 @@ void protocol_send_multi_fault_result_memory(
       static_cast<long>(pred_class), top1_prob,
       static_cast<long>(golden_pred_class), golden_top1_prob,
       status, injection_status);
-  fflush(stdout);
 }
 #endif
 #endif  // MULTI_FI_MAX_COUNT
 
 void protocol_send_progress(const char* phase, uint32_t current, uint32_t total) {
-  printf("{\"event\":\"progress\",\"phase\":\"%s\",\"current\":%lu,\"total\":%lu}\n",
-         phase, static_cast<unsigned long>(current), static_cast<unsigned long>(total));
-  fflush(stdout);
+  proto_printf("{\"event\":\"progress\",\"phase\":\"%s\",\"current\":%lu,\"total\":%lu}\n",
+               phase, static_cast<unsigned long>(current), static_cast<unsigned long>(total));
 }
 
 void protocol_send_done(void) {
-  printf("{\"event\":\"done\"}\n");
-  fflush(stdout);
+  proto_printf("{\"event\":\"done\"}\n");
 }
 
 }  // extern "C"
 
 extern "C" void app_main(void) {
+  protocol_init_uart();
   setvbuf(stdout, NULL, _IOLBF, 256);
   vTaskDelay(pdMS_TO_TICKS(1500));
   protocol_send_boot();
+  protocol_wait_for_start();
 
 #if defined(FI_CAMPAIGN_REGISTER)
   const esp_reset_reason_t reset_reason = esp_reset_reason();
@@ -436,11 +489,10 @@ extern "C" void app_main(void) {
 #if defined(FI_CAMPAIGN_MEMORY)
   memory_fi_init(&g_memory_fi_ctx, g_model_ram, g_fault_list, g_fault_list_count);
   ESP_LOGI(kTag, "Tensor map entries: %lu", static_cast<unsigned long>(g_tensor_map_count));
-  printf("{\"event\":\"memory_map\","
-         "\"model_base\":%lu,\"model_size\":%lu}\n",
-         static_cast<unsigned long>(reinterpret_cast<uintptr_t>(g_model_ram)),
-         static_cast<unsigned long>(g_model_data_len));
-  fflush(stdout);
+  proto_printf("{\"event\":\"memory_map\","
+               "\"model_base\":%lu,\"model_size\":%lu}\n",
+               static_cast<unsigned long>(reinterpret_cast<uintptr_t>(g_model_ram)),
+               static_cast<unsigned long>(g_model_data_len));
 #endif
 
   const uint32_t image_size = kImageHeight * kImageWidth * kImageChannels;

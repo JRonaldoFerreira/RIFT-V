@@ -29,9 +29,10 @@ sampling:
 firmware:
   src_dir: "../firmware/src"
   platform: espressif32
-  board: esp32-c3-devkitm-1
+  board: esp32-c6-devkitm-1
   framework: espidf
   monitor_speed: 460800
+  # flash_size: 2MB   # uncomment if your module has 2MB instead of the board-default 4MB
 
 serial:
   port: COM17
