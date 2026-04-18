@@ -164,7 +164,23 @@ serial:
   boot_timeout_s: 30
 ```
 
-> **Como saber qual usar?** Procure o número do chip USB na placa: se encontrar um CP2102, CH340, FT232 ou similar, é `uart0`; se o conector USB-C/micro-USB vai directo ao SoC (ex.: C3 Super Mini), é `usb_serial_jtag`.
+> **Como saber qual usar?** Procure o número do chip USB na placa: se encontrar um CP2102, CH340, CH343, FT232 ou similar, é `uart0`; se o conector USB-C/micro-USB vai directo ao SoC (ex.: C3 Super Mini), é `usb_serial_jtag`.
+
+#### Identificar pelo Gerenciador de Dispositivos (Windows)
+
+O nome que o Windows atribui à porta COM é um forte indicador:
+
+| Nome no Gerenciador de Dispositivos | Tipo | `transport` |
+|-------------------------------------|------|-------------|
+| *"Dispositivo Serial USB"* (driver genérico `usbser.sys`) | USB CDC nativo do SoC | `usb_serial_jtag` |
+| *"USB-Enhanced-SERIAL CH343"* / *"USB-SERIAL CH340"* | Bridge WCH CH343/CH340 | `uart0` |
+| *"Silicon Labs CP210x USB to UART Bridge"* | Bridge Silicon Labs CP2102/CP2104 | `uart0` |
+| *"USB Serial Port"* (driver FTDI) | Bridge FTDI FT232 | `uart0` |
+
+**Exemplos reais testados:**
+
+- `ESP32-C3 Super Mini` → *"Dispositivo Serial USB (COM17)"* → `transport: usb_serial_jtag`
+- `ESP32-C6 DevKitC WiFi ZigBee N4` → *"USB-Enhanced-SERIAL CH343 (COM18)"* → `transport: uart0`
 
 ## Classificação de Resultados
 
