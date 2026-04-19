@@ -4,15 +4,15 @@
 
 experiment:
   name: registerfi_lenet5_mnist
-  description: "Register-FI bit-flip campaign on LeNet-5 (MNIST, int8)"
+  description: "Register-FI bit-flip campaign on image_classification (Fashion MNIST, int8)"
 
 model:
-  tflite: "../models/lenet5_mnist_int8.tflite"
-  subset_npz: "../models/mnist_subset.npz"
+  tflite: "../models/image_classification_fashionmnist_int8.tflite"
+  subset_npz: "../models/fashion_mnist_100_subset.npz"
 
 campaign:
   type: register
-  fault_duration: permanent_infer   # "transient" = per-operator (MicroFI), "permanent" = whole inference
+  fault_duration: transient   
   register:
     target_ops:
       - CONV_2D
@@ -35,11 +35,15 @@ firmware:
   board: esp32-c3-devkitm-1
   framework: espidf
   monitor_speed: 460800
+  idf_target: esp32c3
 
 serial:
   port: COM17
   baud: 460800
   boot_timeout_s: 30
+  transport: usb_serial_jtag
+  # run_port: COM17       # uncomment if capture port differs from flash port
+  
 
 output:
   dir: "../runs/{name}_{timestamp}"

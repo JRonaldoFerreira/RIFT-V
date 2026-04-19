@@ -435,6 +435,15 @@ def capture(
 
             event = payload.get("event")
 
+            if event == "boot":
+                print("[uart] Device rebooted (crash recovery) \u2014 re-sending start.", file=sys.stderr)
+                try:
+                    ser.write(b'{"cmd":"start"}\n')
+                    ser.flush()
+                except (serial.SerialException, OSError) as exc:
+                    print(f"[uart] Warning: could not re-send start: {exc}", file=sys.stderr)
+                continue
+
             if event == "progress":
                 phase = payload.get("phase", "?")
                 cur, tot = payload.get("current", 0), payload.get("total", 0)
