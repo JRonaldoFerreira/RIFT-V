@@ -6,3 +6,4 @@
 .vscode/ipch
 managed_components
 dependencies.lock
+sdkconfig*

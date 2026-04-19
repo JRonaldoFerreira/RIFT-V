@@ -1,4 +1,0 @@
-# Board-specific sdkconfig defaults for ESP32-C3 Super Mini (lolin_c3_mini)
-# The USB connector is wired to the chip's native USB Serial/JTAG controller.
-# When serial.transport is usb_serial_jtag, the builder will additionally set
-# CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y in the runtime sdkconfig fragment.
