@@ -32,7 +32,7 @@ firmware:
   src_dir: "../firmware/src"
 
 serial:
-  port: COM3
+  port: auto
   baud: 460800
 
 output:

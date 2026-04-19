@@ -324,7 +324,7 @@ class Experiment:
             print("[experiment] Note: standalone flash with hybrid only flashes register.", file=sys.stderr)
             print("[experiment]       Use execute() for the full hybrid pipeline.", file=sys.stderr)
         ctype = self.cfg.campaign.type if self.cfg.campaign.type != "hybrid" else "register"
-        port = upload_port or self.cfg.serial.port
+        port = upload_port or self.cfg.serial.resolve_port()
         print(f"[experiment] Flashing via {port} (env={ctype})...", file=sys.stderr)
         pio_builder.flash(self.cfg, ctype, upload_port=port, verbose=verbose)
         print("[experiment] Flash succeeded.", file=sys.stderr)
@@ -472,7 +472,7 @@ class Experiment:
 
             # Flash
             if not skip_flash:
-                port = self.cfg.serial.port
+                port = self.cfg.serial.resolve_port()
                 print(f"[experiment] Flashing via {port} (env={sub_type})...", file=sys.stderr)
                 pio_builder.flash(self.cfg, sub_type, verbose=verbose)
                 print(f"[experiment] Flash succeeded.", file=sys.stderr)
