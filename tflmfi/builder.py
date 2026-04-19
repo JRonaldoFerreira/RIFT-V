@@ -138,10 +138,35 @@ def flash(
     print(f"[builder] Running: {' '.join(cmd)}", file=sys.stderr)
     print(f"[builder] board={cfg.firmware.board}  platform={cfg.firmware.platform}  "
           f"flash_size={cfg.firmware.flash_size or 'board-default'}", file=sys.stderr)
-    result = subprocess.run(cmd, capture_output=False)
-    if result.returncode != 0:
-        raise RuntimeError(f"PlatformIO flash failed (exit {result.returncode}).")
-    return result
+
+    flash_warnings: List[str] = []
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, env=run_env,
+    )
+    for line in proc.stdout:
+        sys.stderr.write(line)
+        low = line.lower()
+        if "flash memory size mismatch" in low:
+            flash_warnings.append(line.strip())
+
+    proc.wait()
+
+    if flash_warnings:
+        print(f"\n[WARNING] {'='*60}", file=sys.stderr)
+        print("[WARNING] PlatformIO detected flash memory issues:", file=sys.stderr)
+        for w in flash_warnings:
+            print(f"[WARNING]   {w}", file=sys.stderr)
+        print(
+            "[WARNING] This may prevent the device from booting correctly.\n"
+            "[WARNING] Adjust flash size in sdkconfig.defaults or via 'pio run -t menuconfig'.",
+            file=sys.stderr,
+        )
+        print(f"[WARNING] {'='*60}\n", file=sys.stderr)
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"PlatformIO flash failed (exit {proc.returncode}).")
+    return subprocess.CompletedProcess(cmd, proc.returncode)
 
 
 def build_and_flash(

@@ -114,7 +114,8 @@ def _uart_reader_thread(
         try:
             waiting = ser.in_waiting
             chunk = ser.read(waiting) if waiting else ser.read(1)
-        except (serial.SerialException, TypeError, OSError):
+        except (serial.SerialException, OSError, TypeError):
+
             break
         if not chunk:
             continue
@@ -336,16 +337,10 @@ def capture(
     lq: queue.Queue[str] = queue.Queue()
     stop = threading.Event()
 
-<<<<<<< HEAD
     transport = serial_cfg.transport
-    port = serial_cfg.run_port or serial_cfg.port
+    port = serial_cfg.resolve_port()
     baud = serial_cfg.baud
     do_reset = _resolve_reset_flag(serial_cfg)
-=======
-    port = serial_cfg.resolve_port()
-    with serial.Serial(port, serial_cfg.baud, timeout=0.05) as ser:
-        print(f"[uart] Listening on {port} @ {serial_cfg.baud} baud", file=sys.stderr)
->>>>>>> 7c5c5fb (Adicionado a capacidade de auto identificar a porta do esp32)
 
     print(f"[uart] Listening on {port} @ {baud} baud  (transport={transport})", file=sys.stderr)
 
