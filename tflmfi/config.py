@@ -134,11 +134,13 @@ class SerialConfig:
     transport: str = "uart0"              # "uart0" or "usb_serial_jtag"
     run_port: Optional[str] = None        # capture port (defaults to *port* when None)
     reset_before_capture: Optional[bool] = None  # None = auto (True for uart0, False for usb_serial_jtag)
+    # Cache of the auto-detected device so flash and capture see the same
+    # port even when the board briefly re-enumerates after a reset.
+    _detected_port: Optional[str] = field(default=None, repr=False, compare=False)
 
-    def resolve_port(self) -> str:
-        """Return the effective serial port, auto-detecting if needed."""
-        if self.port.lower() != "auto":
-            return self.port
+    def _auto_detect(self) -> str:
+        if self._detected_port:
+            return self._detected_port
         detected = detect_esp32_port()
         if detected is None:
             raise RuntimeError(
@@ -146,7 +148,25 @@ class SerialConfig:
                 "Connect the board or set an explicit port in the YAML config."
             )
         print(f"[serial] Auto-detected ESP32 on {detected}", file=sys.stderr)
+        self._detected_port = detected
         return detected
+
+    def resolve_port(self, for_run: bool = False) -> str:
+        """Return the effective serial port, auto-detecting if needed.
+
+        When *for_run* is True, honour the optional ``run_port`` override
+        (capture port may differ from the flash/upload port).  Auto-detection
+        results are cached on the instance so that the flash step and the
+        UART capture step always agree on the same device.
+        """
+        if for_run and self.run_port:
+            rp = self.run_port
+            if rp.lower() != "auto":
+                return rp
+            return self._auto_detect()
+        if self.port.lower() != "auto":
+            return self.port
+        return self._auto_detect()
 
 
 @dataclass

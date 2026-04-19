@@ -338,7 +338,7 @@ def capture(
     stop = threading.Event()
 
     transport = serial_cfg.transport
-    port = serial_cfg.resolve_port()
+    port = serial_cfg.resolve_port(for_run=True)
     baud = serial_cfg.baud
     do_reset = _resolve_reset_flag(serial_cfg)
 
