@@ -262,9 +262,9 @@ def flash(
     flash_warnings: List[str] = []
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, env=run_env,
+        text=True,
     )
-    for line in proc.stdout:
+    for line in iter(proc.stdout.readline, ''):
         sys.stderr.write(line)
         low = line.lower()
         if "flash memory size mismatch" in low:
