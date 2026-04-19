@@ -47,7 +47,7 @@ firmware:
   idf_target: esp32c3
 
 serial:
-  port: COM17
+  port: auto
   baud: 460800
   transport: usb_serial_jtag
   # run_port: COM17       # uncomment if capture port differs from flash port
