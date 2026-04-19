@@ -514,14 +514,21 @@ extern "C" void app_main(void) {
   vTaskDelay(pdMS_TO_TICKS(1500));
 
   // ---- Allocate and load model BEFORE announcing boot ----
+  // Memory FI requires a writable RAM copy to inject bit-flips into model weights.
+  // Register FI only corrupts CPU registers during inference — model data is never
+  // modified — so it can reference g_model_data (flash .rodata) directly, avoiding
+  // a large heap allocation that may fail for bigger models on ESP32-C3.
+#if defined(FI_CAMPAIGN_MEMORY)
   g_model_ram = static_cast<uint8_t*>(heap_caps_malloc(g_model_data_len, MALLOC_CAP_8BIT));
   if (g_model_ram == nullptr) {
     ESP_LOGE(kTag, "Failed to allocate model RAM copy.");
     return;
   }
   memcpy(g_model_ram, g_model_data, g_model_data_len);
-
   const tflite::Model* model = tflite::GetModel(g_model_ram);
+#else
+  const tflite::Model* model = tflite::GetModel(g_model_data);
+#endif
   if (model == nullptr) {
     ESP_LOGE(kTag, "Failed to parse TFLite model.");
     return;
@@ -647,11 +654,13 @@ extern "C" void app_main(void) {
 
       vTaskDelay(1);
       esp_task_wdt_reset();
+#if defined(FI_CAMPAIGN_MEMORY)
       memcpy(g_model_ram, g_model_data, g_model_data_len);
+#endif
 
 #if defined(FI_CAMPAIGN_REGISTER)
       {
-        const tflite::Model* fi_model = tflite::GetModel(g_model_ram);
+        const tflite::Model* fi_model = tflite::GetModel(g_model_data);
         tflite::MicroInterpreter fi_interp(fi_model, resolver, g_tensor_arena, kTensorArenaSize);
         if (fi_interp.AllocateTensors() != kTfLiteOk) {
 #if defined(MULTI_FI_MAX_COUNT)

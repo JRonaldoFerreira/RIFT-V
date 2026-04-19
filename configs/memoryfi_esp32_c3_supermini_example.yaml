@@ -52,6 +52,11 @@ serial:
   transport: usb_serial_jtag
   # run_port: COM17       # uncomment if capture port differs from flash port
   boot_timeout_s: 30
+  max_hang_recoveries: 3       # forced resets when firmware hangs without rebooting
+  hang_recovery_delay_s: 2.0   # seconds to wait between reset attempts
+  # NOTE: DTR/RTS reset over USB native (usb_serial_jtag) may NOT trigger
+  # a real chip reset. For reliable hang recovery on native-USB boards,
+  # consider an external reset mechanism (e.g. relay on EN/RST pin).
 
 output:
   dir: "../runs/{name}_{timestamp}"

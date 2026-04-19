@@ -606,6 +606,49 @@ def capture(
                 return True
         return False
 
+    def _force_hw_reset_and_reconnect() -> bool:
+        """Close the port, force a DTR/RTS hardware reset, reopen, wait for boot.
+
+        This recovers from a firmware hang where the device did not reboot on
+        its own.  Works on boards with a USB-UART bridge that supports
+        DTR/RTS auto-reset (most ESP32 dev-kits).
+        """
+        nonlocal ser, reader
+
+        # 1. Stop the reader thread
+        stop_ev.set()
+        reader.join(timeout=3.0)
+
+        # 2. Close the current port
+        try:
+            ser.close()
+        except Exception:
+            pass
+
+        # 3. Drain leftover data from the queue
+        while not lq.empty():
+            try:
+                lq.get_nowait()
+            except queue.Empty:
+                break
+
+        # 4. Force DTR/RTS reset and reopen (always do_reset=True)
+        new_ser = _open_port_after_reset(port, baud, True, transport)
+        if new_ser is None:
+            print("[uart] HW reset: could not reopen port.", file=sys.stderr)
+            return False
+        ser = new_ser
+
+        # 5. Restart reader thread
+        stop_ev.clear()
+        reader = threading.Thread(
+            target=_uart_reader_thread, args=(ser, lq, stop_ev), daemon=True,
+        )
+        reader.start()
+
+        # 6. Wait for boot event
+        return _wait_for_boot(timeout_s=float(serial_cfg.boot_timeout_s))
+
     # ---- Main logic ----
     try:
         reader = threading.Thread(
@@ -726,7 +769,7 @@ def capture(
                     print(f"[uart] Firmware error: {msg}", file=sys.stderr)
                     got_ack = True  # skip to next job
 
-            # ---- Handle crash ----
+            # ---- Handle crash / hang ----
             if not got_ack:
                 key = (fi, img)
                 crash_retries[key] = crash_retries.get(key, 0) + 1
@@ -756,8 +799,71 @@ def capture(
                 if not boot_received:
                     print("[uart] Waiting for firmware reboot...", file=sys.stderr)
                     if not _wait_for_boot(timeout_s=30.0):
-                        print("[ERROR] Firmware did not reboot.", file=sys.stderr)
-                        break
+                        # ---- Firmware hung: attempt forced HW reset ----
+                        max_hw = serial_cfg.max_hang_recoveries
+                        delay = serial_cfg.hang_recovery_delay_s
+                        recovered = False
+                        for attempt in range(1, max_hw + 1):
+                            print(
+                                f"[uart] Firmware did not reboot. "
+                                f"Forcing HW reset ({attempt}/{max_hw})...",
+                                file=sys.stderr,
+                            )
+                            if delay > 0:
+                                time.sleep(delay)
+                            if _force_hw_reset_and_reconnect():
+                                print(
+                                    "[uart] HW reset succeeded \u2014 device rebooted.",
+                                    file=sys.stderr,
+                                )
+                                recovered = True
+                                break
+
+                        if not recovered:
+                            # All reset attempts exhausted for this job.
+                            # Mark the fault as fatal_hang (if not already
+                            # marked as a persistent crash above).
+                            if fi not in crashed_faults:
+                                crashed_faults.add(fi)
+                                cr = _make_crash_result(fi, img)
+                                cr["status"] = "fatal_hang"
+                                cr["injection_status"] = "fatal_hang"
+                                _append_jsonl(jsonl_path, cr)
+                                valid += 1
+                                crash_outcomes += 1
+
+                            # Remove any re-queued retries for this fault
+                            jobs = deque(j for j in jobs if j[0] != fi)
+
+                            if not jobs:
+                                print(
+                                    f"[uart] All {max_hw} HW resets failed and "
+                                    "no jobs remain. Campaign ending.",
+                                    file=sys.stderr,
+                                )
+                                break
+
+                            # Last-ditch: one more reset attempt so we can
+                            # continue with the remaining fault indices.
+                            print(
+                                "[uart] Attempting last-ditch HW reset "
+                                "to continue campaign...",
+                                file=sys.stderr,
+                            )
+                            if delay > 0:
+                                time.sleep(delay * 2)
+                            if not _force_hw_reset_and_reconnect():
+                                print(
+                                    "[ERROR] Cannot recover device. "
+                                    "Aborting campaign.",
+                                    file=sys.stderr,
+                                )
+                                break
+                            print(
+                                "[uart] Device recovered. Continuing "
+                                "with remaining faults.",
+                                file=sys.stderr,
+                            )
 
                 # Skip golden after crash — host has cached golden data.
                 # Firmware just needs golden_done=true to accept jobs.

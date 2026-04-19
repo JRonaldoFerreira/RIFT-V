@@ -44,7 +44,15 @@ serial:
   transport: uart0   # use "uart0" if your C6 board has a USB-UART bridge
   # run_port: COM18            # uncomment if capture port differs from flash port
   boot_timeout_s: 30
+  max_hang_recoveries: 3       # forced DTR/RTS resets when firmware hangs without rebooting
+  hang_recovery_delay_s: 2.0   # seconds to wait between reset attempts
 
 output:
   dir: "../runs/{name}_{timestamp}"
   formats: [csv, jsonl]
+
+
+
+
+
+

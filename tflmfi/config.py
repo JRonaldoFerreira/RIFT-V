@@ -83,6 +83,8 @@ class SerialConfig:
     transport: str = "uart0"              # "uart0" or "usb_serial_jtag"
     run_port: Optional[str] = None        # capture port (defaults to *port* when None)
     reset_before_capture: Optional[bool] = None  # None = auto (True for uart0, False for usb_serial_jtag)
+    max_hang_recoveries: int = 3          # HW reset attempts when firmware hangs without rebooting
+    hang_recovery_delay_s: float = 2.0    # seconds to wait between HW reset attempts
 
 
 @dataclass
@@ -234,6 +236,8 @@ def _parse_serial(raw: Optional[Dict[str, Any]]) -> SerialConfig:
         transport=transport,
         run_port=raw.get("run_port", None),
         reset_before_capture=reset_val,
+        max_hang_recoveries=raw.get("max_hang_recoveries", 3),
+        hang_recovery_delay_s=float(raw.get("hang_recovery_delay_s", 2.0)),
     )
 
 

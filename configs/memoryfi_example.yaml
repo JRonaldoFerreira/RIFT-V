@@ -38,6 +38,8 @@ serial:
   port: COM17
   baud: 460800
   boot_timeout_s: 30
+  max_hang_recoveries: 3       # forced DTR/RTS resets when firmware hangs without rebooting
+  hang_recovery_delay_s: 2.0   # seconds to wait between reset attempts
 
 output:
   dir: "../runs/{name}_{timestamp}"
