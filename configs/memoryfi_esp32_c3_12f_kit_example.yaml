@@ -50,7 +50,7 @@ firmware:
 serial:
   port: auto
   baud: 115200
-  transport: usb_serial_jtag
+  transport: uart0
   # run_port: COM17       # uncomment if capture port differs from flash port
   boot_timeout_s: 30
 
