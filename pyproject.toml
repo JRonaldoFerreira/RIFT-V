@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tflmfi"
-version = "0.1.0"
+version = "0.2.0"
 description = "Unified Fault-Injection Framework for TFLite-Micro on ESP32"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,6 +20,13 @@ dependencies = [
 [project.optional-dependencies]
 tf = ["tensorflow>=2.13"]
 dev = ["pytest", "ruff"]
+firmware = ["platformio>=6.1"]
+all = [
+    "tensorflow>=2.13",
+    "pytest",
+    "ruff",
+    "platformio>=6.1",
+]
 
 [project.scripts]
 tflmfi = "tflmfi.cli:main"

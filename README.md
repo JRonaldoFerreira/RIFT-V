@@ -13,6 +13,16 @@ Framework declarativo para campanhas de injeção de falhas (bit-flip) em modelo
 pip install -e .
 ```
 
+### Instalação completa (Python + dev + TensorFlow + PlatformIO)
+
+```bash
+pip install -e ".[all]"
+```
+
+Isso instala as dependências Python do framework, ferramentas de desenvolvimento, TensorFlow (para quantização/subset) e PlatformIO.
+
+> Nota: drivers USB/serial da placa e componentes de toolchain/SDK baixados pelo PlatformIO continuam dependentes do sistema operativo.
+
 ## Estrutura do Projeto
 
 ```
@@ -92,6 +102,12 @@ tflmfi configs/registerfi_example.yaml --step build
 tflmfi configs/registerfi_example.yaml --step flash
 tflmfi configs/registerfi_example.yaml --step run
 tflmfi configs/registerfi_example.yaml --step analyze
+
+# Regerar results.csv a partir de results.jsonl (schema novo, mesmo run)
+tflmfi configs/memoryfi_example.yaml --step rebuild-csv --run-dir runs/my_run
+
+# Analisar resultados de um run já existente
+tflmfi configs/memoryfi_example.yaml --step analyze --run-dir runs/my_run
 ```
 
 ### Uso programático

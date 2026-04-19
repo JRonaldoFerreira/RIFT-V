@@ -353,6 +353,33 @@ class Experiment:
         return csv
 
     # ------------------------------------------------------------------ #
+    # Step 4b: REBUILD-CSV — regenerate results.csv from JSONL
+    # ------------------------------------------------------------------ #
+
+    def rebuild_csv(self, run_dir: Optional[Path] = None) -> Path:
+        """Re-generate results.csv from results.jsonl in an existing run directory.
+
+        Useful when the CSV column schema changed after a capture.
+        """
+        from tflmfi.uart import build_csv
+
+        target = run_dir or self.out_dir
+        jsonl = target / "results.jsonl"
+        csv = target / "results.csv"
+        ctype = self.cfg.campaign.type
+        mi = self.cfg.campaign.multi_injection
+        is_multi = bool(mi and mi.enabled)
+        groups_csv = next(target.glob("*_fault_groups.csv"), None)
+
+        if not jsonl.exists():
+            raise FileNotFoundError(f"No JSONL found at {jsonl}")
+
+        print(f"[experiment] Rebuilding CSV from {jsonl}...", file=sys.stderr)
+        build_csv(jsonl, csv, campaign_type=ctype, is_multi=is_multi, groups_csv=groups_csv)
+        print(f"[experiment] CSV rebuilt → {csv}", file=sys.stderr)
+        return csv
+
+    # ------------------------------------------------------------------ #
     # Step 5: ANALYZE — classify
     # ------------------------------------------------------------------ #
 

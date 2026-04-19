@@ -15,6 +15,9 @@ Usage examples:
     # Capture only (firmware must already be flashed):
     tflmfi configs/registerfi_example.yaml --step run
 
+    # Rebuild CSV from JSONL (e.g. after column schema change):
+    tflmfi configs/memoryfi_example.yaml --step rebuild-csv --run-dir runs/my_run
+
     # Analyze existing results:
     tflmfi configs/registerfi_example.yaml --step analyze --results runs/my_run/results.csv
 """
@@ -37,12 +40,13 @@ def main() -> None:
     parser.add_argument(
         "--step",
         action="append",
-        choices=["prepare", "build", "flash", "run", "analyze", "all"],
+        choices=["prepare", "build", "flash", "run", "rebuild-csv", "analyze", "all"],
         help="Steps to execute (default: all). Can be repeated.",
     )
     parser.add_argument("--verbose", action="store_true", help="Verbose PlatformIO output")
     parser.add_argument("--stop-after", type=int, default=None, help="Stop UART capture after N messages")
     parser.add_argument("--results", type=Path, default=None, help="Existing results CSV for analyze step")
+    parser.add_argument("--run-dir", type=Path, default=None, help="Existing run directory (for rebuild-csv / analyze)")
     parser.add_argument("--upload-port", type=str, default=None, help="Override serial upload port")
     args = parser.parse_args()
 
@@ -67,8 +71,15 @@ def main() -> None:
     if "run" in steps:
         exp.run(stop_after=args.stop_after)
 
+    if "rebuild-csv" in steps:
+        exp.rebuild_csv(run_dir=args.run_dir)
+
     if "analyze" in steps:
-        exp.analyze(results_csv=args.results)
+        run_dir = args.run_dir
+        results = args.results
+        if run_dir and not results:
+            results = run_dir / "results.csv"
+        exp.analyze(results_csv=results)
 
 
 if __name__ == "__main__":
