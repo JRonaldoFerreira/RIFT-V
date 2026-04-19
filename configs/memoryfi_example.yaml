@@ -35,7 +35,7 @@ firmware:
   # flash_size: 2MB   # uncomment if your module has 2MB instead of the board-default 4MB
 
 serial:
-  port: COM17
+  port: auto
   baud: 460800
   boot_timeout_s: 30
 

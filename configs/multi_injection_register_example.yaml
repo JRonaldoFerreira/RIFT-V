@@ -44,7 +44,7 @@ firmware:
   monitor_speed: 460800
 
 serial:
-  port: COM17
+  port: auto
   baud: 460800
   boot_timeout_s: 30
 

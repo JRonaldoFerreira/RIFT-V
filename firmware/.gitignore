@@ -4,10 +4,5 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
-
-# Auto-generated sdkconfig files (build artifacts, NOT source).
-# Only sdkconfig.defaults is source-controlled.
-sdkconfig
-sdkconfig.memoryfi
-sdkconfig.registerfi
-sdkconfig.esp32-*
+managed_components
+dependencies.lock

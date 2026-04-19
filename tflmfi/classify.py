@@ -67,6 +67,20 @@ def classify_results(results_csv: Path, output_csv: Path) -> pd.DataFrame:
     The CSV must contain both golden (phase=="golden") and fault rows.
     Returns the classified DataFrame (fault rows only).
     """
+    if not results_csv.exists():
+        raise FileNotFoundError(
+            f"[classify] Results file not found: {results_csv}\n"
+            "[classify] The UART capture did not produce a results file.\n"
+            "[classify] This usually means the device failed to boot "
+            "(check boot timeout and flash warnings above)."
+        )
+    if results_csv.stat().st_size == 0:
+        raise ValueError(
+            f"[classify] Results file is empty: {results_csv}\n"
+            "[classify] The UART capture produced no data rows.\n"
+            "[classify] The device may have booted but sent no results."
+        )
+
     df = pd.read_csv(results_csv)
 
     golden_df = df[df["phase"] == "golden"].copy()

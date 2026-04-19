@@ -12,7 +12,7 @@ model:
 
 campaign:
   type: register
-  fault_duration: permanent_infer   # "transient" = per-operator (MicroFI), "permanent" = whole inference
+  fault_duration: permanent   # "transient" = per-operator (MicroFI), "permanent" = whole inference
   register:
     target_ops:
       - CONV_2D
@@ -37,7 +37,7 @@ firmware:
   monitor_speed: 460800
 
 serial:
-  port: COM17
+  port: auto
   baud: 460800
   boot_timeout_s: 30
 
