@@ -335,15 +335,36 @@ class Experiment:
 
     def run(self, stop_after: Optional[int] = None) -> Path:
         """Capture campaign results via UART. Returns the CSV path."""
+        import numpy as np
+        import pandas as pd
+
         jsonl = self.out_dir / "results.jsonl"
         csv = self.out_dir / "results.csv"
         ctype = self.cfg.campaign.type
         mi = self.cfg.campaign.multi_injection
         is_multi = bool(mi and mi.enabled)
         groups_csv = self.artifacts.groups_csv if self.artifacts else None
+
+        # Compute fault_count
+        fault_count = 0
+        if self.artifacts:
+            if is_multi and groups_csv and groups_csv.exists():
+                fault_count = len(pd.read_csv(groups_csv))
+            elif self.artifacts.selected_csv.exists():
+                fault_count = len(pd.read_csv(self.artifacts.selected_csv))
+
+        # Compute image_count from subset .npz
+        image_count = 0
+        subset_path = self.cfg.subset_npz_path
+        if subset_path.exists():
+            subset = np.load(subset_path)
+            image_count = len(subset["labels"])
+
         print(f"[experiment] Capturing UART → {csv}", file=sys.stderr)
         uart_capture(
             self.cfg.serial, jsonl, csv,
+            fault_count=fault_count,
+            image_count=image_count,
             stop_after=stop_after,
             campaign_type=ctype,
             is_multi=is_multi,
@@ -474,6 +495,9 @@ class Experiment:
         verbose: bool = False,
     ) -> Dict[str, Path]:
         """Run register and memory sub-campaigns sequentially on the target."""
+        import numpy as np
+        import pandas as pd
+
         results: Dict[str, Path] = {}
 
         for sub_type, artifacts in [
@@ -510,9 +534,24 @@ class Experiment:
             mi = self.cfg.campaign.multi_injection
             is_multi = bool(mi and mi.enabled)
             groups_csv_path = artifacts.groups_csv if artifacts else None
+
+            # Compute fault_count / image_count for host-driven scheduler
+            sub_fault_count = 0
+            if artifacts:
+                if is_multi and groups_csv_path and groups_csv_path.exists():
+                    sub_fault_count = len(pd.read_csv(groups_csv_path))
+                elif artifacts.selected_csv.exists():
+                    sub_fault_count = len(pd.read_csv(artifacts.selected_csv))
+            sub_image_count = 0
+            subset_path = self.cfg.subset_npz_path
+            if subset_path.exists():
+                sub_image_count = len(np.load(subset_path)["labels"])
+
             print(f"[experiment] Capturing UART → {csv}", file=sys.stderr)
             uart_capture(
                 self.cfg.serial, jsonl, csv,
+                fault_count=sub_fault_count,
+                image_count=sub_image_count,
                 stop_after=stop_after,
                 campaign_type=sub_type,
                 is_multi=is_multi,
