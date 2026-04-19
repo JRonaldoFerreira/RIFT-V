@@ -867,15 +867,22 @@ def capture(
 
                 # Skip golden after crash — host has cached golden data.
                 # Firmware just needs golden_done=true to accept jobs.
+                golden_ok = False
                 if golden_cache:
-                    if not _skip_golden():
-                        print("[ERROR] skip_golden failed after crash.", file=sys.stderr)
-                        break
-                else:
-                    print("[uart] Re-running golden after crash (no cache)...", file=sys.stderr)
-                    if not _run_golden(is_first=False):
-                        print("[ERROR] Golden failed after crash recovery.", file=sys.stderr)
-                        break
+                    golden_ok = _skip_golden()
+                    if not golden_ok:
+                        print(
+                            "[uart] skip_golden failed — falling back to full golden...",
+                            file=sys.stderr,
+                        )
+
+                if not golden_ok:
+                    print("[uart] Re-running golden after crash...", file=sys.stderr)
+                    golden_ok = _run_golden(is_first=False)
+
+                if not golden_ok:
+                    print("[ERROR] Golden recovery failed after crash.", file=sys.stderr)
+                    break
 
                 continue  # next job from the deque
 
