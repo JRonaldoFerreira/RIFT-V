@@ -1,0 +1,59 @@
+# ──────────────────────────────────────────────────
+# Memory Fault-Injection Campaign — ESP32-C3 Super Mini
+# ──────────────────────────────────────────────────
+# The ESP32-C3 Super Mini has the USB connector wired to the chip's
+# built-in USB Serial/JTAG controller (native USB), NOT to a UART
+# bridge.  This means:
+#
+#   serial.transport: usb_serial_jtag
+#
+# DTR/RTS reset over USB native does not trigger a real chip reset,
+# so the framework skips it automatically and uses a proactive start
+# handshake instead.
+#
+# If your C3 board has a CP2102/CH340 USB-to-UART bridge instead,
+# change transport to "uart0".
+
+experiment:
+  name: memoryfi_image_classification_c3_12f_kit
+  description: "Memory-FI bit-flip campaign on image_classification (Fashion MNIST, int8) — ESP32-C3 Super Mini"
+
+model:
+  tflite: "../models/image_classification_fashionmnist_int8.tflite"
+  subset_npz: "../models/fashion_mnist_100_subset.npz"
+
+campaign:
+  type: memory
+  fault_duration: transient
+  memory:
+    target_ops:
+      - CONV_2D
+      - FULLY_CONNECTED
+
+sampling:
+  method: stratified
+  confidence: 0.95
+  margin: 0.05
+  p_prior: 0.5
+  seed: 1337
+  group_by: [op_index, op_name]
+
+firmware:
+  src_dir: "../firmware/src"
+  platform: espressif32
+  board: esp32-c3-devkitm-1
+  flash_size: 2MB
+  framework: espidf
+  monitor_speed: 460800
+  idf_target: esp32c3
+
+serial:
+  port: auto
+  baud: 115200
+  transport: usb_serial_jtag
+  # run_port: COM17       # uncomment if capture port differs from flash port
+  boot_timeout_s: 30
+
+output:
+  dir: "../runs/{name}_{timestamp}"
+  formats: [csv, jsonl]
