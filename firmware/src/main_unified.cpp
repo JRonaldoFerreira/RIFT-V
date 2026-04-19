@@ -44,16 +44,6 @@
 
 #include "resolver_ops.h"
 
-#if defined(FI_CAMPAIGN_REGISTER)
-static RTC_NOINIT_ATTR uint32_t g_rtc_magic;
-static RTC_NOINIT_ATTR uint32_t g_rtc_fault_idx;
-static RTC_NOINIT_ATTR uint32_t g_rtc_image_id;
-static RTC_NOINIT_ATTR uint8_t g_rtc_golden_done;
-static RTC_NOINIT_ATTR int32_t g_rtc_golden_pred[128];
-static RTC_NOINIT_ATTR float g_rtc_golden_top1[128];
-static RTC_NOINIT_ATTR register_fi_op_profile_t g_rtc_op_profiles[32];
-static constexpr uint32_t kResumeMagic = 0x52464921u;
-#endif
 
 namespace {
 
@@ -294,30 +284,6 @@ void protocol_send_boot(void) {
   proto_printf("{\"event\":\"boot\",\"status\":\"ready\"}\n");
 }
 
-// Block until the host sends a newline-terminated command over UART.
-// Re-emits the boot event every second so the host can recover if the
-// original boot was missed (USB re-enumeration, buffer overflow, etc.).
-void protocol_wait_for_start(void) {
-  char buf[64];
-  size_t len = 0;
-  while (true) {
-    uint8_t byte = 0;
-    int n = proto_read_byte(&byte, pdMS_TO_TICKS(1000));
-    if (n <= 0) {
-      protocol_send_boot();
-      continue;
-    }
-    if (byte == '\n' || byte == '\r') {
-      if (len > 0) {
-        return;
-      }
-      continue;
-    }
-    if (len < sizeof(buf) - 1) {
-      buf[len++] = (char)byte;
-    }
-  }
-}
 
 void protocol_send_golden_result(int32_t image_id,
                                  int32_t label,
@@ -470,21 +436,84 @@ void protocol_send_done(void) {
 
 }  // extern "C"
 
+// -------------------------------------------------------------------
+// Command parsing — host-driven job protocol
+// -------------------------------------------------------------------
+
+enum FiCommand {
+  FI_CMD_UNKNOWN = 0,
+  FI_CMD_RUN_GOLDEN,
+  FI_CMD_SKIP_GOLDEN,
+  FI_CMD_RUN_JOB,
+  FI_CMD_DONE,
+};
+
+struct FiCommandData {
+  FiCommand type;
+  int32_t fault_idx;
+  int32_t image_id;
+};
+
+static int32_t json_extract_int(const char* json, const char* key) {
+  char pattern[48];
+  snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+  const char* p = strstr(json, pattern);
+  if (!p) return -1;
+  p += strlen(pattern);
+  while (*p == ' ' || *p == '\t') ++p;
+  char* end = nullptr;
+  long val = strtol(p, &end, 10);
+  if (end == p) return -1;
+  return static_cast<int32_t>(val);
+}
+
+static FiCommandData parse_command(const char* line) {
+  FiCommandData cmd = {};
+  cmd.type = FI_CMD_UNKNOWN;
+  cmd.fault_idx = -1;
+  cmd.image_id = -1;
+  if (strstr(line, "\"skip_golden\"")) {
+    cmd.type = FI_CMD_SKIP_GOLDEN;
+  } else if (strstr(line, "\"run_golden\"")) {
+    cmd.type = FI_CMD_RUN_GOLDEN;
+  } else if (strstr(line, "\"run_job\"")) {
+    cmd.type = FI_CMD_RUN_JOB;
+    cmd.fault_idx = json_extract_int(line, "fi");
+    cmd.image_id = json_extract_int(line, "img");
+  } else if (strstr(line, "\"done\"")) {
+    cmd.type = FI_CMD_DONE;
+  }
+  return cmd;
+}
+
+static int protocol_read_line(char* buf, size_t bufsize) {
+  size_t len = 0;
+  while (true) {
+    uint8_t byte = 0;
+    int n = proto_read_byte(&byte, pdMS_TO_TICKS(1000));
+    if (n <= 0) {
+      if (len == 0) protocol_send_boot();
+      continue;
+    }
+    if (byte == '\n' || byte == '\r') {
+      if (len > 0) {
+        buf[len] = '\0';
+        return static_cast<int>(len);
+      }
+      continue;
+    }
+    if (len < bufsize - 1) {
+      buf[len++] = static_cast<char>(byte);
+    }
+  }
+}
+
 extern "C" void app_main(void) {
   protocol_init_uart();
   setvbuf(stdout, NULL, _IOLBF, 256);
   vTaskDelay(pdMS_TO_TICKS(1500));
-  protocol_send_boot();
-  protocol_wait_for_start();
 
-#if defined(FI_CAMPAIGN_REGISTER)
-  const esp_reset_reason_t reset_reason = esp_reset_reason();
-  const bool is_crash_reset = (reset_reason == ESP_RST_PANIC || reset_reason == ESP_RST_TASK_WDT ||
-                               reset_reason == ESP_RST_INT_WDT || reset_reason == ESP_RST_WDT);
-  const bool resuming = (is_crash_reset && g_rtc_magic == kResumeMagic && g_rtc_golden_done == 1u);
-  ESP_LOGI(kTag, "Reset reason: %d, resuming: %s", (int)reset_reason, resuming ? "YES" : "NO");
-#endif
-
+  // ---- Allocate and load model BEFORE announcing boot ----
   g_model_ram = static_cast<uint8_t*>(heap_caps_malloc(g_model_data_len, MALLOC_CAP_8BIT));
   if (g_model_ram == nullptr) {
     ESP_LOGE(kTag, "Failed to allocate model RAM copy.");
@@ -515,176 +544,249 @@ extern "C" void app_main(void) {
 #if defined(FI_CAMPAIGN_MEMORY)
   memory_fi_init(&g_memory_fi_ctx, g_model_ram, g_fault_list, g_fault_list_count);
   ESP_LOGI(kTag, "Tensor map entries: %lu", static_cast<unsigned long>(g_tensor_map_count));
+#endif
+
+  const uint32_t image_size = kImageHeight * kImageWidth * kImageChannels;
+  static int32_t golden_pred_class[kNumCampaignImages];
+  static float golden_top1_prob[kNumCampaignImages];
+  bool golden_done = false;
+  bool wdt_active = false;
+
+  // ---- Announce boot (neutral — firmware does NOT decide to resume) ----
+  protocol_send_boot();
+
+#if defined(FI_CAMPAIGN_MEMORY)
   proto_printf("{\"event\":\"memory_map\","
                "\"model_base\":%lu,\"model_size\":%lu}\n",
                static_cast<unsigned long>(reinterpret_cast<uintptr_t>(g_model_ram)),
                static_cast<unsigned long>(g_model_data_len));
 #endif
 
-  const uint32_t image_size = kImageHeight * kImageWidth * kImageChannels;
-  static int32_t golden_pred_class[kNumCampaignImages];
-  static float golden_top1_prob[kNumCampaignImages];
+  // ---- Command loop — host drives the campaign ----
+  char cmd_buf[256];
+  while (true) {
+    const int cmd_len = protocol_read_line(cmd_buf, sizeof(cmd_buf));
+    if (cmd_len <= 0) continue;
+
+    const FiCommandData cmd = parse_command(cmd_buf);
+
+    // ---- run_golden: batch golden phase (no fault injection, safe) ----
+    if (cmd.type == FI_CMD_RUN_GOLDEN) {
+      ESP_LOGI(kTag, "Running golden phase (%lu images)...",
+               static_cast<unsigned long>(kNumCampaignImages));
 
 #if defined(FI_CAMPAIGN_REGISTER)
-  uint32_t start_fault_idx = 0u;
-
-  if (resuming) {
-    memcpy(golden_pred_class, g_rtc_golden_pred, sizeof(int32_t) * kNumCampaignImages);
-    memcpy(golden_top1_prob, g_rtc_golden_top1, sizeof(float) * kNumCampaignImages);
-    memcpy(g_register_fi_ctx.op_profiles, g_rtc_op_profiles, sizeof(g_rtc_op_profiles));
-
-    const uint32_t crashed_idx = g_rtc_fault_idx;
-    const uint32_t crashed_img = g_rtc_image_id;
-#if defined(MULTI_FI_MAX_COUNT)
-    if (crashed_idx < g_fault_group_count) {
-      const fault_group_t& group = g_fault_groups[crashed_idx];
-      for (uint32_t image_id = crashed_img; image_id < kNumCampaignImages; ++image_id) {
-        protocol_send_multi_fault_result_register(
-            group.group_id, group.fault_count,
-            static_cast<int32_t>(image_id), g_mnist_labels[image_id], -1, 0.0f,
-            golden_pred_class[image_id], golden_top1_prob[image_id],
-            "crash", "crash");
-      }
-    }
-#else
-    if (crashed_idx < g_fault_list_count) {
-      const register_fault_t& fault = g_fault_list[crashed_idx];
-      for (uint32_t image_id = crashed_img; image_id < kNumCampaignImages; ++image_id) {
-        protocol_send_fault_result(fault.fault_id, static_cast<int32_t>(image_id), g_mnist_labels[image_id], -1,
-                                   0.0f, golden_pred_class[image_id], golden_top1_prob[image_id], fault.op_index,
-                                   fault.register_id, register_fi_register_name(fault.register_id),
-                                   fault.time_slot_index, fault.time_slot_count, 0u, fault.bit_index, "crash",
-                                   "crash");
-      }
-    }
+      register_fi_set_profiling(&g_register_fi_ctx, true);
 #endif
-    start_fault_idx = crashed_idx + 1u;
-  } else {
-    g_rtc_magic = kResumeMagic;
-    g_rtc_golden_done = 0u;
 
-    register_fi_set_profiling(&g_register_fi_ctx, true);
-    protocol_send_progress("golden", 0, kNumCampaignImages);
-    for (uint32_t image_id = 0; image_id < kNumCampaignImages; ++image_id) {
-      const float* image_ptr = &g_mnist_images[image_id * image_size];
-      const InferenceSummary summary = run_inference(&interpreter, image_ptr, image_size, -1);
-      golden_pred_class[image_id] = summary.pred_class;
-      golden_top1_prob[image_id] = summary.top1_prob;
-      protocol_send_golden_result(static_cast<int32_t>(image_id), g_mnist_labels[image_id], summary.pred_class,
-                                  summary.top1_prob, summary.ok ? "ok" : "invoke_failed");
-      if (image_id % 10 == 0) {
-        vTaskDelay(1);
+      protocol_send_progress("golden", 0, kNumCampaignImages);
+      for (uint32_t image_id = 0; image_id < kNumCampaignImages; ++image_id) {
+        const float* image_ptr = &g_mnist_images[image_id * image_size];
+        const InferenceSummary summary = run_inference(&interpreter, image_ptr, image_size, -1);
+        golden_pred_class[image_id] = summary.pred_class;
+        golden_top1_prob[image_id] = summary.top1_prob;
+        protocol_send_golden_result(static_cast<int32_t>(image_id), g_mnist_labels[image_id],
+                                    summary.pred_class, summary.top1_prob,
+                                    summary.ok ? "ok" : "invoke_failed");
+        if (image_id % 10 == 0) {
+          vTaskDelay(1);
+        }
       }
+      protocol_send_progress("golden", kNumCampaignImages, kNumCampaignImages);
+
+#if defined(FI_CAMPAIGN_REGISTER)
+      register_fi_set_profiling(&g_register_fi_ctx, false);
+      for (uint32_t i = 0; i < g_register_op_names_count; ++i) {
+        const uint32_t op_index = g_register_op_names[i].op_index;
+        const uint32_t mean_us = register_fi_get_mean_duration_us(&g_register_fi_ctx, op_index);
+        const uint32_t samples = g_register_fi_ctx.op_profiles[op_index].count;
+        if (samples == 0u || mean_us == 0u) continue;
+        protocol_send_operator_profile(op_index, g_register_op_names[i].op_name, mean_us, samples);
+      }
+#endif
+
+      golden_done = true;
+      proto_printf("{\"event\":\"golden_done\"}\n");
+      ESP_LOGI(kTag, "Golden phase complete.");
+      continue;
     }
-    protocol_send_progress("golden", kNumCampaignImages, kNumCampaignImages);
-    register_fi_set_profiling(&g_register_fi_ctx, false);
 
-    memcpy(g_rtc_golden_pred, golden_pred_class, sizeof(int32_t) * kNumCampaignImages);
-    memcpy(g_rtc_golden_top1, golden_top1_prob, sizeof(float) * kNumCampaignImages);
-    memcpy(g_rtc_op_profiles, g_register_fi_ctx.op_profiles, sizeof(g_rtc_op_profiles));
-    g_rtc_golden_done = 1u;
+    // ---- skip_golden: host already has golden data, just unlock jobs ----
+    if (cmd.type == FI_CMD_SKIP_GOLDEN) {
+      golden_done = true;
+      proto_printf("{\"event\":\"golden_done\"}\n");
+      ESP_LOGI(kTag, "Golden phase skipped (host-cached).");
+      continue;
+    }
 
-    for (uint32_t i = 0; i < g_register_op_names_count; ++i) {
-      const uint32_t op_index = g_register_op_names[i].op_index;
-      const uint32_t mean_us = register_fi_get_mean_duration_us(&g_register_fi_ctx, op_index);
-      const uint32_t samples = g_register_fi_ctx.op_profiles[op_index].count;
-      if (samples == 0u || mean_us == 0u) {
+    // ---- run_job: execute a single fault x image job ----
+    if (cmd.type == FI_CMD_RUN_JOB) {
+      if (!golden_done) {
+        proto_printf("{\"event\":\"error\",\"msg\":\"golden_not_done\"}\n");
         continue;
       }
-      protocol_send_operator_profile(op_index, g_register_op_names[i].op_name, mean_us, samples);
-    }
-  }
 
-  {
-    const esp_task_wdt_config_t twdt_cfg = {
-        .timeout_ms = 30000,
-        .idle_core_mask = 0,
-        .trigger_panic = true,
-    };
-    esp_task_wdt_reconfigure(&twdt_cfg);
-    esp_task_wdt_add(NULL);
-  }
+      const int32_t fi = cmd.fault_idx;
+      const int32_t img = cmd.image_id;
 
+      if (img < 0 || static_cast<uint32_t>(img) >= kNumCampaignImages) {
+        proto_printf("{\"event\":\"error\",\"msg\":\"invalid_image_id\"}\n");
+        continue;
+      }
+
+      if (!wdt_active) {
+        const esp_task_wdt_config_t twdt_cfg = {
+            .timeout_ms = 30000,
+            .idle_core_mask = 0,
+            .trigger_panic = true,
+        };
+        esp_task_wdt_reconfigure(&twdt_cfg);
+        esp_task_wdt_add(NULL);
+        wdt_active = true;
+      }
+
+      vTaskDelay(1);
+      esp_task_wdt_reset();
+      memcpy(g_model_ram, g_model_data, g_model_data_len);
+
+#if defined(FI_CAMPAIGN_REGISTER)
+      {
+        const tflite::Model* fi_model = tflite::GetModel(g_model_ram);
+        tflite::MicroInterpreter fi_interp(fi_model, resolver, g_tensor_arena, kTensorArenaSize);
+        if (fi_interp.AllocateTensors() != kTfLiteOk) {
 #if defined(MULTI_FI_MAX_COUNT)
-  for (uint32_t group_idx = start_fault_idx; group_idx < g_fault_group_count; ++group_idx) {
-    g_rtc_fault_idx = group_idx;
-
-    if (group_idx % 100 == 0) {
-      protocol_send_progress("fault", group_idx, g_fault_group_count);
-    }
-
-    const fault_group_t& group = g_fault_groups[group_idx];
-    register_fi_set_group(&g_register_fi_ctx, g_fault_pool, group.pool_indices, group.fault_count);
-
-    for (uint32_t image_id = 0; image_id < kNumCampaignImages; ++image_id) {
-      g_rtc_image_id = image_id;
-      vTaskDelay(1);
-      esp_task_wdt_reset();
-
-      memcpy(g_model_ram, g_model_data, g_model_data_len);
-      const tflite::Model* fi_model = tflite::GetModel(g_model_ram);
-      tflite::MicroInterpreter fi_interp(fi_model, resolver, g_tensor_arena, kTensorArenaSize);
-      if (fi_interp.AllocateTensors() != kTfLiteOk) {
-        protocol_send_multi_fault_result_register(
-            group.group_id, group.fault_count,
-            static_cast<int32_t>(image_id), g_mnist_labels[image_id], -1, 0.0f,
-            golden_pred_class[image_id], golden_top1_prob[image_id],
-            "invoke_failed", "alloc_failed");
-        continue;
-      }
-
-      const float* image_ptr = &g_mnist_images[image_id * image_size];
-      const InferenceSummary summary = run_inference(&fi_interp, image_ptr, image_size, -1);
-      protocol_send_multi_fault_result_register(
-          group.group_id, group.fault_count,
-          static_cast<int32_t>(image_id), g_mnist_labels[image_id],
-          summary.pred_class, summary.top1_prob,
-          golden_pred_class[image_id], golden_top1_prob[image_id],
-          summary.ok ? "ok" : "invoke_failed", summary.injection_status);
-    }
-
-    register_fi_clear_group(&g_register_fi_ctx);
-  }
+          if (static_cast<uint32_t>(fi) < g_fault_group_count) {
+            const fault_group_t& group = g_fault_groups[fi];
+            protocol_send_multi_fault_result_register(
+                group.group_id, group.fault_count,
+                img, g_mnist_labels[img], -1, 0.0f,
+                golden_pred_class[img], golden_top1_prob[img],
+                "invoke_failed", "alloc_failed");
+          }
 #else
-  for (uint32_t fault_idx = start_fault_idx; fault_idx < g_fault_list_count; ++fault_idx) {
-    g_rtc_fault_idx = fault_idx;
-
-    if (fault_idx % 100 == 0) {
-      protocol_send_progress("fault", fault_idx, g_fault_list_count);
-    }
-
-    const register_fault_t& fault = g_fault_list[fault_idx];
-    for (uint32_t image_id = 0; image_id < kNumCampaignImages; ++image_id) {
-      g_rtc_image_id = image_id;
-      vTaskDelay(1);
-      esp_task_wdt_reset();
-
-      memcpy(g_model_ram, g_model_data, g_model_data_len);
-      const tflite::Model* fi_model = tflite::GetModel(g_model_ram);
-      tflite::MicroInterpreter fi_interp(fi_model, resolver, g_tensor_arena, kTensorArenaSize);
-      if (fi_interp.AllocateTensors() != kTfLiteOk) {
-        protocol_send_fault_result(fault.fault_id, static_cast<int32_t>(image_id), g_mnist_labels[image_id], -1,
-                                   0.0f, golden_pred_class[image_id], golden_top1_prob[image_id], fault.op_index,
-                                   fault.register_id, register_fi_register_name(fault.register_id),
-                                   fault.time_slot_index, fault.time_slot_count, 0u, fault.bit_index,
-                                   "invoke_failed", "alloc_failed");
-        continue;
+          if (static_cast<uint32_t>(fi) < g_fault_list_count) {
+            const register_fault_t& fault = g_fault_list[fi];
+            protocol_send_fault_result(fault.fault_id, img, g_mnist_labels[img], -1,
+                                       0.0f, golden_pred_class[img], golden_top1_prob[img], fault.op_index,
+                                       fault.register_id, register_fi_register_name(fault.register_id),
+                                       fault.time_slot_index, fault.time_slot_count, 0u, fault.bit_index,
+                                       "invoke_failed", "alloc_failed");
+          }
+#endif
+        } else {
+#if defined(MULTI_FI_MAX_COUNT)
+          if (static_cast<uint32_t>(fi) < g_fault_group_count) {
+            const fault_group_t& group = g_fault_groups[fi];
+            register_fi_set_group(&g_register_fi_ctx, g_fault_pool, group.pool_indices, group.fault_count);
+            const float* image_ptr = &g_mnist_images[img * image_size];
+            const InferenceSummary summary = run_inference(&fi_interp, image_ptr, image_size, -1);
+            protocol_send_multi_fault_result_register(
+                group.group_id, group.fault_count,
+                img, g_mnist_labels[img],
+                summary.pred_class, summary.top1_prob,
+                golden_pred_class[img], golden_top1_prob[img],
+                summary.ok ? "ok" : "invoke_failed", summary.injection_status);
+            register_fi_clear_group(&g_register_fi_ctx);
+          }
+#else
+          if (static_cast<uint32_t>(fi) < g_fault_list_count) {
+            const register_fault_t& fault = g_fault_list[fi];
+            const float* image_ptr = &g_mnist_images[img * image_size];
+            const InferenceSummary summary = run_inference(&fi_interp, image_ptr, image_size, fi);
+            protocol_send_fault_result(fault.fault_id, img, g_mnist_labels[img],
+                                       summary.pred_class, summary.top1_prob,
+                                       golden_pred_class[img], golden_top1_prob[img],
+                                       fault.op_index, summary.register_id,
+                                       summary.register_name, summary.time_slot_index,
+                                       summary.time_slot_count, summary.delay_us,
+                                       fault.bit_index,
+                                       summary.ok ? "ok" : "invoke_failed",
+                                       summary.injection_status);
+          }
+#endif
+        }
       }
+#endif  // FI_CAMPAIGN_REGISTER
 
-      const float* image_ptr = &g_mnist_images[image_id * image_size];
-      const InferenceSummary summary = run_inference(&fi_interp, image_ptr, image_size, static_cast<int32_t>(fault_idx));
-      protocol_send_fault_result(fault.fault_id, static_cast<int32_t>(image_id), g_mnist_labels[image_id],
-                                 summary.pred_class, summary.top1_prob, golden_pred_class[image_id],
-                                 golden_top1_prob[image_id], fault.op_index, summary.register_id,
-                                 summary.register_name, summary.time_slot_index,
-                                 summary.time_slot_count, summary.delay_us,
-                                 fault.bit_index, summary.ok ? "ok" : "invoke_failed", summary.injection_status);
-    }
-  }
+#if defined(FI_CAMPAIGN_MEMORY)
+      {
+#if defined(MULTI_FI_MAX_COUNT)
+        if (static_cast<uint32_t>(fi) < g_fault_group_count) {
+          const fault_group_t& group = g_fault_groups[fi];
+#if defined(FI_FAULT_TRANSIENT)
+          memory_fi_set_group(&g_memory_fi_ctx, g_fault_pool, group.pool_indices, group.fault_count);
+          const float* image_ptr = &g_mnist_images[img * image_size];
+          const InferenceSummary summary = run_inference(&interpreter, image_ptr, image_size, -1);
+          protocol_send_multi_fault_result_memory(
+              group.group_id, group.fault_count,
+              img, g_mnist_labels[img],
+              summary.pred_class, summary.top1_prob,
+              golden_pred_class[img], golden_top1_prob[img],
+              summary.ok ? "ok" : "invoke_failed",
+              summary.injection_status);
+          memory_fi_clear_group(&g_memory_fi_ctx);
+#else
+          memory_fi_set_group(&g_memory_fi_ctx, g_fault_pool, group.pool_indices, group.fault_count);
+          for (uint8_t fii = 0; fii < g_memory_fi_ctx.group_fault_count; ++fii) {
+            const memory_fault_t* f = g_memory_fi_ctx.group_faults[fii];
+            uint8_t* addr = memory_fi_resolve_addr(&g_memory_fi_ctx, f);
+            g_memory_fi_ctx.saved_group_bytes[fii] = *addr;
+            g_memory_fi_ctx.group_injection_active[fii] = true;
+          }
+          for (uint8_t fii = 0; fii < g_memory_fi_ctx.group_fault_count; ++fii) {
+            const memory_fault_t* f = g_memory_fi_ctx.group_faults[fii];
+            uint8_t* addr = memory_fi_resolve_addr(&g_memory_fi_ctx, f);
+            *addr ^= static_cast<uint8_t>(1u << f->bit_index);
+          }
+          const float* image_ptr = &g_mnist_images[img * image_size];
+          const InferenceSummary summary = run_inference(&interpreter, image_ptr, image_size, -1);
+          for (int8_t fii = static_cast<int8_t>(g_memory_fi_ctx.group_fault_count) - 1; fii >= 0; --fii) {
+            uint8_t* addr = memory_fi_resolve_addr(&g_memory_fi_ctx, g_memory_fi_ctx.group_faults[fii]);
+            *addr = g_memory_fi_ctx.saved_group_bytes[fii];
+            g_memory_fi_ctx.group_injection_active[fii] = false;
+          }
+          protocol_send_multi_fault_result_memory(
+              group.group_id, group.fault_count,
+              img, g_mnist_labels[img],
+              summary.pred_class, summary.top1_prob,
+              golden_pred_class[img], golden_top1_prob[img],
+              summary.ok ? "ok" : "invoke_failed",
+              summary.ok ? "injected" : "invoke_failed");
+          memory_fi_clear_group(&g_memory_fi_ctx);
+#endif
+        }
+#else
+        if (static_cast<uint32_t>(fi) < g_fault_list_count) {
+          const float* image_ptr = &g_mnist_images[img * image_size];
+          const InferenceSummary summary = run_inference(&interpreter, image_ptr, image_size, fi);
+          const memory_fault_t& fault = g_fault_list[fi];
+          protocol_send_fault_result(fault.fault_id, img, g_mnist_labels[img],
+                                     summary.pred_class, summary.top1_prob,
+                                     golden_pred_class[img], golden_top1_prob[img],
+                                     fault.op_index, fault.tensor_index, fault.byte_in_tensor,
+                                     fault.bit_index,
+                                     summary.ok ? "ok" : "invoke_failed",
+                                     summary.injection_status);
+        }
 #endif  // MULTI_FI_MAX_COUNT
+      }
+#endif  // FI_CAMPAIGN_MEMORY
 
-  esp_task_wdt_delete(NULL);
-  {
+      proto_printf("{\"event\":\"job_ack\"}\n");
+      continue;
+    }
+
+    // ---- done: host signals campaign end ----
+    if (cmd.type == FI_CMD_DONE) {
+      break;
+    }
+
+    ESP_LOGW(kTag, "Unknown command: %s", cmd_buf);
+  }
+
+  // ---- Cleanup ----
+  if (wdt_active) {
+    esp_task_wdt_delete(NULL);
     const esp_task_wdt_config_t twdt_cfg = {
         .timeout_ms = 30000,
         .idle_core_mask = (1 << 0),
@@ -693,126 +795,9 @@ extern "C" void app_main(void) {
     esp_task_wdt_reconfigure(&twdt_cfg);
   }
 
-#if defined(MULTI_FI_MAX_COUNT)
-  protocol_send_progress("fault", g_fault_group_count, g_fault_group_count);
-#else
-  protocol_send_progress("fault", g_fault_list_count, g_fault_list_count);
-#endif
-  protocol_send_done();
-  g_rtc_magic = 0u;
+#if defined(FI_CAMPAIGN_REGISTER)
   register_fi_deinit(&g_register_fi_ctx);
 #endif
 
-#if defined(FI_CAMPAIGN_MEMORY)
-  protocol_send_progress("golden", 0, kNumCampaignImages);
-  for (uint32_t image_id = 0; image_id < kNumCampaignImages; ++image_id) {
-    const float* image_ptr = &g_mnist_images[image_id * image_size];
-    const InferenceSummary summary = run_inference(&interpreter, image_ptr, image_size, -1);
-    golden_pred_class[image_id] = summary.pred_class;
-    golden_top1_prob[image_id] = summary.top1_prob;
-    protocol_send_golden_result(static_cast<int32_t>(image_id), g_mnist_labels[image_id], summary.pred_class,
-                                summary.top1_prob, summary.ok ? "ok" : "invoke_failed");
-    if (image_id % 10 == 0) {
-      vTaskDelay(1);
-    }
-  }
-  protocol_send_progress("golden", kNumCampaignImages, kNumCampaignImages);
-
-#if defined(MULTI_FI_MAX_COUNT)
-  for (uint32_t group_idx = 0; group_idx < g_fault_group_count; ++group_idx) {
-    if (group_idx % 100 == 0) {
-      protocol_send_progress("fault", group_idx, g_fault_group_count);
-    }
-
-    const fault_group_t& group = g_fault_groups[group_idx];
-    memcpy(g_model_ram, g_model_data, g_model_data_len);
-
-#if defined(FI_FAULT_TRANSIENT)
-    memory_fi_set_group(&g_memory_fi_ctx, g_fault_pool, group.pool_indices, group.fault_count);
-
-    for (uint32_t image_id = 0; image_id < kNumCampaignImages; ++image_id) {
-      const float* image_ptr = &g_mnist_images[image_id * image_size];
-      const InferenceSummary summary = run_inference(&interpreter, image_ptr, image_size, -1);
-
-      protocol_send_multi_fault_result_memory(
-          group.group_id, group.fault_count,
-          static_cast<int32_t>(image_id), g_mnist_labels[image_id],
-          summary.pred_class, summary.top1_prob,
-          golden_pred_class[image_id], golden_top1_prob[image_id],
-          summary.ok ? "ok" : "invoke_failed",
-          summary.injection_status);
-      if (image_id % 10 == 0) {
-        vTaskDelay(1);
-      }
-    }
-
-    memory_fi_clear_group(&g_memory_fi_ctx);
-#else
-    memory_fi_set_group(&g_memory_fi_ctx, g_fault_pool, group.pool_indices, group.fault_count);
-
-    for (uint32_t image_id = 0; image_id < kNumCampaignImages; ++image_id) {
-      for (uint8_t fi = 0; fi < g_memory_fi_ctx.group_fault_count; ++fi) {
-        const memory_fault_t* fault = g_memory_fi_ctx.group_faults[fi];
-        uint8_t* addr = memory_fi_resolve_addr(&g_memory_fi_ctx, fault);
-        g_memory_fi_ctx.saved_group_bytes[fi] = *addr;
-        g_memory_fi_ctx.group_injection_active[fi] = true;
-      }
-      for (uint8_t fi = 0; fi < g_memory_fi_ctx.group_fault_count; ++fi) {
-        const memory_fault_t* fault = g_memory_fi_ctx.group_faults[fi];
-        uint8_t* addr = memory_fi_resolve_addr(&g_memory_fi_ctx, fault);
-        *addr ^= static_cast<uint8_t>(1u << fault->bit_index);
-      }
-
-      const float* image_ptr = &g_mnist_images[image_id * image_size];
-      const InferenceSummary summary = run_inference(&interpreter, image_ptr, image_size, -1);
-
-      for (int8_t fi = static_cast<int8_t>(g_memory_fi_ctx.group_fault_count) - 1; fi >= 0; --fi) {
-        uint8_t* addr = memory_fi_resolve_addr(&g_memory_fi_ctx, g_memory_fi_ctx.group_faults[fi]);
-        *addr = g_memory_fi_ctx.saved_group_bytes[fi];
-        g_memory_fi_ctx.group_injection_active[fi] = false;
-      }
-
-      protocol_send_multi_fault_result_memory(
-          group.group_id, group.fault_count,
-          static_cast<int32_t>(image_id), g_mnist_labels[image_id],
-          summary.pred_class, summary.top1_prob,
-          golden_pred_class[image_id], golden_top1_prob[image_id],
-          summary.ok ? "ok" : "invoke_failed",
-          summary.ok ? "injected" : "invoke_failed");
-      if (image_id % 10 == 0) {
-        vTaskDelay(1);
-      }
-    }
-
-    memory_fi_clear_group(&g_memory_fi_ctx);
-#endif
-  }
-
-  protocol_send_progress("fault", g_fault_group_count, g_fault_group_count);
-#else
-  for (uint32_t fault_idx = 0; fault_idx < g_fault_list_count; ++fault_idx) {
-    if (fault_idx % 100 == 0) {
-      protocol_send_progress("fault", fault_idx, g_fault_list_count);
-    }
-
-    const memory_fault_t& fault = g_fault_list[fault_idx];
-    memcpy(g_model_ram, g_model_data, g_model_data_len);
-
-    for (uint32_t image_id = 0; image_id < kNumCampaignImages; ++image_id) {
-      const float* image_ptr = &g_mnist_images[image_id * image_size];
-      const InferenceSummary summary = run_inference(&interpreter, image_ptr, image_size, static_cast<int32_t>(fault_idx));
-      protocol_send_fault_result(fault.fault_id, static_cast<int32_t>(image_id), g_mnist_labels[image_id],
-                                 summary.pred_class, summary.top1_prob, golden_pred_class[image_id],
-                                 golden_top1_prob[image_id], fault.op_index, fault.tensor_index, fault.byte_in_tensor,
-                                 fault.bit_index, summary.ok ? "ok" : "invoke_failed", summary.injection_status);
-      if (image_id % 10 == 0) {
-        vTaskDelay(1);
-      }
-    }
-  }
-
-  protocol_send_progress("fault", g_fault_list_count, g_fault_list_count);
-#endif  // MULTI_FI_MAX_COUNT
   protocol_send_done();
-#endif
 }

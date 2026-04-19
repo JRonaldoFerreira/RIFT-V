@@ -104,6 +104,27 @@ def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
         fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+def _load_valid_fault_ids(run_dir: Path, is_multi: bool) -> Optional[set]:
+    """Load valid fault/group IDs from the selected-faults CSV in *run_dir*.
+
+    Returns ``None`` when no suitable CSV is found (dedup-only mode).
+    """
+    for csv_path in sorted(run_dir.glob("selected_*faults.csv")):
+        try:
+            sdf = pd.read_csv(csv_path, usecols=["fault_id"])
+            return set(sdf["fault_id"].dropna().astype(int))
+        except (ValueError, KeyError):
+            continue
+    if is_multi:
+        for csv_path in sorted(run_dir.glob("*_fault_groups.csv")):
+            try:
+                sdf = pd.read_csv(csv_path, usecols=["group_id"])
+                return set(sdf["group_id"].dropna().astype(int))
+            except (ValueError, KeyError):
+                continue
+    return None
+
+
 def _uart_reader_thread(
     ser: serial.Serial,
     line_queue: "queue.Queue[str]",
@@ -187,6 +208,64 @@ def build_csv(
         return
 
     df = pd.DataFrame(rows)
+
+    # -- Deduplicate result rows (firmware crash-recovery may re-send) --
+    result_mask = df["event"] == "result"
+    if result_mask.any():
+        non_results = df[~result_mask]
+        results_df = df[result_mask].copy()
+        before_dedup = len(results_df)
+
+        if is_multi and "group_id" in results_df.columns:
+            golden = results_df[results_df["phase"] == "golden"]
+            fault = results_df[results_df["phase"] != "golden"]
+            golden = golden.drop_duplicates(subset=["image_id"], keep="last")
+            fault = fault.drop_duplicates(subset=["group_id", "image_id"], keep="last")
+            results_df = pd.concat([golden, fault], ignore_index=True)
+        elif "fault_id" in results_df.columns and "image_id" in results_df.columns:
+            results_df = results_df.drop_duplicates(
+                subset=["fault_id", "image_id"], keep="last",
+            )
+
+        dropped = before_dedup - len(results_df)
+        if dropped:
+            print(
+                f"[CSV] Deduplicated: dropped {dropped} duplicate result rows",
+                file=sys.stderr,
+            )
+
+        # Filter out corrupt fault IDs caused by crash-induced memory corruption
+        valid_ids = _load_valid_fault_ids(jsonl_path.parent, is_multi)
+        if valid_ids is not None:
+            valid_ids_with_golden = valid_ids | {-1}
+            if is_multi and "group_id" in results_df.columns:
+                corrupt_mask = (
+                    (results_df["phase"] != "golden")
+                    & ~results_df["group_id"].isin(valid_ids)
+                )
+            elif "fault_id" in results_df.columns:
+                corrupt_mask = ~results_df["fault_id"].isin(valid_ids_with_golden)
+            else:
+                corrupt_mask = pd.Series(False, index=results_df.index)
+
+            n_corrupt = int(corrupt_mask.sum())
+            if n_corrupt:
+                print(
+                    f"[CSV] Filtered {n_corrupt} rows with corrupt fault IDs",
+                    file=sys.stderr,
+                )
+                results_df = results_df[~corrupt_mask]
+
+        # Dedup non-result rows (e.g. op_profile after firmware restarts)
+        op_mask = non_results["event"] == "op_profile"
+        if op_mask.any() and "operator_index" in non_results.columns:
+            ops = non_results[op_mask].drop_duplicates(
+                subset=["operator_index"], keep="last",
+            )
+            rest = non_results[~op_mask]
+            non_results = pd.concat([rest, ops], ignore_index=True)
+
+        df = pd.concat([non_results, results_df], ignore_index=True)
 
     # Enrich multi-fault rows with group member indices
     if is_multi and groups_csv and groups_csv.exists():
@@ -295,46 +374,110 @@ def capture(
     serial_cfg: SerialConfig,
     jsonl_path: Path,
     csv_path: Path,
+    fault_count: int = 0,
+    image_count: int = 0,
     stop_after: Optional[int] = None,
     on_result: Optional[Callable[[Dict[str, Any]], None]] = None,
     campaign_type: Optional[str] = None,
     is_multi: bool = False,
     groups_csv: Optional[Path] = None,
 ) -> None:
-    """Open the serial port, capture the campaign, write JSONL, then build CSV.
+    """Drive the campaign via job commands, capture results, write JSONL + CSV.
+
+    The host acts as the campaign scheduler.  It sends commands to firmware:
+
+    - ``run_golden`` — run the golden (fault-free) inference phase
+    - ``run_job``    — run a single fault x image inference
+    - ``done``       — signal campaign end
+
+    If the firmware crashes during a job (detected by a ``boot`` event),
+    the host re-sends ``run_golden`` to reinitialise, then retries or
+    marks the job as a crash outcome.
 
     Parameters
     ----------
     serial_cfg : SerialConfig
         Port, baud, transport and boot timeout settings.
-    jsonl_path : Path
-        Where to stream JSON lines.
-    csv_path : Path
-        Where to write the final CSV.
+    jsonl_path / csv_path : Path
+        Output destinations.
+    fault_count : int
+        Number of faults (or groups) to iterate over.
+    image_count : int
+        Number of images per fault.
     stop_after : int, optional
         Stop after *N* valid data messages.
     on_result : callable, optional
         Called with each result payload dict for live monitoring.
     campaign_type : str, optional
-        ``"memory"`` or ``"register"``.  Passed through to :func:`build_csv`.
+        ``"memory"`` or ``"register"``.
     is_multi : bool
         Whether this is a multi-fault campaign.
     groups_csv : Path, optional
         Path to the ``*_fault_groups.csv`` for multi-fault enrichment.
     """
+    MAX_CRASH_RETRIES = 1
+    JOB_TIMEOUT_S = 60.0
+    GOLDEN_TIMEOUT_S = 120.0
+
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Truncate stale capture files from previous runs
     if jsonl_path.exists():
         jsonl_path.unlink()
     if csv_path.exists():
         csv_path.unlink()
 
+    # ---- Auto-detect fault_count / image_count from run directory ----
+    run_dir = jsonl_path.parent
+    if fault_count == 0:
+        if is_multi:
+            for p in sorted(run_dir.glob("*_fault_groups.csv")):
+                try:
+                    fault_count = len(pd.read_csv(p))
+                    break
+                except Exception:
+                    pass
+        if fault_count == 0:
+            for p in sorted(run_dir.glob("selected_*faults.csv")):
+                try:
+                    fault_count = len(pd.read_csv(p))
+                    break
+                except Exception:
+                    pass
+    if image_count == 0:
+        meta_path = run_dir / "meta.json"
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                image_count = int(meta.get("image_count", meta.get("subset_count", 0)))
+            except Exception:
+                pass
+
+    # ---- Load fault-ID lookup for crash result generation ----
+    fault_id_map: Dict[int, int] = {}
+    group_id_map: Dict[int, int] = {}
+    if is_multi:
+        for p in sorted(run_dir.glob("*_fault_groups.csv")):
+            try:
+                gdf = pd.read_csv(p)
+                if "group_id" in gdf.columns:
+                    group_id_map = dict(enumerate(gdf["group_id"].astype(int)))
+                break
+            except Exception:
+                pass
+    else:
+        for p in sorted(run_dir.glob("selected_*faults.csv")):
+            try:
+                sdf = pd.read_csv(p)
+                if "fault_id" in sdf.columns:
+                    fault_id_map = dict(enumerate(sdf["fault_id"].astype(int)))
+                break
+            except Exception:
+                pass
+
     valid = 0
-    campaign_done = False
     lq: queue.Queue[str] = queue.Queue()
-    stop = threading.Event()
+    stop_ev = threading.Event()
 
     transport = serial_cfg.transport
     port = serial_cfg.run_port or serial_cfg.port
@@ -342,143 +485,327 @@ def capture(
     do_reset = _resolve_reset_flag(serial_cfg)
 
     print(f"[uart] Listening on {port} @ {baud} baud  (transport={transport})", file=sys.stderr)
+    print(f"[uart] Campaign: {fault_count} faults x {image_count} images = {fault_count * image_count} jobs", file=sys.stderr)
 
     # ---- Phase 1+2: reset (if applicable) and open the capture port ----
     ser = _open_port_after_reset(port, baud, do_reset, transport)
-
     if ser is None:
         print(f"[ERROR] Could not open {port} after reset.", file=sys.stderr)
         return
 
-    try:
-        reader = threading.Thread(target=_uart_reader_thread, args=(ser, lq, stop), daemon=True)
-        reader.start()
+    # ---- Helper closures ----
+    def _send_cmd(cmd_dict: Dict[str, Any]) -> None:
+        try:
+            ser.write((json.dumps(cmd_dict) + "\n").encode())
+            ser.flush()
+        except (serial.SerialException, OSError) as exc:
+            print(f"[uart] Warning: send failed: {exc}", file=sys.stderr)
 
-        # ---- Phase 3: handshake — wait for boot or send proactive start ----
-        # For USB native boards the boot event may already have been emitted
-        # before the host opened the port.  The firmware re-emits boot every
-        # ~1 s, so we should eventually see it.  As a safety net we also send
-        # a proactive start after a short grace period.
-        if transport == "usb_serial_jtag":
-            # Give the firmware a moment, then send start proactively
-            time.sleep(0.3)
-            print("[uart] Sending proactive start (USB native)...", file=sys.stderr)
-            try:
-                ser.write(b'{"cmd":"start"}\n')
-                ser.flush()
-            except (serial.SerialException, OSError) as exc:
-                print(f"[uart] Warning: could not send proactive start: {exc}", file=sys.stderr)
+    def _read_event(timeout: float = JOB_TIMEOUT_S) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Return (payload, None) or (None, error_kind)."""
+        try:
+            line = lq.get(timeout=timeout)
+        except queue.Empty:
+            return None, "timeout"
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            low = line.lower()
+            is_panic = any(m in low for m in _PANIC_MARKERS)
+            is_warn = any(m in low for m in _SYSTEM_WARNING_MARKERS)
+            if is_panic or is_warn:
+                _append_jsonl(jsonl_path, {
+                    "event": "_system_warning",
+                    "warning_type": "panic" if is_panic else "system_warning",
+                    "uart_line": line[:500],
+                })
+            else:
+                print(f"[WARN] Non-JSON: {line[:200]}", file=sys.stderr)
+            return None, "non_json"
+        return payload, None
 
-        print("[uart] Waiting for boot event...", file=sys.stderr)
+    def _wait_for_boot(timeout_s: Optional[float] = None) -> bool:
+        timeout = timeout_s or float(serial_cfg.boot_timeout_s)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            remaining = max(0.1, deadline - time.monotonic())
+            payload, err = _read_event(timeout=remaining)
+            if err == "timeout":
+                return False
+            if payload and payload.get("event") == "boot":
+                return True
+        return False
+
+    # Cache of golden results: image_id -> (pred_class, top1_prob)
+    golden_cache: Dict[int, Tuple[int, float]] = {}
+
+    def _run_golden(is_first: bool = True) -> bool:
+        """Send run_golden and block until golden_done. Returns success."""
+        nonlocal valid
+        _send_cmd({"cmd": "run_golden"})
+        print("[uart] Running golden phase...", file=sys.stderr)
+
         while True:
-            try:
-                line = lq.get(timeout=float(serial_cfg.boot_timeout_s))
-            except queue.Empty:
-                # Last-resort: send start one more time before giving up
-                print("[uart] No boot yet \u2014 sending start command...", file=sys.stderr)
-                try:
-                    ser.write(b'{"cmd":"start"}\n')
-                    ser.flush()
-                except (serial.SerialException, OSError):
-                    pass
-                try:
-                    line = lq.get(timeout=5.0)
-                except queue.Empty:
-                    print("[ERROR] Boot timeout.", file=sys.stderr)
-                    stop.set()
-                    reader.join(timeout=2.0)
-                    return
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
+            payload, err = _read_event(timeout=GOLDEN_TIMEOUT_S)
+            if err == "timeout":
+                print("[uart] Golden phase timeout!", file=sys.stderr)
+                return False
+            if err:
                 continue
-            evt = payload.get("event")
-            if evt == "boot":
-                print("[uart] Boot received \u2014 sending start signal.", file=sys.stderr)
-                try:
-                    ser.write(b'{"cmd":"start"}\n')
-                    ser.flush()
-                except (serial.SerialException, OSError) as exc:
-                    print(f"[uart] Warning: could not send start: {exc}", file=sys.stderr)
-                print("[uart] Campaign running.", file=sys.stderr)
-                break
-            if evt in ("result", "progress", "done"):
-                print(
-                    f"[uart] Firmware already running ('{evt}' before boot) "
-                    "\u2014 joining campaign.",
-                    file=sys.stderr,
-                )
-                lq.put(line)
-                break
-
-        # ---- Phase 4: main receive loop ----
-        while True:
-            line = lq.get()
-            if not line:
-                continue
-
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                low = line.lower()
-                is_panic = any(m in low for m in _PANIC_MARKERS)
-                is_warn = any(m in low for m in _SYSTEM_WARNING_MARKERS)
-                if is_panic or is_warn:
-                    _append_jsonl(jsonl_path, {
-                        "event": "_system_warning",
-                        "warning_type": "panic" if is_panic else "system_warning",
-                        "uart_line": line[:500],
-                    })
-                else:
-                    print(f"[WARN] Non-JSON: {line[:200]}", file=sys.stderr)
+            if payload is None:
                 continue
 
             event = payload.get("event")
 
             if event == "boot":
-                print("[uart] Device rebooted (crash recovery) \u2014 re-sending start.", file=sys.stderr)
-                try:
-                    ser.write(b'{"cmd":"start"}\n')
-                    ser.flush()
-                except (serial.SerialException, OSError) as exc:
-                    print(f"[uart] Warning: could not re-send start: {exc}", file=sys.stderr)
+                print("[uart] Crash during golden! Retrying...", file=sys.stderr)
+                _send_cmd({"cmd": "run_golden"})
                 continue
+
+            if event in ("result", "op_profile") and is_first:
+                _append_jsonl(jsonl_path, payload)
+                valid += 1
+
+            # Cache golden predictions for skip_golden patching
+            if event == "result" and payload.get("phase") == "golden":
+                img_id = payload.get("image_id")
+                if img_id is not None:
+                    golden_cache[int(img_id)] = (
+                        int(payload.get("pred_class", -1)),
+                        float(payload.get("top1_prob", 0.0)),
+                    )
+
+            if event == "memory_map":
+                _append_jsonl(jsonl_path, payload)
 
             if event == "progress":
                 phase = payload.get("phase", "?")
                 cur, tot = payload.get("current", 0), payload.get("total", 0)
                 pct = (cur / tot * 100) if tot else 0
                 print(f"[PROGRESS] {phase}: {cur}/{tot} ({pct:.1f}%)", file=sys.stderr)
+
+            if event == "golden_done":
+                print("[uart] Golden phase complete.", file=sys.stderr)
+                return True
+
+    def _skip_golden() -> bool:
+        """Send skip_golden to bypass inference; host patches golden fields."""
+        _send_cmd({"cmd": "skip_golden"})
+        print("[uart] Sending skip_golden (host-cached)...", file=sys.stderr)
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            remaining = max(0.1, deadline - time.monotonic())
+            payload, err = _read_event(timeout=remaining)
+            if err == "timeout":
+                print("[uart] skip_golden timeout!", file=sys.stderr)
+                return False
+            if err:
+                continue
+            if payload and payload.get("event") == "golden_done":
+                print("[uart] Golden skipped (host-cached).", file=sys.stderr)
+                return True
+        return False
+
+    # ---- Main logic ----
+    try:
+        reader = threading.Thread(
+            target=_uart_reader_thread, args=(ser, lq, stop_ev), daemon=True,
+        )
+        reader.start()
+
+        if transport == "usb_serial_jtag":
+            time.sleep(0.3)
+
+        print("[uart] Waiting for boot event...", file=sys.stderr)
+        if not _wait_for_boot():
+            print("[ERROR] Boot timeout.", file=sys.stderr)
+            stop_ev.set()
+            reader.join(timeout=2.0)
+            return
+
+        print("[uart] Boot received.", file=sys.stderr)
+
+        # ---- Golden phase ----
+        if not _run_golden(is_first=True):
+            print("[ERROR] Golden phase failed.", file=sys.stderr)
+            stop_ev.set()
+            reader.join(timeout=2.0)
+            return
+
+        # ---- Fault-job dispatch loop ----
+        from collections import deque
+
+        total_jobs = fault_count * image_count
+        jobs: "deque[Tuple[int, int]]" = deque(
+            (fi, img) for fi in range(fault_count) for img in range(image_count)
+        )
+        crash_retries: Dict[Tuple[int, int], int] = {}
+        crashed_faults: set = set()
+        completed = 0
+        crash_outcomes = 0
+
+        def _make_crash_result(fi_idx: int, image_id: int) -> Dict[str, Any]:
+            cr: Dict[str, Any] = {
+                "event": "result",
+                "phase": "fault",
+                "mode": "multi_fault" if is_multi else "fault",
+                "fault_model": campaign_type or "unknown",
+                "status": "crash",
+                "injection_status": "crash",
+                "image_id": image_id,
+                "pred_class": -1,
+                "top1_prob": 0.0,
+            }
+            if is_multi:
+                cr["group_id"] = group_id_map.get(fi_idx, fi_idx)
+                cr["fault_count"] = 0
+            else:
+                cr["fault_id"] = fault_id_map.get(fi_idx, fi_idx)
+            return cr
+
+        print(f"[uart] Dispatching {total_jobs} fault jobs...", file=sys.stderr)
+
+        while jobs:
+            fi, img = jobs.popleft()
+
+            # ---- Skip images whose fault index already crashed ----
+            if fi in crashed_faults:
+                cr = _make_crash_result(fi, img)
+                _append_jsonl(jsonl_path, cr)
+                valid += 1
+                crash_outcomes += 1
                 continue
 
-            if event == "done":
-                campaign_done = True
-                print("[uart] Campaign finished.", file=sys.stderr)
-                break
+            _send_cmd({"cmd": "run_job", "fi": fi, "img": img})
 
-            _append_jsonl(jsonl_path, payload)
-            valid += 1
+            got_ack = False
+            boot_received = False
 
-            if event == "result":
-                phase = payload.get("phase", payload.get("mode", "?"))
-                fid = payload.get("fault_id", "?")
-                img = payload.get("image_id", "?")
-                st = payload.get("injection_status", "?")
-                print(f"[RX {valid}] phase={phase} fault_id={fid} image={img} inj={st}", file=sys.stderr)
-                if on_result:
-                    on_result(payload)
+            while not got_ack:
+                payload, err = _read_event(timeout=JOB_TIMEOUT_S)
+
+                if err == "timeout":
+                    print(f"[uart] Job timeout fi={fi} img={img}", file=sys.stderr)
+                    break
+                if err:
+                    continue
+                if payload is None:
+                    continue
+
+                event = payload.get("event")
+
+                if event == "boot":
+                    boot_received = True
+                    break
+
+                if event == "result":
+                    # Patch golden fields from host cache when golden
+                    # was skipped after a crash recovery.
+                    if golden_cache and payload.get("phase") == "fault":
+                        img_id = payload.get("image_id")
+                        if img_id is not None and int(img_id) in golden_cache:
+                            gc_pred, gc_prob = golden_cache[int(img_id)]
+                            payload["golden_pred_class"] = gc_pred
+                            payload["golden_top1_prob"] = gc_prob
+                    _append_jsonl(jsonl_path, payload)
+                    valid += 1
+                    fid = payload.get("fault_id", payload.get("group_id", "?"))
+                    st = payload.get("injection_status", "?")
+                    print(
+                        f"[RX {valid}] fi={fi} img={img} fault_id={fid} inj={st}",
+                        file=sys.stderr,
+                    )
+                    if on_result:
+                        on_result(payload)
+
+                if event == "job_ack":
+                    got_ack = True
+
+                if event == "error":
+                    msg = payload.get("msg", "unknown")
+                    print(f"[uart] Firmware error: {msg}", file=sys.stderr)
+                    got_ack = True  # skip to next job
+
+            # ---- Handle crash ----
+            if not got_ack:
+                key = (fi, img)
+                crash_retries[key] = crash_retries.get(key, 0) + 1
+
+                if crash_retries[key] <= MAX_CRASH_RETRIES:
+                    print(
+                        f"[uart] Crash fi={fi} img={img} "
+                        f"(attempt {crash_retries[key]}/{MAX_CRASH_RETRIES})",
+                        file=sys.stderr,
+                    )
+                    jobs.appendleft((fi, img))
+                else:
+                    # Mark this fault index as crashed — skip all remaining
+                    # images for it instead of retrying each one individually.
+                    crashed_faults.add(fi)
+                    print(
+                        f"[uart] Persistent crash fi={fi} img={img} "
+                        "\u2014 recording as crash for all remaining images.",
+                        file=sys.stderr,
+                    )
+                    cr = _make_crash_result(fi, img)
+                    _append_jsonl(jsonl_path, cr)
+                    valid += 1
+                    crash_outcomes += 1
+
+                # Wait for boot if we haven't seen it already
+                if not boot_received:
+                    print("[uart] Waiting for firmware reboot...", file=sys.stderr)
+                    if not _wait_for_boot(timeout_s=30.0):
+                        print("[ERROR] Firmware did not reboot.", file=sys.stderr)
+                        break
+
+                # Skip golden after crash — host has cached golden data.
+                # Firmware just needs golden_done=true to accept jobs.
+                if golden_cache:
+                    if not _skip_golden():
+                        print("[ERROR] skip_golden failed after crash.", file=sys.stderr)
+                        break
+                else:
+                    print("[uart] Re-running golden after crash (no cache)...", file=sys.stderr)
+                    if not _run_golden(is_first=False):
+                        print("[ERROR] Golden failed after crash recovery.", file=sys.stderr)
+                        break
+
+                continue  # next job from the deque
+
+            # ---- Job completed successfully ----
+            completed += 1
+            if completed % 100 == 0 or completed == total_jobs:
+                print(
+                    f"[uart] Progress: {completed}/{total_jobs} jobs, "
+                    f"{crash_outcomes} crash outcomes",
+                    file=sys.stderr,
+                )
 
             if stop_after is not None and valid >= stop_after:
                 break
 
-        stop.set()
+        # ---- Signal campaign end ----
+        _send_cmd({"cmd": "done"})
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            payload, err = _read_event(timeout=max(0.1, deadline - time.monotonic()))
+            if err:
+                break
+            if payload and payload.get("event") == "done":
+                break
+
+        print(
+            f"[uart] Campaign finished. {completed} completed, "
+            f"{crash_outcomes} crash outcomes.",
+            file=sys.stderr,
+        )
+
+        stop_ev.set()
         reader.join(timeout=2.0)
     finally:
-        stop.set()
+        stop_ev.set()
         ser.close()
-
-    if not campaign_done:
-        print("[WARN] Capture ended WITHOUT 'done' event \u2014 results may be incomplete.", file=sys.stderr)
 
     build_csv(jsonl_path, csv_path, campaign_type=campaign_type,
               is_multi=is_multi, groups_csv=groups_csv)
