@@ -723,6 +723,7 @@ def capture(
 
             got_ack = False
             boot_received = False
+            pending_result = None
 
             while not got_ack:
                 payload, err = _read_event(timeout=JOB_TIMEOUT_S)
@@ -750,16 +751,9 @@ def capture(
                             gc_pred, gc_prob = golden_cache[int(img_id)]
                             payload["golden_pred_class"] = gc_pred
                             payload["golden_top1_prob"] = gc_prob
-                    _append_jsonl(jsonl_path, payload)
-                    valid += 1
-                    fid = payload.get("fault_id", payload.get("group_id", "?"))
-                    st = payload.get("injection_status", "?")
-                    print(
-                        f"[RX {valid}] fi={fi} img={img} fault_id={fid} inj={st}",
-                        file=sys.stderr,
-                    )
-                    if on_result:
-                        on_result(payload)
+                    # Buffer the result — only persist after job_ack to
+                    # avoid writing "ok" for jobs that crash before ack.
+                    pending_result = payload
 
                 if event == "job_ack":
                     got_ack = True
@@ -885,6 +879,19 @@ def capture(
                     break
 
                 continue  # next job from the deque
+
+            # ---- Flush buffered result on successful ack ----
+            if pending_result is not None:
+                _append_jsonl(jsonl_path, pending_result)
+                valid += 1
+                fid = pending_result.get("fault_id", pending_result.get("group_id", "?"))
+                st = pending_result.get("injection_status", "?")
+                print(
+                    f"[RX {valid}] fi={fi} img={img} fault_id={fid} inj={st}",
+                    file=sys.stderr,
+                )
+                if on_result:
+                    on_result(pending_result)
 
             # ---- Job completed successfully ----
             completed += 1

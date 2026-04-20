@@ -3,16 +3,16 @@
 # ──────────────────────────────────────────────────
 
 experiment:
-  name: registerfi_lenet5_mnist
-  description: "Register-FI bit-flip campaign on image_classification (Fashion MNIST, int8)"
+  name: registerfi_lenet5_mnist_parmanent
+  description: "Register-FI bit-flip campaign on LeNet-5 (MNIST, int8)_permanent type"
 
 model:
-  tflite: "../models/image_classification_fashionmnist_int8.tflite"
-  subset_npz: "../models/fashion_mnist_100_subset.npz"
+  tflite: "../models/lenet5_mnist_int8.tflite"
+  subset_npz: "../models/mnist_subset.npz"
 
 campaign:
   type: register
-  fault_duration: transient   
+  fault_duration: permanent   
   register:
     target_ops:
       - CONV_2D
