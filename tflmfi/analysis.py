@@ -483,8 +483,14 @@ class PhysicalAnalysisReport:
 
         if not self.critical_regions.empty:
             top = self.critical_regions.iloc[0]
+            bin_start = top.get("bin_start")
+            bin_end = top.get("bin_end")
+            if pd.notna(bin_start) and pd.notna(bin_end):
+                region = f"[{int(bin_start):#x}, {int(bin_end):#x})"
+            else:
+                region = f"[{bin_start}, {bin_end})"
             lines.append(
-                f"  Hottest physical region: [{top['bin_start']:#x}, {top['bin_end']:#x})"
+                f"  Hottest physical region: {region}"
                 f" rate={top['critical_rate']:.3f} ({top['total']} faults)"
             )
 
