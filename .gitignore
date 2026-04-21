@@ -40,7 +40,9 @@ Thumbs.db
 
 # --- Saídas de experimentos (descomente se NÃO quiser ignorar) ---
 runs/
-analysis_runs/
+
+# --- Arquivos grandes de resultados ---
+*.jsonl
 
 # --- PlatformIO (já listado em firmware/.gitignore; reforço na raiz) ---
 firmware/.pio/
