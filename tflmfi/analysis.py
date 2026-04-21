@@ -13,6 +13,15 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+    _HAS_MPL = True
+except ImportError:
+    _HAS_MPL = False
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -22,6 +31,55 @@ SEVERITY_ORDER = ["Masked", "Acceptable", "Good", "Observed", "Warning", "Critic
 
 CRITICAL_CLASSES = {"Critical", "Crash"}
 DEGRADED_CLASSES = {"Warning", "Critical", "Crash"}
+
+# ---------------------------------------------------------------------------
+# Tensor type inference
+# ---------------------------------------------------------------------------
+
+_TFLITE_DTYPE_MAP = {
+    0: "float32", 1: "float16", 2: "int32", 3: "uint8",
+    4: "int64", 5: "string", 6: "bool", 7: "int16",
+    8: "complex64", 9: "int8",
+}
+
+
+def infer_tensor_type(row: pd.Series) -> str:
+    """Infer the semantic type of a TFLite tensor from its metadata.
+
+    Returns one of: 'weight', 'bias', 'input', 'activation', 'constant'.
+    """
+    is_const = row.get("is_constant", None)
+    if is_const is False or (isinstance(is_const, str) and is_const.lower() == "false"):
+        name = str(row.get("name", "")).lower()
+        if "input" in name or "serving_default" in name:
+            return "input"
+        return "activation"
+
+    dtype = int(row.get("dtype", -1)) if pd.notna(row.get("dtype")) else -1
+    shape_str = str(row.get("shape", ""))
+    name = str(row.get("name", "")).lower()
+
+    # int32 constants are almost always bias in quantised models
+    if dtype == 2:  # int32
+        return "bias"
+
+    # int8 / uint8 constants with multi-dimensional shape → weights
+    if dtype in (9, 3):  # int8 / uint8
+        if "x" in shape_str:  # multi-dimensional
+            return "weight"
+        # 1-D int8 constant is unusual; still call it weight
+        return "weight"
+
+    # catch-all for other constants (e.g. reduction_indices)
+    return "constant"
+
+
+def add_tensor_type_column(tensor_map: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of *tensor_map* with an added ``tensor_type`` column."""
+    tm = tensor_map.copy()
+    tm["tensor_type"] = tm.apply(infer_tensor_type, axis=1)
+    return tm
+
 
 # ---------------------------------------------------------------------------
 # Data loading
@@ -179,8 +237,15 @@ def bin_by_physical_offset(
     return pd.DataFrame(records).sort_values("bin_start").reset_index(drop=True)
 
 
-def criticality_by_tensor(enriched: pd.DataFrame) -> pd.DataFrame:
+def criticality_by_tensor(
+    enriched: pd.DataFrame,
+    tensor_map: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
     """Compute criticality rates per tensor.
+
+    If *tensor_map* is provided (with ``tensor_type`` column), the result
+    includes a ``tensor_type`` column identifying each tensor as
+    ``weight``, ``bias``, ``input``, ``activation`` or ``constant``.
 
     Returns a DataFrame with per-tensor statistics sorted by critical_rate
     descending.
@@ -210,7 +275,17 @@ def criticality_by_tensor(enriched: pd.DataFrame) -> pd.DataFrame:
             row["tensor_size"] = int(grp["tensor_length_bytes"].iloc[0])
         records.append(row)
 
-    return pd.DataFrame(records).sort_values("critical_rate", ascending=False).reset_index(drop=True)
+    result = pd.DataFrame(records).sort_values("critical_rate", ascending=False).reset_index(drop=True)
+
+    # Attach tensor_type from tensor_map if available
+    if tensor_map is not None and "tensor_index" in result.columns:
+        tm = tensor_map.copy()
+        if "tensor_type" not in tm.columns:
+            tm = add_tensor_type_column(tm)
+        type_lookup = tm.set_index("tensor_index")["tensor_type"]
+        result["tensor_type"] = result["tensor_index"].map(type_lookup)
+
+    return result
 
 
 def criticality_by_operator(enriched: pd.DataFrame) -> pd.DataFrame:
@@ -505,7 +580,7 @@ class PhysicalAnalysisReport:
         return "\n".join(lines)
 
     def save(self, out_dir: str | Path) -> List[Path]:
-        """Save all report DataFrames as CSVs."""
+        """Save all report DataFrames as CSVs and a PDF summary."""
         d = Path(out_dir)
         d.mkdir(parents=True, exist_ok=True)
         saved: List[Path] = []
@@ -531,7 +606,108 @@ class PhysicalAnalysisReport:
         p.write_text(self.summary(), encoding="utf-8")
         saved.append(p)
 
+        pdf_path = self._save_pdf(d)
+        if pdf_path is not None:
+            saved.append(pdf_path)
+
         return saved
+
+    def _save_pdf(self, out_dir: Path) -> Optional[Path]:
+        """Generate a PDF report with tensor-type identification."""
+        if not _HAS_MPL:
+            return None
+
+        pdf_path = out_dir / "analysis_report.pdf"
+
+        with PdfPages(str(pdf_path)) as pdf:
+            # --- Page 1: Summary text ---
+            fig, ax = plt.subplots(figsize=(11, 8.5))
+            ax.axis("off")
+            ax.text(
+                0.05, 0.95, self.summary(),
+                transform=ax.transAxes, fontsize=10,
+                verticalalignment="top", fontfamily="monospace",
+            )
+            fig.suptitle("Fault-Injection Analysis Report", fontsize=14, fontweight="bold")
+            pdf.savefig(fig)
+            plt.close(fig)
+
+            # --- Page 2: Criticality by tensor (with tensor_type) ---
+            if not self.by_tensor.empty:
+                display_cols = []
+                for c in ["tensor_index", "tensor_type", "tensor_name", "total",
+                          "critical", "crash", "degraded",
+                          "critical_rate", "degraded_rate", "tensor_size"]:
+                    if c in self.by_tensor.columns:
+                        display_cols.append(c)
+
+                tbl_data = self.by_tensor[display_cols].copy()
+                # Shorten long tensor names for readability
+                if "tensor_name" in tbl_data.columns:
+                    tbl_data["tensor_name"] = tbl_data["tensor_name"].apply(
+                        lambda n: n if len(str(n)) <= 40 else str(n)[:37] + "..."
+                    )
+                # Format rates as percentages
+                for rc in ("critical_rate", "degraded_rate"):
+                    if rc in tbl_data.columns:
+                        tbl_data[rc] = tbl_data[rc].apply(lambda v: f"{v:.2%}")
+
+                fig, ax = plt.subplots(figsize=(11, 8.5))
+                ax.axis("off")
+                fig.suptitle("Criticality by Tensor", fontsize=14, fontweight="bold")
+                table = ax.table(
+                    cellText=tbl_data.values,
+                    colLabels=tbl_data.columns,
+                    loc="center",
+                    cellLoc="center",
+                )
+                table.auto_set_font_size(False)
+                table.set_fontsize(8)
+                table.auto_set_column_width(list(range(len(display_cols))))
+                # Colour header row
+                for j in range(len(display_cols)):
+                    table[0, j].set_facecolor("#4472C4")
+                    table[0, j].set_text_props(color="white", fontweight="bold")
+                pdf.savefig(fig)
+                plt.close(fig)
+
+            # --- Page 3: Criticality by operator ---
+            if not self.by_operator.empty:
+                fig, ax = plt.subplots(figsize=(11, 8.5))
+                ax.axis("off")
+                fig.suptitle("Criticality by Operator", fontsize=14, fontweight="bold")
+                op_data = self.by_operator.copy()
+                for rc in ("critical_rate", "degraded_rate"):
+                    if rc in op_data.columns:
+                        op_data[rc] = op_data[rc].apply(lambda v: f"{v:.2%}")
+                table = ax.table(
+                    cellText=op_data.values,
+                    colLabels=op_data.columns,
+                    loc="center",
+                    cellLoc="center",
+                )
+                table.auto_set_font_size(False)
+                table.set_fontsize(9)
+                table.auto_set_column_width(list(range(len(op_data.columns))))
+                for j in range(len(op_data.columns)):
+                    table[0, j].set_facecolor("#4472C4")
+                    table[0, j].set_text_props(color="white", fontweight="bold")
+                pdf.savefig(fig)
+                plt.close(fig)
+
+            # --- Page 4: Bit vulnerability ---
+            if not self.bit_vulnerability.empty:
+                fig, ax = plt.subplots(figsize=(11, 8.5))
+                fig.suptitle("Bit-Position Vulnerability", fontsize=14, fontweight="bold")
+                bv = self.bit_vulnerability
+                ax.bar(bv["bit_index"].astype(str), bv["critical_rate"], color="#C0504D")
+                ax.set_xlabel("Bit Index")
+                ax.set_ylabel("Critical Rate")
+                ax.set_ylim(0, max(bv["critical_rate"].max() * 1.2, 0.01))
+                pdf.savefig(fig)
+                plt.close(fig)
+
+        return pdf_path
 
 
 def generate_physical_report(
@@ -559,9 +735,11 @@ def generate_physical_report(
     data = load_campaign_data(run_dir)
     enriched = enrich_results(data)
 
+    tm = add_tensor_type_column(data.tensor_map)
+
     return PhysicalAnalysisReport(
         binned_offsets=bin_by_physical_offset(enriched, bin_size=bin_size),
-        by_tensor=criticality_by_tensor(enriched),
+        by_tensor=criticality_by_tensor(enriched, tensor_map=tm),
         by_operator=criticality_by_operator(enriched),
         contiguity=contiguity_analysis(enriched, data.tensor_map),
         semantic_vs_physical=semantic_vs_physical(enriched, bin_size=bin_size),

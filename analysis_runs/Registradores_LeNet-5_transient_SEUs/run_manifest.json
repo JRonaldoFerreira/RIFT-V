@@ -1,0 +1,14 @@
+{
+  "experiment": "registerfi_LeNet-5_mnist_transient",
+  "campaign_type": "register",
+  "fault_duration": "transient",
+  "output_dir": "C:\\Downloads\\framework_jose\\analysis_runs\\Registradores_LeNet-5_transient_SEUs",
+  "tflite": "C:\\Downloads\\framework_jose\\models\\lenet5_mnist_int8.tflite",
+  "subset_npz": "C:\\Downloads\\framework_jose\\models\\mnist_subset.npz",
+  "sampling": {
+    "confidence": 0.95,
+    "margin": 0.05,
+    "p_prior": 0.5,
+    "seed": 1337
+  }
+}

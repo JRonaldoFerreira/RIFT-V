@@ -1,0 +1,7 @@
+fault_class,Count,Percentage (%)
+Masked,149526.0,83.35
+Good,186.0,0.1
+Acceptable,22420.0,12.5
+Warning,3592.0,2.0
+Critical,3676.0,2.05
+TOTAL,179400.0,100.0

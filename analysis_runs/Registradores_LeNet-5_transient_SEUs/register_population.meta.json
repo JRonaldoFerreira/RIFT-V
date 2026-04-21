@@ -1,0 +1,8 @@
+{
+  "population_definition": "N_R={(op_k, time_slot_index, register_id, bit_index)} with normalized timing slots calibrated on-device during the golden phase.",
+  "slot_count": 3,
+  "num_operator_instances": 5,
+  "num_registers": 31,
+  "bits_per_register": 32,
+  "population_size": 14880
+}

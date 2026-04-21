@@ -1,0 +1,15 @@
+{
+  "method": "one_step_layer_wise_registerfi",
+  "population_size_total": 14880,
+  "selected_faults_total": 1705,
+  "confidence": 0.95,
+  "margin": 0.05,
+  "p": 0.5,
+  "group_cols": [
+    "op_index",
+    "op_name"
+  ],
+  "num_layers": 5,
+  "estimated_total_inferences_for_100_images": 170500,
+  "note": "Sample size computed independently for each operator/layer using finite population correction."
+}

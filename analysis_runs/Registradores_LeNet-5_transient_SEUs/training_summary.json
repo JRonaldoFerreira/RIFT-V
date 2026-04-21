@@ -1,0 +1,11 @@
+{
+  "seed": 1337,
+  "epochs_requested": 12,
+  "epochs_ran": 10,
+  "keras_test_loss": 0.04562965780496597,
+  "keras_test_accuracy": 0.9848999977111816,
+  "subset_size": 100,
+  "subset_mean_top1_prob": 0.990234375,
+  "subset_accuracy": 1.0,
+  "tflite_path": "output_registerfi\\lenet5_mnist_int8.tflite"
+}

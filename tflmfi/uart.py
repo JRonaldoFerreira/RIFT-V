@@ -267,6 +267,18 @@ def build_csv(
 
         df = pd.concat([non_results, results_df], ignore_index=True)
 
+    # Enrich result rows with operator_name from op_profile events
+    if "operator_index" in df.columns and "operator_name" in df.columns:
+        op_profiles = df[df["event"] == "op_profile"].dropna(subset=["operator_index", "operator_name"])
+        if not op_profiles.empty:
+            op_map = op_profiles.drop_duplicates(subset=["operator_index"], keep="last")
+            op_map = op_map.set_index("operator_index")["operator_name"]
+            missing = df["operator_name"].isna() & df["operator_index"].notna()
+            if missing.any():
+                df.loc[missing, "operator_name"] = (
+                    df.loc[missing, "operator_index"].map(op_map)
+                )
+
     # Enrich multi-fault rows with group member indices
     if is_multi and groups_csv and groups_csv.exists():
         gdf = pd.read_csv(groups_csv)

@@ -38,6 +38,7 @@ void memory_fi_begin_inference(memory_fi_context_t* ctx, int32_t fault_index) {
     return;
   }
   ctx->active_fault_index = fault_index;
+  
   ctx->injected_this_inference = false;
   ctx->saved_original_byte = 0u;
   ctx->injection_active = false;

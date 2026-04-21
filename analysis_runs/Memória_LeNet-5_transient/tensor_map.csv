@@ -1,0 +1,15 @@
+tensor_index,name,buffer_index,global_offset,length_bytes,shape,dtype,is_constant
+0,serving_default_args_0:0,1,-1,0,1x28x28x1,9,False
+1,le_net5_1_1/lenet5_1/flatten_1/strided_slice/stack,2,63144,4,1,2,True
+2,arith.constant,3,63128,4,1,2,True
+3,le_net5_1_1/lenet5_1/flatten_1/Reshape/shape/1,4,63112,4,,2,True
+4,le_net5_1_1/lenet5_1/fc2_1/BiasAdd,5,63060,40,10,2,True
+5,le_net5_1_1/lenet5_1/fc2_1/MatMul,6,62208,840,10x84,9,True
+6,le_net5_1_1/lenet5_1/fc1_1/Relu;le_net5_1_1/lenet5_1/fc1_1/BiasAdd,7,61860,336,84,2,True
+7,le_net5_1_1/lenet5_1/fc1_1/MatMul,8,51768,10080,84x120,9,True
+8,le_net5_1_1/lenet5_1/conv3_1/Relu;le_net5_1_1/lenet5_1/conv3_1/BiasAdd;le_net5_1_1/lenet5_1/conv3_1/convolution;le_net5_1_1/lenet5_1/conv3_1/Squeeze,9,51276,480,120,2,True
+9,le_net5_1_1/lenet5_1/conv3_1/convolution,10,3264,48000,120x5x5x16,9,True
+10,le_net5_1_1/lenet5_1/conv2_1/Relu;le_net5_1_1/lenet5_1/conv2_1/BiasAdd;le_net5_1_1/lenet5_1/conv2_1/convolution;le_net5_1_1/lenet5_1/conv2_1/Squeeze,11,3188,64,16,2,True
+11,le_net5_1_1/lenet5_1/conv2_1/convolution,12,776,2400,16x5x5x6,9,True
+12,le_net5_1_1/lenet5_1/conv1_1/Relu;le_net5_1_1/lenet5_1/conv1_1/BiasAdd;le_net5_1_1/lenet5_1/conv1_1/convolution;le_net5_1_1/lenet5_1/conv1_1/Squeeze,13,740,24,6,2,True
+13,le_net5_1_1/lenet5_1/conv1_1/convolution,14,576,150,6x5x5x1,9,True

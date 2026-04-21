@@ -1,0 +1,14 @@
+{
+  "experiment": "registerfi_lenet5_mnist_parmanent",
+  "campaign_type": "register",
+  "fault_duration": "permanent",
+  "output_dir": "C:\\Users\\KOliveira\\Downloads\\framework_jose-main\\analysis_runs\\registerfi_lenet5_mnist_parmanent_20260419_225017",
+  "tflite": "C:\\Users\\KOliveira\\Downloads\\framework_jose-main\\models\\lenet5_mnist_int8.tflite",
+  "subset_npz": "C:\\Users\\KOliveira\\Downloads\\framework_jose-main\\models\\mnist_subset.npz",
+  "sampling": {
+    "confidence": 0.95,
+    "margin": 0.05,
+    "p_prior": 0.5,
+    "seed": 1337
+  }
+}

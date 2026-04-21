@@ -84,6 +84,47 @@ def classify_results(results_csv: Path, output_csv: Path) -> pd.DataFrame:
     })
 
     merged = fault_df.merge(golden_ref, on="image_id", how="left")
+
+    # Enrich operator_name from op_profile rows when firmware didn't include it
+    if "operator_name" in merged.columns:
+        missing_mask = merged["operator_name"].isna()
+        if missing_mask.any() and "operator_index" in merged.columns:
+            op_profiles = df[df["event"] == "op_profile"]
+            if not op_profiles.empty and "operator_index" in op_profiles.columns and "operator_name" in op_profiles.columns:
+                op_map = op_profiles.dropna(subset=["operator_index", "operator_name"])
+                op_map = op_map.drop_duplicates(subset=["operator_index"], keep="last")
+                op_map = op_map.set_index("operator_index")["operator_name"]
+                can_fill = missing_mask & merged["operator_index"].notna()
+                if can_fill.any():
+                    merged.loc[can_fill, "operator_name"] = (
+                        merged.loc[can_fill, "operator_index"].map(op_map)
+                    )
+
+        # Fallback: fill remaining NaN operator_name/operator_index from selected faults CSV
+        still_missing = merged["operator_name"].isna()
+        if still_missing.any() and "fault_id" in merged.columns:
+            run_dir = Path(results_csv).parent
+            for sel_csv in sorted(run_dir.glob("selected_*faults.csv")):
+                sel_df = pd.read_csv(sel_csv)
+                name_col = "op_name" if "op_name" in sel_df.columns else "operator_name" if "operator_name" in sel_df.columns else None
+                idx_col = "op_index" if "op_index" in sel_df.columns else "operator_index" if "operator_index" in sel_df.columns else None
+                if name_col and "fault_id" in sel_df.columns:
+                    sel_map = sel_df.dropna(subset=["fault_id"]).drop_duplicates(
+                        subset=["fault_id"], keep="last"
+                    ).set_index("fault_id")
+                    can_fill2 = still_missing & merged["fault_id"].notna()
+                    if can_fill2.any():
+                        merged.loc[can_fill2, "operator_name"] = (
+                            merged.loc[can_fill2, "fault_id"].map(sel_map[name_col])
+                        )
+                    if idx_col and "operator_index" in merged.columns:
+                        idx_missing = merged["operator_index"].isna() & merged["fault_id"].notna()
+                        if idx_missing.any():
+                            merged.loc[idx_missing, "operator_index"] = (
+                                merged.loc[idx_missing, "fault_id"].map(sel_map[idx_col])
+                            )
+                    break
+
     merged["fault_class"] = merged.apply(classify_row, axis=1)
     merged.to_csv(output_csv, index=False)
 

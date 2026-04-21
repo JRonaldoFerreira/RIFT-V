@@ -1,0 +1,13 @@
+tensor_index,name,buffer_index,global_offset,length_bytes,shape,dtype,is_constant
+0,serving_default_input_layer_1:0,1,-1,0,1x28x28x1,9,False
+1,sequential_1_1/global_average_pooling2d_1_1/Mean/reduction_indices,2,26856,8,2,2,True
+2,sequential_1_1/dense_3_1/BiasAdd,3,26804,40,10,2,True
+3,sequential_1_1/dense_3_1/MatMul,4,26472,320,10x32,9,True
+4,sequential_1_1/dense_2_1/Relu;sequential_1_1/dense_2_1/BiasAdd,5,26332,128,32,2,True
+5,sequential_1_1/dense_2_1/MatMul,6,24272,2048,32x64,9,True
+6,sequential_1_1/conv2d_5_1/Relu;sequential_1_1/conv2d_5_1/BiasAdd;sequential_1_1/conv2d_5_1/convolution;sequential_1_1/conv2d_5_1/Squeeze,7,24004,256,64,2,True
+7,sequential_1_1/conv2d_5_1/convolution,8,5560,18432,64x3x3x32,9,True
+8,sequential_1_1/conv2d_4_1/Relu;sequential_1_1/conv2d_4_1/BiasAdd;sequential_1_1/conv2d_4_1/convolution;sequential_1_1/conv2d_4_1/Squeeze,9,5420,128,32,2,True
+9,sequential_1_1/conv2d_4_1/convolution,10,800,4608,32x3x3x16,9,True
+10,sequential_1_1/conv2d_3_1/Relu;sequential_1_1/conv2d_3_1/BiasAdd;sequential_1_1/conv2d_3_1/convolution;sequential_1_1/conv2d_3_1/Squeeze,11,724,64,16,2,True
+11,sequential_1_1/conv2d_3_1/convolution,12,568,144,16x3x3x1,9,True
