@@ -1,3 +1,29 @@
+/**
+ * ESP32 Firmware with Enhanced Boot Synchronization
+ * 
+ * This firmware implements a robust boot synchronization mechanism to address
+ * timing issues between ESP32 boot and host application run mode.
+ * 
+ * Key Features:
+ * - Start Command Protocol: ESP32 waits for explicit "start" command before
+ *   announcing boot readiness, ensuring proper synchronization
+ * - Boot Beacon Generation: Periodic status updates during boot preparation
+ *   prevent host timeouts during initialization
+ * - RTOS-Friendly Serial Monitoring: Short timeouts with small delays allow
+ *   proper task scheduling while maintaining responsiveness
+ * 
+ * Protocol Flow:
+ * 1. ESP32 boots and begins initialization
+ * 2. Sends boot_beacon events with progress percentages (10%, 20%, ..., 95%)
+ * 3. Waits for "start" command from host application
+ * 4. Upon receiving start command, sends "boot" event with "ready" status
+ * 5. Host can then proceed with normal campaign commands
+ * 
+ * This approach replaces the previous fixed delay (vTaskDelay) with a
+ * deterministic synchronization mechanism that prevents race conditions
+ * between ESP32 boot completion and host run mode preparation.
+ */
+
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -284,6 +310,15 @@ void protocol_send_boot(void) {
   proto_printf("{\"event\":\"boot\",\"status\":\"ready\"}\n");
 }
 
+/**
+ * Send boot preparation beacon to indicate boot process is ongoing
+ * This prevents the host application from timing out during boot preparation
+ */
+static void protocol_send_boot_beacon(uint32_t progress_percent) {
+  proto_printf("{\"event\":\"boot_beacon\",\"status\":\"preparing\",\"progress\":%lu}\n", 
+               static_cast<unsigned long>(progress_percent));
+}
+
 
 void protocol_send_golden_result(int32_t image_id,
                                  int32_t label,
@@ -442,6 +477,7 @@ void protocol_send_done(void) {
 
 enum FiCommand {
   FI_CMD_UNKNOWN = 0,
+  FI_CMD_START,
   FI_CMD_RUN_GOLDEN,
   FI_CMD_SKIP_GOLDEN,
   FI_CMD_RUN_JOB,
@@ -472,7 +508,9 @@ static FiCommandData parse_command(const char* line) {
   cmd.type = FI_CMD_UNKNOWN;
   cmd.fault_idx = -1;
   cmd.image_id = -1;
-  if (strstr(line, "\"skip_golden\"")) {
+  if (strstr(line, "\"start\"")) {
+    cmd.type = FI_CMD_START;
+  } else if (strstr(line, "\"skip_golden\"")) {
     cmd.type = FI_CMD_SKIP_GOLDEN;
   } else if (strstr(line, "\"run_golden\"")) {
     cmd.type = FI_CMD_RUN_GOLDEN;
@@ -486,13 +524,19 @@ static FiCommandData parse_command(const char* line) {
   return cmd;
 }
 
+/**
+ * Read a line from the serial port with RTOS-friendly delays
+ * This function monitors the serial port while allowing RTOS task scheduling
+ */
 static int protocol_read_line(char* buf, size_t bufsize) {
   size_t len = 0;
   while (true) {
     uint8_t byte = 0;
-    int n = proto_read_byte(&byte, pdMS_TO_TICKS(1000));
+    // Use shorter timeout to allow RTOS scheduling
+    int n = proto_read_byte(&byte, pdMS_TO_TICKS(100));
     if (n <= 0) {
-      if (len == 0) protocol_send_boot();
+      // Small RTOS-friendly delay when no data available
+      vTaskDelay(pdMS_TO_TICKS(1));
       continue;
     }
     if (byte == '\n' || byte == '\r') {
@@ -511,13 +555,24 @@ static int protocol_read_line(char* buf, size_t bufsize) {
 extern "C" void app_main(void) {
   protocol_init_uart();
   setvbuf(stdout, NULL, _IOLBF, 256);
-  vTaskDelay(pdMS_TO_TICKS(1500));
 
+  /**
+   * Boot preparation phase with beacon generation
+   * Instead of using a fixed delay, we wait for a start command from the host
+   * while sending periodic beacons to indicate boot preparation progress
+   */
+  ESP_LOGI(kTag, "Starting boot preparation phase...");
+  
+  // Send initial beacon to indicate boot preparation started
+  protocol_send_boot_beacon(10);
+  
   // ---- Allocate and load model BEFORE announcing boot ----
   // Memory FI requires a writable RAM copy to inject bit-flips into model weights.
   // Register FI only corrupts CPU registers during inference — model data is never
   // modified — so it can reference g_model_data (flash .rodata) directly, avoiding
   // a large heap allocation that may fail for bigger models on ESP32-C3.
+  protocol_send_boot_beacon(20);
+  
 #if defined(FI_CAMPAIGN_MEMORY)
   g_model_ram = static_cast<uint8_t*>(heap_caps_malloc(g_model_data_len, MALLOC_CAP_8BIT));
   if (g_model_ram == nullptr) {
@@ -533,33 +588,65 @@ extern "C" void app_main(void) {
     ESP_LOGE(kTag, "Failed to parse TFLite model.");
     return;
   }
+  protocol_send_boot_beacon(40);
 
   tflite::MicroMutableOpResolver<TFLMFI_RESOLVER_OP_COUNT> resolver;
   tflmfi_populate_resolver(resolver);
+  protocol_send_boot_beacon(50);
 
   tflite::MicroInterpreter interpreter(model, resolver, g_tensor_arena, kTensorArenaSize);
   if (interpreter.AllocateTensors() != kTfLiteOk) {
     ESP_LOGE(kTag, "AllocateTensors failed.");
     return;
   }
+  protocol_send_boot_beacon(60);
 
 #if defined(FI_CAMPAIGN_REGISTER)
   register_fi_init(&g_register_fi_ctx, g_fault_list, g_fault_list_count, kRegisterTimerMinDelayUs,
                    kRegisterTimerGuardUs);
 #endif
+  protocol_send_boot_beacon(70);
 
 #if defined(FI_CAMPAIGN_MEMORY)
   memory_fi_init(&g_memory_fi_ctx, g_model_ram, g_fault_list, g_fault_list_count);
   ESP_LOGI(kTag, "Tensor map entries: %lu", static_cast<unsigned long>(g_tensor_map_count));
 #endif
+  protocol_send_boot_beacon(80);
 
   const uint32_t image_size = kImageHeight * kImageWidth * kImageChannels;
   static int32_t golden_pred_class[kNumCampaignImages];
   static float golden_top1_prob[kNumCampaignImages];
   bool golden_done = false;
   bool wdt_active = false;
+  protocol_send_boot_beacon(90);
 
-  // ---- Announce boot (neutral — firmware does NOT decide to resume) ----
+  /**
+   * Wait for start command from host before announcing boot ready
+   * This ensures synchronization between ESP32 boot and host run mode
+   * The firmware monitors serial port while allowing RTOS scheduling
+   */
+  ESP_LOGI(kTag, "Boot preparation complete, waiting for start command...");
+  char cmd_buf[256];
+  bool start_received = false;
+  
+  while (!start_received) {
+    // Send periodic beacon to indicate we're waiting for start command
+    protocol_send_boot_beacon(95);
+    
+    const int cmd_len = protocol_read_line(cmd_buf, sizeof(cmd_buf));
+    if (cmd_len > 0) {
+      const FiCommandData cmd = parse_command(cmd_buf);
+      if (cmd.type == FI_CMD_START) {
+        start_received = true;
+        ESP_LOGI(kTag, "Start command received, proceeding with boot announcement");
+      }
+    }
+    
+    // Small RTOS-friendly delay to prevent overwhelming the serial port
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+
+  // ---- Announce boot ready after start command received ----
   protocol_send_boot();
 
 #if defined(FI_CAMPAIGN_MEMORY)
@@ -570,12 +657,20 @@ extern "C" void app_main(void) {
 #endif
 
   // ---- Command loop — host drives the campaign ----
-  char cmd_buf[256];
   while (true) {
     const int cmd_len = protocol_read_line(cmd_buf, sizeof(cmd_buf));
     if (cmd_len <= 0) continue;
 
     const FiCommandData cmd = parse_command(cmd_buf);
+
+    // ---- start: acknowledge start command (already handled during boot) ----
+    if (cmd.type == FI_CMD_START) {
+      // Start command was already processed during boot preparation
+      // Send acknowledgment to confirm we're ready for commands
+      proto_printf("{\"event\":\"start_ack\"}\n");
+      ESP_LOGI(kTag, "Start command acknowledged");
+      continue;
+    }
 
     // ---- run_golden: batch golden phase (no fault injection, safe) ----
     if (cmd.type == FI_CMD_RUN_GOLDEN) {

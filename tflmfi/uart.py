@@ -1,4 +1,19 @@
-"""UART receiver — capture JSON-line stream from ESP32 firmware."""
+"""UART receiver — capture JSON-line stream from ESP32 firmware.
+
+This module implements enhanced boot synchronization to address timing issues
+between ESP32 boot and host application run mode.
+
+Enhanced Protocol Features:
+- Boot Beacon Monitoring: Tracks ESP32 boot preparation progress
+- Start Command Synchronization: Sends start command when ESP32 is ready
+- RTOS-Friendly Communication: Handles new event types for robust timing
+
+Protocol Flow:
+1. ESP32 sends boot_beacon events with progress percentages
+2. Host monitors beacons and sends start command at 95% progress
+3. ESP32 acknowledges start command and sends boot ready event
+4. Host proceeds with normal campaign execution
+"""
 from __future__ import annotations
 
 import json
@@ -386,9 +401,15 @@ def capture(
 
     The host acts as the campaign scheduler.  It sends commands to firmware:
 
+    - ``start``      — initiate boot synchronization (new enhanced protocol)
     - ``run_golden`` — run the golden (fault-free) inference phase
     - ``run_job``    — run a single fault x image inference
     - ``done``       — signal campaign end
+
+    Enhanced Boot Synchronization:
+    The host now monitors boot_beacon events during ESP32 preparation and
+    sends a start command when the device is ready (95% progress). This
+    eliminates timing issues between ESP32 boot and host run mode.
 
     If the firmware crashes during a job (detected by a ``boot`` event),
     the host re-sends ``run_golden`` to reinitialise, then retries or
@@ -525,15 +546,55 @@ def capture(
         return payload, None
 
     def _wait_for_boot(timeout_s: Optional[float] = None) -> bool:
+        """Wait for boot event with enhanced synchronization support.
+        
+        This function now handles the new boot synchronization protocol:
+        1. Monitors boot_beacon events during ESP32 preparation
+        2. Sends start command when ESP32 is ready
+        3. Waits for boot event after start command acknowledgment
+        """
         timeout = timeout_s or float(serial_cfg.boot_timeout_s)
         deadline = time.monotonic() + timeout
+        boot_beacon_received = False
+        start_sent = False
+        
         while time.monotonic() < deadline:
             remaining = max(0.1, deadline - time.monotonic())
             payload, err = _read_event(timeout=remaining)
             if err == "timeout":
                 return False
-            if payload and payload.get("event") == "boot":
-                return True
+            
+            if payload is None:
+                continue
+                
+            event = payload.get("event")
+            
+            # Handle boot preparation beacons
+            if event == "boot_beacon":
+                boot_beacon_received = True
+                progress = payload.get("progress", 0)
+                status = payload.get("status", "unknown")
+                print(f"[uart] Boot beacon: {status} ({progress}%)", file=sys.stderr)
+                
+                # Send start command when ESP32 is waiting (95% progress)
+                if progress >= 95 and not start_sent:
+                    print("[uart] Sending start command...", file=sys.stderr)
+                    _send_cmd({"cmd": "start"})
+                    start_sent = True
+                continue
+                
+            # Handle boot ready event
+            if event == "boot":
+                if payload.get("status") == "ready":
+                    print("[uart] Boot ready received.", file=sys.stderr)
+                    return True
+                continue
+                
+            # Handle start acknowledgment
+            if event == "start_ack":
+                print("[uart] Start command acknowledged.", file=sys.stderr)
+                continue
+                
         return False
 
     # Cache of golden results: image_id -> (pred_class, top1_prob)
