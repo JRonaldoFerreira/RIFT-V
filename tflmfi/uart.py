@@ -279,6 +279,49 @@ def build_csv(
                     df.loc[missing, "operator_index"].map(op_map)
                 )
 
+    # Enrich register-campaign result rows with fault metadata from the
+    # selected-faults CSV.  This fills in register_id, register_name,
+    # bit_index, operator_index, operator_name, time_slot_* for crash
+    # rows (host-synthesized) or any firmware row that is missing fields.
+    if campaign_type == "register" and not is_multi:
+        faults_csv = None
+        for p in sorted(jsonl_path.parent.glob("selected_*faults.csv")):
+            faults_csv = p
+            break
+        if faults_csv and faults_csv.exists():
+            try:
+                fdf = pd.read_csv(faults_csv)
+                _CSV_TO_JSON = {
+                    "op_index": "operator_index",
+                    "op_name": "operator_name",
+                }
+                fdf = fdf.rename(columns=_CSV_TO_JSON)
+                merge_cols = [
+                    c for c in [
+                        "fault_id", "operator_index", "operator_name",
+                        "register_id", "register_name",
+                        "time_slot_index", "time_slot_count", "bit_index",
+                    ] if c in fdf.columns
+                ]
+                if "fault_id" in merge_cols and "fault_id" in df.columns:
+                    fdf_merge = fdf[merge_cols].drop_duplicates(subset=["fault_id"])
+                    # Use suffixes to detect which columns to backfill
+                    df = df.merge(fdf_merge, on="fault_id", how="left",
+                                  suffixes=("", "_meta"))
+                    for col in merge_cols:
+                        if col == "fault_id":
+                            continue
+                        meta_col = f"{col}_meta"
+                        if meta_col in df.columns:
+                            if col in df.columns:
+                                df[col] = df[col].fillna(df[meta_col])
+                            else:
+                                df[col] = df[meta_col]
+                            df.drop(columns=[meta_col], inplace=True)
+            except Exception as exc:
+                print(f"[CSV] Warning: could not enrich from faults CSV: {exc}",
+                      file=sys.stderr)
+
     # Enrich multi-fault rows with group member indices
     if is_multi and groups_csv and groups_csv.exists():
         gdf = pd.read_csv(groups_csv)
@@ -467,6 +510,7 @@ def capture(
 
     # ---- Load fault-ID lookup for crash result generation ----
     fault_id_map: Dict[int, int] = {}
+    fault_meta_map: Dict[int, Dict[str, Any]] = {}  # seq_idx -> full row dict
     group_id_map: Dict[int, int] = {}
     if is_multi:
         for p in sorted(run_dir.glob("*_fault_groups.csv")):
@@ -483,6 +527,8 @@ def capture(
                 sdf = pd.read_csv(p)
                 if "fault_id" in sdf.columns:
                     fault_id_map = dict(enumerate(sdf["fault_id"].astype(int)))
+                    for seq_idx, row in sdf.iterrows():
+                        fault_meta_map[int(seq_idx)] = row.to_dict()
                 break
             except Exception:
                 pass
@@ -716,6 +762,22 @@ def capture(
                 cr["fault_count"] = 0
             else:
                 cr["fault_id"] = fault_id_map.get(fi_idx, fi_idx)
+            # Enrich with full fault metadata so crash rows carry the
+            # same register fields as firmware-reported results.
+            meta = fault_meta_map.get(fi_idx)
+            if meta:
+                _META_FIELD_MAP = {
+                    "op_index": "operator_index",
+                    "op_name": "operator_name",
+                    "register_id": "register_id",
+                    "register_name": "register_name",
+                    "time_slot_index": "time_slot_index",
+                    "time_slot_count": "time_slot_count",
+                    "bit_index": "bit_index",
+                }
+                for csv_col, json_col in _META_FIELD_MAP.items():
+                    if csv_col in meta and json_col not in cr:
+                        cr[json_col] = meta[csv_col]
             return cr
 
         print(f"[uart] Dispatching {total_jobs} fault jobs...", file=sys.stderr)

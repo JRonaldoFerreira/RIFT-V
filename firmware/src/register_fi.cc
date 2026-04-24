@@ -21,6 +21,19 @@
 volatile uintptr_t g_register_fi_saved_sp = 0;
 #endif
 
+#ifndef REGISTER_FI_USE_SAVED_SP_MICROFI
+/* Trampoline globals — written by the ISR, read by _fi_trampoline (asm).
+ * sp and gp are NOT restored from RvExcFrame by restore_general_regs
+ * in vectors.S; we redirect mepc to an IRAM trampoline that XORs the
+ * live register after mret. */
+extern "C" {
+extern void _fi_trampoline(void);
+volatile uint32_t g_fi_trampoline_mepc    = 0;
+volatile uint32_t g_fi_trampoline_sp_mask = 0;
+volatile uint32_t g_fi_trampoline_gp_mask = 0;
+}
+#endif  /* !REGISTER_FI_USE_SAVED_SP_MICROFI */
+
 namespace {
 
 #ifndef REGISTER_FI_USE_SAVED_SP_MICROFI
@@ -56,6 +69,15 @@ static const char* kSlotNames[REGISTER_FI_MAX_STACK_SLOTS] = {
     "slot_24", "slot_25", "slot_26", "slot_27",
     "slot_28", "slot_29", "slot_30", "slot_31",
 };
+
+/* MicroFI path does not need the mepc trampoline — all slots are
+ * accessible through the saved stack pointer and directly modifiable. */
+IRAM_ATTR static inline void do_bitflip(uint32_t* /*frame*/, uint32_t* target,
+                                         uint8_t /*reg_id*/, uint32_t mask) {
+    *target ^= mask;
+}
+IRAM_ATTR static inline void reset_trampoline(void) {}
+
 #else
 /* ---- Excframe path (DEFAULT) ---- */
 /* Uses RvExcFrame offsets via pxCurrentTCBs[0]->pxTopOfStack.
@@ -81,6 +103,39 @@ static const RegisterDescriptor kRegisterDescriptors[] = {
 };
 
 #undef REG_DESC
+
+constexpr uint8_t kRegIdSp = 1;
+constexpr uint8_t kRegIdGp = 2;
+
+/* Apply a bit-flip.  For most registers this directly XORs the
+ * RvExcFrame field.  For sp/gp (not restored by restore_general_regs)
+ * the mask is accumulated into trampoline globals and mepc is
+ * redirected so the live register is XORed after mret. */
+IRAM_ATTR static inline void do_bitflip(
+        RvExcFrame* frame, uint32_t* target,
+        uint8_t reg_id, uint32_t mask) {
+    if (reg_id == kRegIdSp) {
+        g_fi_trampoline_sp_mask ^= mask;
+    } else if (reg_id == kRegIdGp) {
+        g_fi_trampoline_gp_mask ^= mask;
+    } else {
+        *target ^= mask;
+        return;
+    }
+    /* Redirect mepc to the trampoline (once per ISR invocation). */
+    const long tramp_addr = (long)(uintptr_t)_fi_trampoline;
+    if (frame->mepc != tramp_addr) {
+        g_fi_trampoline_mepc = static_cast<uint32_t>(frame->mepc);
+        frame->mepc = tramp_addr;
+    }
+}
+
+/* Reset trampoline masks — called at ISR entry. */
+IRAM_ATTR static inline void reset_trampoline(void) {
+    g_fi_trampoline_sp_mask = 0;
+    g_fi_trampoline_gp_mask = 0;
+}
+
 #endif  /* REGISTER_FI_USE_SAVED_SP_MICROFI */
 
 #ifdef REGISTER_FI_RUNTIME_CHECK
@@ -274,6 +329,8 @@ IRAM_ATTR void register_timer_isr(void* arg) {
   auto* frame = reinterpret_cast<RvExcFrame*>(tcb->pxTopOfStack);
 #endif  /* REGISTER_FI_USE_SAVED_SP_MICROFI */
 
+  reset_trampoline();
+
 #ifdef MULTI_FI_MAX_COUNT
   if (ctx->op_fault_count > 0) {
     // Inject only the current batch: faults whose delay equals the
@@ -298,15 +355,15 @@ IRAM_ATTR void register_timer_isr(void* arg) {
         if (!ctx->permanent_injected[gi]) {
           ctx->permanent_original_bits[gi] = (*target & mask) != 0;
           ctx->permanent_injected[gi] = true;
-          *target ^= mask;
+          do_bitflip(frame, target, f->register_id, mask);
         } else {
           bool current_bit = (*target & mask) != 0;
           if (current_bit == ctx->permanent_original_bits[gi]) {
-            *target ^= mask;
+            do_bitflip(frame, target, f->register_id, mask);
           }
         }
 #else
-        *target ^= mask;
+        do_bitflip(frame, target, f->register_id, mask);
 #endif
       }
     }
@@ -378,15 +435,15 @@ IRAM_ATTR void register_timer_isr(void* arg) {
   if (!ctx->permanent_active) {
     ctx->permanent_original_bit = (*target & mask) != 0;
     ctx->permanent_active = true;
-    *target ^= mask;
+    do_bitflip(frame, target, fault->register_id, mask);
   } else {
     bool current = (*target & mask) != 0;
     if (current == ctx->permanent_original_bit) {
-      *target ^= mask;
+      do_bitflip(frame, target, fault->register_id, mask);
     }
   }
 #else
-  *target ^= (1u << fault->bit_index);
+  do_bitflip(frame, target, fault->register_id, (1u << fault->bit_index));
 #endif
 
 #ifdef REGISTER_FI_RUNTIME_CHECK
