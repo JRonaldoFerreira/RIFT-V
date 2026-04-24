@@ -5,23 +5,84 @@ Framework declarativo para campanhas de injeção de falhas (bit-flip) em modelo
 ## Requisitos
 
 - Python >= 3.10
-- PlatformIO (para build/flash do firmware)
+- Uma placa ESP32 suportada e os respetivos drivers USB/serial a funcionar
+- Um ambiente virtual Python recomendado para isolar dependências
+- PlatformIO Core para build/flash do firmware
 
-## Instalação
+O ponto mais importante para o utilizador final é simples: **depois de instalar os requisitos, o fluxo normal passa a ser editar o YAML e correr `tflmfi ...`**. O utilizador não precisa de escolher manualmente o ambiente `registerfi`/`memoryfi` nem de gerar headers à mão.
+
+## Instalação recomendada
+
+### 1. Criar e ativar um ambiente virtual
+
+**PowerShell (Windows)**
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+**bash (Linux/macOS)**
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+```
+
+### 2. Instalar o framework
 
 ```bash
 pip install -e .
 ```
 
-### Instalação completa (Python + dev + TensorFlow + PlatformIO)
+Isto instala o pacote Python e a CLI `tflmfi`.
+
+### 3. Instalar o perfil certo de dependências
+
+**Opção recomendada para a maioria dos utilizadores**
 
 ```bash
 pip install -e ".[all]"
 ```
 
-Isso instala as dependências Python do framework, ferramentas de desenvolvimento, TensorFlow (para quantização/subset) e PlatformIO.
+Este perfil instala:
 
-> Nota: drivers USB/serial da placa e componentes de toolchain/SDK baixados pelo PlatformIO continuam dependentes do sistema operativo.
+- dependências Python do framework
+- dependências de desenvolvimento
+- TensorFlow, para quantização e geração de subsets
+- PlatformIO Core, para build e flash do firmware
+
+**Perfis úteis**
+
+- `pip install -e .` — apenas o framework e a CLI
+- `pip install -e ".[dev]"` — framework + testes/lint
+- `pip install -e ".[all]"` — framework + dev + TensorFlow + PlatformIO
+
+> Nota: drivers USB/serial da placa e componentes de toolchain/SDK descarregados pelo PlatformIO continuam dependentes do sistema operativo.
+
+### 4. Verificação rápida
+
+```bash
+tflmfi --help
+```
+
+Se o comando acima funcionar, a instalação da CLI está correta.
+
+### 5. Opcional — manter o cache do PlatformIO dentro do projeto
+
+Isto é útil quando quiser evitar dependência do diretório global do utilizador.
+
+**PowerShell**
+
+```powershell
+$env:PLATFORMIO_CORE_DIR = "$PWD/firmware/.platformio-core"
+```
+
+**bash**
+
+```bash
+export PLATFORMIO_CORE_DIR="$PWD/firmware/.platformio-core"
+```
 
 ## Estrutura do Projeto
 
@@ -55,46 +116,44 @@ models/                  # Modelos .tflite e subsets .npz
 runs/                    # Saídas de campanhas (geradas automaticamente)
 ```
 
-## Tipos de Campanha
-
-### Register (`type: register`)
-
-Injeta bit-flips em registradores RISC-V (x1–x31) durante a execução de operadores do modelo. Usa um timer de hardware para disparar a injeção num instante aleatório dentro da execução do operador.
-
-### Memory (`type: memory`)
-
-Injeta bit-flips nos **pesos constantes do modelo** (tensores serializados no blob `.tflite`). Cada falha altera um bit específico num byte específico de um tensor, identificado por `(op_index, tensor_index, byte_in_tensor, bit_index)`.
-
-### Hybrid (`type: hybrid`)
-
-Executa ambas as campanhas (register + memory) sequencialmente no mesmo target, com artefatos separados por sub-directório.
-
-## Duração da Falha
-
-- **`permanent`** — a falha persiste durante toda a inferência.
-- **`transient`** — a falha é aplicada antes do operador alvo e revertida depois (per-operator, via hooks MicroFI).
-
-## Multi-Injection
-
-Suporta injeção de múltiplas falhas simultâneas (simulação MEU — Multi-Event Upset). Grupos aleatórios de `count` falhas são gerados a partir do pool amostrado.
-
-```yaml
-multi_injection:
-  enabled: true
-  count: 2
-  num_groups: 500
-  seed: 42
-```
-
 ## Uso
 
-### Pipeline completo
+### O que o utilizador precisa realmente de configurar
+
+Na maioria dos casos, o utilizador só precisa de rever estes campos no YAML:
+
+- `model.tflite` — modelo TFLite a usar
+- `model.subset_npz` — subset de teste para o firmware
+- `campaign.type` — `register`, `memory` ou `hybrid`
+- `serial.port` — porta série da placa
+- `serial.transport` — `uart0` ou `usb_serial_jtag`
+- `firmware.board` — board PlatformIO, se for diferente do exemplo
+
+O resto do pipeline é tratado pelo framework.
+
+### Fluxo recomendado para o dia a dia
+
+1. Escolher ou copiar um YAML em `configs/`
+2. Ajustar `serial.port` e `serial.transport`
+3. Executar o pipeline completo
 
 ```bash
-tflmfi configs/memoryfi_example.yaml
+tflmfi configs/registerfi_example.yaml
 ```
 
+Esse comando executa automaticamente:
+
+- `prepare()` — gera população, amostragem e headers
+- `build()` — compila o firmware
+- `flash()` — grava o firmware na placa
+- `run()` — captura a UART
+- `analyze()` — classifica os resultados
+
+Também escolhe automaticamente o ambiente PlatformIO correto com base em `campaign.type`.
+
 ### Passos individuais
+
+Use os passos individuais quando quiser depurar alguma fase específica:
 
 ```bash
 tflmfi configs/registerfi_example.yaml --step prepare
@@ -103,23 +162,23 @@ tflmfi configs/registerfi_example.yaml --step flash
 tflmfi configs/registerfi_example.yaml --step run
 tflmfi configs/registerfi_example.yaml --step analyze
 
-# Regerar results.csv a partir de results.jsonl (schema novo, mesmo run)
+# Regerar results.csv a partir de results.jsonl
 tflmfi configs/memoryfi_example.yaml --step rebuild-csv --run-dir runs/my_run
 
-# Analisar resultados de um run já existente
+# Analisar um run já existente
 tflmfi configs/memoryfi_example.yaml --step analyze --run-dir runs/my_run
 ```
 
+### Quando usar a CLI e quando usar a API Python
+
+- Use a **CLI** para o fluxo normal de campanha
+- Use a **API Python** quando quiser integrar o framework em notebooks, scripts próprios ou pipelines maiores
+
 ### Uso programático
 
-O ciclo principal continua a ser `prepare()` → `build()` → `flash()` → `run()` → `analyze()` (ou `execute()` para tudo de seguida). **Antes** de `prepare()`, o `Experiment` expõe duas fases **opcionais** para gerar os artefactos referenciados no YAML em `model.tflite` e `model.subset_npz`:
+O ciclo principal é `prepare()` → `build()` → `flash()` → `run()` → `analyze()`.
 
-| Fase | Método | O que faz |
-|------|--------|-----------|
-| **0a — Quantização** | `exp.quantize_model(...)` | Converte um modelo Keras (`.h5` / `.keras` / SavedModel) para **TFLite int8** e grava o ficheiro `.tflite`. Por omissão escreve em `cfg.model.tflite` (o mesmo caminho que `prepare()` usa para introspecção e headers). Aceita `dataset_name` (`"mnist"`, `"fashion_mnist"`, `"cifar10"`, `"cifar100"`) para dados de calibração automáticos, ou `representative_data` em NumPy; `preprocess_fn` e `num_calibration_samples` alinham o pré-processamento com o treino. |
-| **0b — Subconjunto de teste** | `exp.prepare_test_subset(...)` | Cria um `.npz` aleatório com amostras de teste para o firmware, com as chaves `images`, `labels` e `test_indices` esperadas pelo gerador de headers. Por omissão grava em `cfg.model.subset_npz`. Pode carregar o conjunto de teste via `dataset_name`, `test_data_path` (`.npz` com `(images,labels)`, `(x_test,y_test)` ou `(x,y)`), ou arrays `x`/`y`; `subset_size`, `seed` e `preprocess_fn` controlam o subconjunto e o pré-processamento. |
-
-**Quando usar:** se já tiver um `.tflite` int8 e um `.npz` de teste compatíveis com o YAML, pode ir directamente a `prepare()`. Se parte do pipeline for «do zero» (por exemplo só existe `.h5`), chame primeiro `quantize_model()` e/ou `prepare_test_subset()` para materializar os caminhos configurados; só depois `prepare()` gera população, amostragem e headers C.
+Se já tiver um `.tflite` int8 e um `.npz` compatíveis com o YAML, pode ir diretamente para `prepare()`. Se ainda só tiver um modelo Keras ou precisar de gerar o subset de teste, use antes as fases opcionais `quantize_model()` e `prepare_test_subset()`.
 
 ```python
 from tflmfi import load_config, Experiment
@@ -131,11 +190,57 @@ exp = Experiment(cfg)
 # exp.quantize_model("models/meu_modelo.h5", dataset_name="fashion_mnist")
 # exp.prepare_test_subset(subset_size=100, dataset_name="fashion_mnist")
 
-exp.prepare()   # introspecção do .tflite + população + amostragem + headers + instalação no firmware
-exp.build()     # pio build
-exp.flash()     # pio upload
-exp.run()       # captura UART
-exp.analyze()   # classificação dos resultados
+exp.prepare()
+exp.build()
+exp.flash()
+exp.run()
+exp.analyze()
+```
+
+Se quiser tudo numa chamada só:
+
+```python
+from tflmfi import load_config, Experiment
+
+cfg = load_config("configs/registerfi_example.yaml")
+exp = Experiment(cfg)
+exp.execute()
+```
+
+### Novo comportamento para scripts externos
+
+Se o utilizador ativar o ambiente virtual onde o `tflmfi` foi instalado e executar o script com esse Python, o framework passa a resolver automaticamente:
+
+- o executável do PlatformIO a partir do próprio ambiente ativo
+- o `PLATFORMIO_CORE_DIR` local ao projeto de firmware, por omissão em `firmware/.platformio-core`
+
+Isso significa que o utilizador pode criar scripts Python **em qualquer pasta**, desde que:
+
+- o ambiente com `tflmfi` esteja ativo
+- o script faça `import tflmfi`
+- o YAML usado aponte corretamente para o `firmware/src`
+
+Já não é necessário configurar manualmente `PATH` nem `PLATFORMIO_CORE_DIR` para o fluxo programático normal.
+
+### Exemplo: script fora do repositório
+
+Exemplo de um script guardado noutro diretório, desde que o YAML aponte para os caminhos corretos do projeto:
+
+```python
+from pathlib import Path
+from tflmfi import load_config, Experiment
+
+config_path = Path(r"c:\Downloads\tinymlfi\framework_jose\configs\registerfi_example.yaml")
+
+cfg = load_config(config_path)
+exp = Experiment(cfg)
+exp.execute()
+```
+
+Exemplo de execução:
+
+```powershell
+python C:\meus_scripts\run_registerfi.py
 ```
 
 ## Configuração YAML

@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from tflmfi.config import ExperimentConfig
 
@@ -55,6 +55,48 @@ def _context_fingerprint(cfg: ExperimentConfig, pio_env: str) -> str:
         "pio_env": pio_env,
     }, sort_keys=True)
     return hashlib.sha256(blob.encode()).hexdigest()[:12]
+
+
+def _resolve_pio_executable() -> str:
+    python_dir = Path(sys.executable).resolve().parent
+    candidates = []
+    if os.name == "nt":
+        candidates.extend([
+            python_dir / "pio.exe",
+            python_dir / "platformio.exe",
+        ])
+    candidates.extend([
+        python_dir / "pio",
+        python_dir / "platformio",
+    ])
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+
+    for name in ("pio", "platformio"):
+        resolved = shutil.which(name)
+        if resolved:
+            return resolved
+
+    raise RuntimeError(
+        "Could not find PlatformIO Core. Install it in the active environment "
+        "with 'pip install -e \".[firmware]\"' or 'pip install -e \".[all]\"'."
+    )
+
+
+def _platformio_runtime(project_dir: Path) -> Tuple[str, Dict[str, str], Path]:
+    pio_exe = _resolve_pio_executable()
+    core_dir = Path(os.environ.get("PLATFORMIO_CORE_DIR", project_dir / ".platformio-core")).resolve()
+    core_dir.mkdir(parents=True, exist_ok=True)
+
+    env = os.environ.copy()
+    env["PLATFORMIO_CORE_DIR"] = str(core_dir)
+
+    pio_dir = str(Path(pio_exe).resolve().parent)
+    current_path = env.get("PATH", "")
+    env["PATH"] = pio_dir if not current_path else pio_dir + os.pathsep + current_path
+    return pio_exe, env, core_dir
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +270,7 @@ def build(
     """Run ``pio run -e <env> -c <generated_ini>`` for the given campaign type."""
     project_dir = _find_project_dir(cfg)
     pio_env = _pio_env_name(campaign_type)
+    pio_exe, env, core_dir = _platformio_runtime(project_dir)
 
     # Cache cleanup on context change
     fp = _context_fingerprint(cfg, pio_env)
@@ -236,7 +279,7 @@ def build(
     # Generate context-specific ini + sdkconfig
     ini_path = _generate_ini(cfg, project_dir, pio_env)
 
-    cmd = ["pio", "run", "-e", pio_env, "-c", str(ini_path), "-d", str(project_dir)]
+    cmd = [pio_exe, "run", "-e", pio_env, "-c", str(ini_path), "-d", str(project_dir)]
 
     if verbose:
         cmd.append("-v")
@@ -244,10 +287,11 @@ def build(
         cmd.extend(extra_args)
 
     print(f"[builder] Running: {' '.join(cmd)}", file=sys.stderr)
+    print(f"[builder] platformio_core_dir={core_dir}", file=sys.stderr)
     print(f"[builder] board={cfg.firmware.board}  platform={cfg.firmware.platform}  "
           f"flash_size={cfg.firmware.flash_size or 'board-default'}  "
           f"fault_duration={cfg.campaign.fault_duration}", file=sys.stderr)
-    result = subprocess.run(cmd, capture_output=False)
+    result = subprocess.run(cmd, capture_output=False, env=env)
     if result.returncode != 0:
         raise RuntimeError(f"PlatformIO build failed (exit {result.returncode}).")
 
@@ -263,11 +307,12 @@ def flash(
     """Run ``pio run -e <env> -t upload -c <generated_ini>``."""
     project_dir = _find_project_dir(cfg)
     pio_env = _pio_env_name(campaign_type)
+    pio_exe, env, core_dir = _platformio_runtime(project_dir)
 
     # Ensure ini exists (build should have been called first, but be safe)
     ini_path = _generate_ini(cfg, project_dir, pio_env)
 
-    cmd = ["pio", "run", "-e", pio_env, "-t", "upload",
+    cmd = [pio_exe, "run", "-e", pio_env, "-t", "upload",
            "-c", str(ini_path), "-d", str(project_dir)]
 
     if upload_port:
@@ -276,9 +321,10 @@ def flash(
         cmd.append("-v")
 
     print(f"[builder] Running: {' '.join(cmd)}", file=sys.stderr)
+    print(f"[builder] platformio_core_dir={core_dir}", file=sys.stderr)
     print(f"[builder] board={cfg.firmware.board}  platform={cfg.firmware.platform}  "
           f"flash_size={cfg.firmware.flash_size or 'board-default'}", file=sys.stderr)
-    result = subprocess.run(cmd, capture_output=False)
+    result = subprocess.run(cmd, capture_output=False, env=env)
     if result.returncode != 0:
         raise RuntimeError(f"PlatformIO flash failed (exit {result.returncode}).")
     return result
