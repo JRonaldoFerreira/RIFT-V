@@ -12,7 +12,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import pandas as pd
 import serial
 
-from tflmfi.config import SerialConfig
+from riftv.config import SerialConfig
 
 # ---------------------------------------------------------------------------
 # Constants

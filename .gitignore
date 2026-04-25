@@ -47,7 +47,7 @@ analysis_runs/
 
 # --- PlatformIO (já listado em firmware/.gitignore; reforço na raiz) ---
 firmware/.pio/
-firmware/.tflmfi/
+firmware/.riftv/
 
 # --- Artefatos grandes gerados localmente (adicione pastas seus dados aqui) ---
 # *.csv

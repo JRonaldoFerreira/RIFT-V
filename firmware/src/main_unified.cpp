@@ -534,8 +534,8 @@ extern "C" void app_main(void) {
     return;
   }
 
-  tflite::MicroMutableOpResolver<TFLMFI_RESOLVER_OP_COUNT> resolver;
-  tflmfi_populate_resolver(resolver);
+  tflite::MicroMutableOpResolver<RIFTV_RESOLVER_OP_COUNT> resolver;
+  riftv_populate_resolver(resolver);
 
   tflite::MicroInterpreter interpreter(model, resolver, g_tensor_arena, kTensorArenaSize);
   if (interpreter.AllocateTensors() != kTfLiteOk) {

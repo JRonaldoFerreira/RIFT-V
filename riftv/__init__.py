@@ -1,11 +1,15 @@
-"""tflmfi — Unified Fault Injection Framework for TFLite-Micro on ESP32."""
+"""RIFT-V — Runtime-aware Injection of Faults in TinyML on RISC-V.
+
+A statistical fault injection framework for evaluating TinyML inference
+reliability on RISC-V microcontrollers.
+"""
 
 __version__ = "0.2.0"
 
-from tflmfi.config import ExperimentConfig, load_config
-from tflmfi.experiment import Experiment
-from tflmfi.model_utils import quantize_model, prepare_test_subset
-from tflmfi.analysis import (
+from riftv.config import ExperimentConfig, load_config
+from riftv.experiment import Experiment
+from riftv.model_utils import quantize_model, prepare_test_subset
+from riftv.analysis import (
     CampaignData,
     PhysicalAnalysisReport,
     generate_physical_report,

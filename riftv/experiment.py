@@ -6,19 +6,19 @@ import sys
 from pathlib import Path
 from typing import Dict, Optional, Union
 
-from tflmfi.config import ExperimentConfig, load_config
-from tflmfi.population import (
+from riftv.config import ExperimentConfig, load_config
+from riftv.population import (
     CampaignArtifacts,
     ModelIntrospector,
     prepare_memory_campaign,
     prepare_register_campaign,
 )
-from tflmfi.headers import install_headers, write_headers
-from tflmfi import builder as pio_builder
-from tflmfi.uart import capture as uart_capture
-from tflmfi.classify import classify_results
-from tflmfi.analysis import generate_physical_report, PhysicalAnalysisReport
-from tflmfi.model_utils import (
+from riftv.headers import install_headers, write_headers
+from riftv import builder as pio_builder
+from riftv.uart import capture as uart_capture
+from riftv.classify import classify_results
+from riftv.analysis import generate_physical_report, PhysicalAnalysisReport
+from riftv.model_utils import (
     quantize_model as _quantize_model,
     prepare_test_subset as _prepare_test_subset,
 )
@@ -29,7 +29,7 @@ class Experiment:
 
     Usage::
 
-        from tflmfi import Experiment, load_config
+        from riftv import Experiment, load_config
 
         cfg = load_config("configs/memoryfi.yaml")
         exp = Experiment(cfg)
@@ -382,7 +382,7 @@ class Experiment:
 
         Useful when the CSV column schema changed after a capture.
         """
-        from tflmfi.uart import build_csv
+        from riftv.uart import build_csv
 
         target = run_dir or self.out_dir
         jsonl = target / "results.jsonl"

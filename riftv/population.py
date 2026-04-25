@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 
-from tflmfi.config import CampaignConfig, MultiInjectionConfig, SamplingConfig
+from riftv.config import CampaignConfig, MultiInjectionConfig, SamplingConfig
 
 # ---------------------------------------------------------------------------
 # FlatBuffers schema import — supports tensorflow or standalone tflite package

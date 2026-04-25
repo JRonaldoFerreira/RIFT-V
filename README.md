@@ -1,6 +1,12 @@
-# tflmfi — Unified Fault-Injection Framework for TFLite-Micro on ESP32.
+# RIFT-V
 
-Framework declarativo para campanhas de injeção de falhas (bit-flip) em modelos TFLite-Micro executados em ESP32-C3. Suporta campanhas de **registradores**, **memória** (pesos do modelo) e **híbridas**, com amostragem estatística estratificada, geração automática de headers C, build/flash via PlatformIO e captura UART.
+**RIFT-V** is a runtime-aware statistical fault injection framework for evaluating TinyML inference reliability on RISC-V microcontrollers.
+
+**RIFT-V** stands for **R**untime-aware **I**njection of **F**aults in **T**inyML on RISC-**V**.
+
+---
+
+Framework declarativo para campanhas de injeção de falhas (bit-flip) em modelos TFLite-Micro executados em microcontroladores RISC-V (ESP32-C3, C6, etc.). Suporta campanhas de **registradores**, **memória** (pesos do modelo) e **híbridas**, com amostragem estatística estratificada, geração automática de headers C, build/flash via PlatformIO e captura UART.
 
 ## Requisitos
 
@@ -9,7 +15,7 @@ Framework declarativo para campanhas de injeção de falhas (bit-flip) em modelo
 - Um ambiente virtual Python recomendado para isolar dependências
 - PlatformIO Core para build/flash do firmware
 
-O ponto mais importante para o utilizador final é simples: **depois de instalar os requisitos, o fluxo normal passa a ser editar o YAML e correr `tflmfi ...`**. O utilizador não precisa de escolher manualmente o ambiente `registerfi`/`memoryfi` nem de gerar headers à mão.
+O ponto mais importante para o utilizador final é simples: **depois de instalar os requisitos, o fluxo normal passa a ser editar o YAML e correr `riftv ...`**. O utilizador não precisa de escolher manualmente o ambiente `registerfi`/`memoryfi` nem de gerar headers à mão.
 
 ## Instalação recomendada
 
@@ -35,7 +41,7 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-Isto instala o pacote Python e a CLI `tflmfi`.
+Isto instala o pacote Python `riftv` e a CLI `riftv`.
 
 ### 3. Instalar o perfil certo de dependências
 
@@ -63,7 +69,7 @@ Este perfil instala:
 ### 4. Verificação rápida
 
 ```bash
-tflmfi --help
+riftv --help
 ```
 
 Se o comando acima funcionar, a instalação da CLI está correta.
@@ -87,7 +93,7 @@ export PLATFORMIO_CORE_DIR="$PWD/firmware/.platformio-core"
 ## Estrutura do Projeto
 
 ```
-tflmfi/                  # Pacote Python principal
+riftv/                   # Pacote Python principal (RIFT-V)
   cli.py                 # Entry point CLI
   config.py              # Schema YAML e loader de configuração
   population.py          # Introspecção do modelo, geração de população e amostragem
@@ -138,7 +144,7 @@ O resto do pipeline é tratado pelo framework.
 3. Executar o pipeline completo
 
 ```bash
-tflmfi configs/registerfi_example.yaml
+riftv configs/registerfi_example.yaml
 ```
 
 Esse comando executa automaticamente:
@@ -156,23 +162,23 @@ Também escolhe automaticamente o ambiente PlatformIO correto com base em `campa
 Use os passos individuais quando quiser depurar alguma fase específica:
 
 ```bash
-tflmfi configs/registerfi_example.yaml --step prepare
-tflmfi configs/registerfi_example.yaml --step build
-tflmfi configs/registerfi_example.yaml --step flash
-tflmfi configs/registerfi_example.yaml --step run
-tflmfi configs/registerfi_example.yaml --step analyze
+riftv configs/registerfi_example.yaml --step prepare
+riftv configs/registerfi_example.yaml --step build
+riftv configs/registerfi_example.yaml --step flash
+riftv configs/registerfi_example.yaml --step run
+riftv configs/registerfi_example.yaml --step analyze
 
 # Regerar results.csv a partir de results.jsonl
-tflmfi configs/memoryfi_example.yaml --step rebuild-csv --run-dir runs/my_run
+riftv configs/memoryfi_example.yaml --step rebuild-csv --run-dir runs/my_run
 
 # Analisar um run já existente
-tflmfi configs/memoryfi_example.yaml --step analyze --run-dir runs/my_run
+riftv configs/memoryfi_example.yaml --step analyze --run-dir runs/my_run
 ```
 
 ### Quando usar a CLI e quando usar a API Python
 
-- Use a **CLI** para o fluxo normal de campanha
-- Use a **API Python** quando quiser integrar o framework em notebooks, scripts próprios ou pipelines maiores
+- Use a **CLI** (`riftv`) para o fluxo normal de campanha
+- Use a **API Python** (`import riftv`) quando quiser integrar o RIFT-V em notebooks, scripts próprios ou pipelines maiores
 
 ### Uso programático
 
@@ -181,7 +187,7 @@ O ciclo principal é `prepare()` → `build()` → `flash()` → `run()` → `an
 Se já tiver um `.tflite` int8 e um `.npz` compatíveis com o YAML, pode ir diretamente para `prepare()`. Se ainda só tiver um modelo Keras ou precisar de gerar o subset de teste, use antes as fases opcionais `quantize_model()` e `prepare_test_subset()`.
 
 ```python
-from tflmfi import load_config, Experiment
+from riftv import load_config, Experiment
 
 cfg = load_config("configs/memoryfi_example.yaml")
 exp = Experiment(cfg)
@@ -200,7 +206,7 @@ exp.analyze()
 Se quiser tudo numa chamada só:
 
 ```python
-from tflmfi import load_config, Experiment
+from riftv import load_config, Experiment
 
 cfg = load_config("configs/registerfi_example.yaml")
 exp = Experiment(cfg)
@@ -209,15 +215,15 @@ exp.execute()
 
 ### Novo comportamento para scripts externos
 
-Se o utilizador ativar o ambiente virtual onde o `tflmfi` foi instalado e executar o script com esse Python, o framework passa a resolver automaticamente:
+Se o utilizador ativar o ambiente virtual onde o RIFT-V foi instalado e executar o script com esse Python, o framework passa a resolver automaticamente:
 
 - o executável do PlatformIO a partir do próprio ambiente ativo
 - o `PLATFORMIO_CORE_DIR` local ao projeto de firmware, por omissão em `firmware/.platformio-core`
 
 Isso significa que o utilizador pode criar scripts Python **em qualquer pasta**, desde que:
 
-- o ambiente com `tflmfi` esteja ativo
-- o script faça `import tflmfi`
+- o ambiente com RIFT-V (`riftv`) esteja ativo
+- o script faça `import riftv`
 - o YAML usado aponte corretamente para o `firmware/src`
 
 Já não é necessário configurar manualmente `PATH` nem `PLATFORMIO_CORE_DIR` para o fluxo programático normal.
@@ -228,7 +234,7 @@ Exemplo de um script guardado noutro diretório, desde que o YAML aponte para os
 
 ```python
 from pathlib import Path
-from tflmfi import load_config, Experiment
+from riftv import load_config, Experiment
 
 config_path = Path(r"c:\Downloads\tinymlfi\framework_jose\configs\registerfi_example.yaml")
 
@@ -329,7 +335,7 @@ O módulo `analysis` permite análise espacial da criticidade das falhas:
 - Vulnerabilidade por posição de bit
 
 ```python
-from tflmfi import generate_physical_report
+from riftv import generate_physical_report
 
 report = generate_physical_report("runs/my_campaign/")
 print(report.summary())
@@ -343,7 +349,7 @@ O ficheiro `firmware/platformio.ini` define dois ambientes de build:
 - **`registerfi`** — define `FI_CAMPAIGN_REGISTER=1`
 - **`memoryfi`** — define `FI_CAMPAIGN_MEMORY=1`
 
-O framework selecciona automaticamente o ambiente correcto com base no `campaign.type`.
+O RIFT-V selecciona automaticamente o ambiente correcto com base no `campaign.type`.
 
 ## Testes
 

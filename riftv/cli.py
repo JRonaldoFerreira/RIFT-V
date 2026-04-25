@@ -1,38 +1,39 @@
 #!/usr/bin/env python3
-"""CLI entry point for tflmfi experiments.
+"""CLI entry point for RIFT-V experiments.
 
 Usage examples:
 
     # Full pipeline (prepare → build → flash → run → analyze):
-    tflmfi configs/registerfi_example.yaml
+    riftv configs/registerfi_example.yaml
 
     # Prepare only (generate population + headers):
-    tflmfi configs/memoryfi_example.yaml --step prepare
+    riftv configs/memoryfi_example.yaml --step prepare
 
     # Build + flash only (headers must already be installed):
-    tflmfi configs/registerfi_example.yaml --step build --step flash
+    riftv configs/registerfi_example.yaml --step build --step flash
 
     # Capture only (firmware must already be flashed):
-    tflmfi configs/registerfi_example.yaml --step run
+    riftv configs/registerfi_example.yaml --step run
 
     # Rebuild CSV from JSONL (e.g. after column schema change):
-    tflmfi configs/memoryfi_example.yaml --step rebuild-csv --run-dir runs/my_run
+    riftv configs/memoryfi_example.yaml --step rebuild-csv --run-dir runs/my_run
 
     # Analyze existing results:
-    tflmfi configs/registerfi_example.yaml --step analyze --results runs/my_run/results.csv
+    riftv configs/registerfi_example.yaml --step analyze --results runs/my_run/results.csv
 """
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
-from tflmfi.config import load_config
-from tflmfi.experiment import Experiment
+from riftv.config import load_config
+from riftv.experiment import Experiment
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="tflmfi — Unified FI experiment runner",
+        prog="riftv",
+        description="RIFT-V — Runtime-aware statistical fault injection for TinyML on RISC-V",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )

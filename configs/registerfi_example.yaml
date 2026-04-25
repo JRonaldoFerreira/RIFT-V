@@ -19,8 +19,8 @@ campaign:
       - DEPTHWISE_CONV_2D
       - FULLY_CONNECTED
     slot_count: 1
-    registers: ["a4", "sp"]              # "all" for x1–x31, or a list: [ra, sp, a0, t0, s0]
-    bits: [31, 22]                                 # "all" for bits 0–31, or a list: [0, 7, 15, 31]
+    registers: ["a4"]              # "all" for x1–x31, or a list: [ra, sp, a0, t0, s0]
+    bits: [31]                                 # "all" for bits 0–31, or a list: [0, 7, 15, 31]
 
 sampling:
   method: stratified

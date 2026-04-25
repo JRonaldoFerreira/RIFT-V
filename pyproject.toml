@@ -3,9 +3,9 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tflmfi"
+name = "riftv"
 version = "0.2.0"
-description = "Unified Fault-Injection Framework for TFLite-Micro on ESP32"
+description = "RIFT-V: A Runtime-Aware Statistical Fault Injection Framework for TinyML Inference on RISC-V Microcontrollers"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -29,7 +29,7 @@ all = [
 ]
 
 [project.scripts]
-tflmfi = "tflmfi.cli:main"
+riftv = "riftv.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["tflmfi*"]
+include = ["riftv*"]
