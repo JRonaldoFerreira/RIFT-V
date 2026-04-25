@@ -1,4 +1,4 @@
-# RIFT-V
+﻿# RIFT-V
 <img width="2172" height="724" alt="logo RIFT-V" src="https://github.com/user-attachments/assets/ba63077e-d856-4f2b-af38-a9b05132c784" />
 
 **RIFT-V** is a runtime-aware statistical fault injection framework for evaluating the reliability of TinyML inference on RISC-V microcontrollers.
@@ -41,36 +41,32 @@ source .venv/bin/activate
 
 ### 2. Install the framework
 
-```bash
-pip install -e .
-```
-
-This installs the Python package `riftv` and the `riftv` command-line interface.
-
-### 3. Install the appropriate dependency profile
-
-**Recommended option for most users**
+**Recommended for most users**
 
 ```bash
 pip install -e ".[all]"
 ```
 
-This profile installs:
+This single command installs:
 
+- The Python package `riftv` and the `riftv` command-line interface
 - RIFT-V runtime dependencies
 - Development and test dependencies
 - TensorFlow, for quantization and test-subset generation
 - PlatformIO Core, for firmware build and flash operations
 
-**Useful profiles**
+**Alternative profiles**
 
-- `pip install -e .` — framework and CLI only
-- `pip install -e ".[dev]"` — framework plus test/lint dependencies
-- `pip install -e ".[all]"` — framework plus development tools, TensorFlow, and PlatformIO
+Choose one of these instead of `[all]` if you want a smaller install:
+
+- `pip install -e .` — framework, CLI, and runtime dependencies only
+- `pip install -e ".[dev]"` — adds test/lint dependencies
+- `pip install -e ".[tf]"` — adds TensorFlow
+- `pip install -e ".[firmware]"` — adds PlatformIO Core
 
 > USB/serial drivers and toolchain/SDK packages downloaded by PlatformIO remain operating-system dependent.
 
-### 4. Quick verification
+### 3. Quick verification
 
 ```bash
 riftv --help
@@ -78,7 +74,7 @@ riftv --help
 
 If this command works, the CLI installation is correct.
 
-### 5. Optional: keep the PlatformIO cache inside the project
+### 4. Optional: keep the PlatformIO cache inside the project
 
 This is useful when you want to avoid relying on the user's global PlatformIO directory.
 
