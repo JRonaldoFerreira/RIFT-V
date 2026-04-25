@@ -6,7 +6,7 @@ import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from statistics import NormalDist
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -274,14 +274,34 @@ def generate_register_population(
     introspector: ModelIntrospector,
     target_ops: Optional[List[str]] = None,
     slot_count: int = 3,
+    registers: Union[str, List[str]] = "all",
+    bits: Union[str, List[int]] = "all",
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Generate full register-FI population.
+
+    Parameters
+    ----------
+    registers : str or list of str
+        ``"all"`` to use every GPR (x1–x31), or a list of register names
+        (e.g. ``["a0", "a1", "t0"]``) to restrict the population.
+    bits : str or list of int
+        ``"all"`` to flip any of the 32 bits (0–31), or a list of specific
+        bit indices (e.g. ``[0, 7, 15, 31]``) to restrict the population.
 
     Returns (population_df, trainable_ops_df, all_ops_df).
     """
     if target_ops is None:
         target_ops = list(DEFAULT_TRAINABLE_OPS)
     target_set = set(target_ops)
+
+    # Resolve register subset
+    if isinstance(registers, list):
+        reg_name_set = set(registers)
+        active_regs = [(rid, rname, rcls) for rid, rname, rcls in RISCV_REGISTERS if rname in reg_name_set]
+        if not active_regs:
+            raise ValueError(f"None of the requested registers {registers} matched RISCV_REGISTERS.")
+    else:
+        active_regs = RISCV_REGISTERS
 
     operators = introspector.collect_operators()
     all_ops_df = pd.DataFrame([asdict(op) for op in operators]).sort_values("op_index").reset_index(drop=True)
@@ -294,8 +314,9 @@ def generate_register_population(
     fault_id = 0
     for _, op in trainable_ops_df.iterrows():
         for ts in range(slot_count):
-            for reg_id, reg_name, reg_class in RISCV_REGISTERS:
-                for bit in range(32):
+            for reg_id, reg_name, reg_class in active_regs:
+                bit_range = range(32) if bits == "all" else bits
+                for bit in bit_range:
                     rows.append({
                         "fault_id": fault_id,
                         "op_index": int(op["op_index"]),
@@ -534,8 +555,13 @@ def prepare_register_campaign(
 
     target_ops = reg_cfg.target_ops if reg_cfg else list(DEFAULT_TRAINABLE_OPS)
     slot_count = reg_cfg.slot_count if reg_cfg else 3
+    registers = reg_cfg.registers if reg_cfg else "all"
 
-    pop_df, trainable_df, all_ops_df = generate_register_population(introspector, target_ops, slot_count)
+    bits = reg_cfg.bits if reg_cfg else "all"
+
+    pop_df, trainable_df, all_ops_df = generate_register_population(
+        introspector, target_ops, slot_count, registers=registers, bits=bits,
+    )
 
     all_ops_csv = out_dir / "all_operator_instances.csv"
     trainable_csv = out_dir / "trainable_operator_instances.csv"
@@ -551,12 +577,26 @@ def prepare_register_campaign(
     )
     pop_by_op.to_csv(out_dir / "register_population_by_operator.csv", index=False)
 
+    if isinstance(registers, list):
+        active_reg_count = len(registers)
+        active_reg_names = registers
+    else:
+        active_reg_count = len(RISCV_REGISTERS)
+        active_reg_names = [name for _, name, _ in RISCV_REGISTERS]
+    if isinstance(bits, list):
+        active_bit_count = len(bits)
+        active_bits = bits
+    else:
+        active_bit_count = 32
+        active_bits = list(range(32))
     pop_meta = {
         "population_definition": "N_R={(op_k, time_slot_index, register_id, bit_index)}",
         "slot_count": slot_count,
         "num_operators": int(len(trainable_df)),
-        "num_registers": len(RISCV_REGISTERS),
-        "bits_per_register": 32,
+        "num_registers": active_reg_count,
+        "registers": active_reg_names,
+        "bits_per_register": active_bit_count,
+        "bits": active_bits,
         "population_size": int(len(pop_df)),
     }
     (out_dir / "register_population.meta.json").write_text(json.dumps(pop_meta, indent=2), encoding="utf-8")

@@ -1,6 +1,0 @@
-op_index,op_name,selected_faults
-0,CONV_2D,341
-2,CONV_2D,341
-4,CONV_2D,341
-9,FULLY_CONNECTED,341
-10,FULLY_CONNECTED,341

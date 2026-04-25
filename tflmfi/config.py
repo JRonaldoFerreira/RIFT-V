@@ -4,7 +4,7 @@ from __future__ import annotations
 import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import yaml
 
@@ -24,11 +24,21 @@ class MemoryCampaignConfig:
     target_ops: List[str] = field(default_factory=lambda: ["CONV_2D", "DEPTHWISE_CONV_2D", "FULLY_CONNECTED"])
 
 
+# Valid RISC-V GPR names (x1–x31) — must stay in sync with population.RISCV_REGISTERS.
+VALID_REGISTER_NAMES = {
+    "ra", "sp", "gp", "tp",
+    "t0", "t1", "t2", "t3", "t4", "t5", "t6",
+    "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11",
+    "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7",
+}
+
+
 @dataclass
 class RegisterCampaignConfig:
     target_ops: List[str] = field(default_factory=lambda: ["CONV_2D", "DEPTHWISE_CONV_2D", "FULLY_CONNECTED"])
     slot_count: int = 3
-    registers: str = "all"
+    registers: Union[str, List[str]] = "all"
+    bits: Union[str, List[int]] = "all"
 
 
 @dataclass
@@ -166,10 +176,40 @@ def _parse_campaign(raw: Dict[str, Any]) -> CampaignConfig:
 
     if ctype in ("register", "hybrid"):
         reg_raw = raw.get("register", {})
+        raw_regs = reg_raw.get("registers", "all")
+        if isinstance(raw_regs, list):
+            unknown = set(raw_regs) - VALID_REGISTER_NAMES
+            if unknown:
+                raise ValueError(
+                    f"campaign.register.registers contains unknown register name(s): {sorted(unknown)}. "
+                    f"Valid names: {sorted(VALID_REGISTER_NAMES)}"
+                )
+            registers: Union[str, List[str]] = raw_regs
+        else:
+            if raw_regs != "all":
+                raise ValueError(
+                    f"campaign.register.registers must be 'all' or a list of register names, got '{raw_regs}'"
+                )
+            registers = "all"
+        raw_bits = reg_raw.get("bits", "all")
+        if isinstance(raw_bits, list):
+            for b in raw_bits:
+                if not isinstance(b, int) or b < 0 or b > 31:
+                    raise ValueError(
+                        f"campaign.register.bits entries must be integers in 0..31, got {b!r}"
+                    )
+            bits: Union[str, List[int]] = sorted(set(raw_bits))
+        else:
+            if raw_bits != "all":
+                raise ValueError(
+                    f"campaign.register.bits must be 'all' or a list of bit indices (0-31), got '{raw_bits}'"
+                )
+            bits = "all"
         register = RegisterCampaignConfig(
             target_ops=reg_raw.get("target_ops", RegisterCampaignConfig().target_ops),
             slot_count=reg_raw.get("slot_count", 3),
-            registers=reg_raw.get("registers", "all"),
+            registers=registers,
+            bits=bits,
         )
 
     mi_raw = raw.get("multi_injection", {})
