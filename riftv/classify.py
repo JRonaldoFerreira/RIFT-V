@@ -29,6 +29,14 @@ def classify_row(row: pd.Series) -> str:
     """Classify a single fault-injection result row."""
     status = str(row.get("status", "ok"))
     if status != "ok":
+        # The host scheduler emits ``fatal_hang`` (in either ``status`` or
+        # ``injection_status``) when all hardware-reset strategies plus the
+        # firmware-watchdog wait fail to recover the device.  Surface that
+        # as a distinct ``Hang`` class so it can be reported separately
+        # from ordinary crashes (which do reboot the chip).
+        injection_status = str(row.get("injection_status", ""))
+        if status == "fatal_hang" or injection_status == "fatal_hang":
+            return "Hang"
         return "Crash"
 
     fault_model = str(row.get("fault_model", ""))
@@ -134,7 +142,7 @@ def classify_results(results_csv: Path, output_csv: Path) -> pd.DataFrame:
     print(f"\n{'='*50}")
     print(f"Classification Summary  ({total} fault results)")
     print(f"{'='*50}")
-    for cls in ["Masked", "Acceptable", "Observed", "Warning", "Critical", "Crash", "Good", "NoInjection"]:
+    for cls in ["Masked", "Acceptable", "Observed", "Warning", "Critical", "Crash", "Hang", "Good", "NoInjection"]:
         n = vc.get(cls, 0)
         pct = n / total * 100 if total else 0
         print(f"  {cls:<15s}: {n:>6d}  ({pct:5.1f}%)")

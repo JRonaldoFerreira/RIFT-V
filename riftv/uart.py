@@ -28,6 +28,15 @@ CSV_COLUMNS = [
     "register_id", "register_name", "time_slot_index", "time_slot_count", "delay_us",
     "bit_index", "status", "injection_status",
     "mean_duration_us", "samples",
+    # Host-side audit fields populated by the job scheduler:
+    #   - elapsed_ms / timeout_ms : wall-clock measurements per job
+    #   - boot_seen / result_seen / job_ack_seen : protocol observation flags
+    #   - recovery_method : which reset strategy brought the chip back
+    #   - inferred : True for rows synthesized from a parent fault crash
+    #                (image was not actually dispatched)
+    "elapsed_ms", "timeout_ms",
+    "boot_seen", "result_seen", "job_ack_seen", "recovery_method",
+    "inferred",
     "uart_line",
 ]
 
@@ -43,6 +52,10 @@ _RESULT_COLS = [
     "image_id", "label", "pred_class", "top1_prob",
     "golden_pred_class", "golden_top1_prob",
     "status", "injection_status",
+    # Host-side audit fields populated by the job scheduler:
+    "elapsed_ms", "timeout_ms",
+    "boot_seen", "result_seen", "job_ack_seen", "recovery_method",
+    "inferred",
 ]
 
 _MEMORY_COLS = ["operator_index", "tensor_index", "byte_in_tensor", "bit_index"]
@@ -354,6 +367,176 @@ def _resolve_reset_flag(serial_cfg: SerialConfig) -> bool:
     return serial_cfg.transport == "uart0"
 
 
+# ---------------------------------------------------------------------------
+# Hardware-reset strategies (used by the hang-recovery path)
+#
+# We try several reset mechanisms in sequence so that recovery does not
+# depend on a manual RESET button press, regardless of whether the board
+# uses a USB-UART bridge or a native USB Serial/JTAG peripheral.
+# ---------------------------------------------------------------------------
+
+def _port_vanished(port: str, baud: int, deadline_s: float = 1.5) -> bool:
+    """Return True if *port* disappears within *deadline_s* (real chip reset)."""
+    deadline = time.monotonic() + deadline_s
+    while time.monotonic() < deadline:
+        try:
+            probe = serial.Serial(port, baud, timeout=0.05)
+            probe.close()
+            time.sleep(0.1)
+        except (serial.SerialException, OSError):
+            return True
+    return False
+
+
+def _try_reset_dtr_rts_classic(port: str, baud: int) -> None:
+    """Classic DTR/RTS toggle used by CP210x/CH340/FTDI bridge boards."""
+    try:
+        with serial.Serial(port, baud, timeout=0.05) as rst:
+            rst.dtr = False
+            rst.rts = True
+            time.sleep(0.1)
+            rst.rts = False
+            rst.dtr = False
+            time.sleep(0.05)
+    except (serial.SerialException, OSError) as exc:
+        print(f"[uart] DTR/RTS classic toggle warning: {exc}", file=sys.stderr)
+
+
+def _try_reset_usb_jtag_serial(port: str, baud: int) -> None:
+    """Esptool-compatible USB Serial/JTAG reset sequence.
+
+    Mirrors esptool's ``USBJTAGSerialReset``: a specific DTR/RTS dance that
+    the on-chip USB Serial/JTAG peripheral interprets as a chip reset.  It
+    is the recommended host-side stimulus for native USB boards, but its
+    success still depends on driver, OS reenumeration timing, and the
+    state of the USB peripheral itself.
+    """
+    try:
+        with serial.Serial(port, baud, timeout=0.05) as rst:
+            rst.setRTS(False)
+            rst.setDTR(False)  # idle
+            time.sleep(0.1)
+            rst.setDTR(True)
+            rst.setRTS(False)
+            rst.setDTR(False)  # avoid (0,0)
+            rst.setRTS(True)
+            rst.setDTR(False)
+            rst.setRTS(True)   # chip in reset
+            time.sleep(0.1)
+            rst.setRTS(False)
+            rst.setDTR(False)
+    except (serial.SerialException, OSError) as exc:
+        print(f"[uart] USB-JTAG-Serial reset warning: {exc}", file=sys.stderr)
+
+
+def _try_reset_break(port: str, baud: int) -> None:
+    """Send a serial BREAK signal — best-effort stimulus, not a guaranteed
+    hardware reset.
+
+    BREAK can dislodge a stuck firmware in some scenarios (e.g. UART
+    driver waiting on a frame), but it does not unconditionally reset the
+    SoC and must not be treated as equivalent to DTR/RTS or watchdog
+    reset.  It is included in the chain because it is cheap and harmless.
+    """
+    try:
+        with serial.Serial(port, baud, timeout=0.05) as rst:
+            rst.send_break(duration=0.5)
+            time.sleep(0.2)
+    except (serial.SerialException, OSError, NotImplementedError) as exc:
+        print(f"[uart] Serial BREAK warning: {exc}", file=sys.stderr)
+
+
+# Stable, machine-readable identifiers used in the ``recovery_method`` field
+# written to JSONL/CSV.  These are kept deliberately short so they are easy
+# to filter on in pandas/Excel.
+RECOVERY_METHOD_DTR_RTS = "dtr_rts_classic"
+RECOVERY_METHOD_USB_JTAG = "usb_jtag_serial"
+RECOVERY_METHOD_BREAK = "serial_break"
+RECOVERY_METHOD_WATCHDOG = "watchdog_wait"
+RECOVERY_METHOD_NATURAL_BOOT = "natural_boot"
+RECOVERY_METHOD_NONE = "none"
+
+
+def _attempt_chip_reset(
+    port: str,
+    baud: int,
+    transport: str,
+    verify_boot: Callable[[float], bool],
+    short_timeout_s: float = 4.0,
+    watchdog_timeout_s: float = 8.0,
+) -> Optional[str]:
+    """Run the reset-strategy chain, gated on a real ``boot`` event.
+
+    Order of attempts:
+
+    1. DTR/RTS classic toggle   — fastest, works on bridge boards.
+    2. USB-JTAG-Serial sequence — esptool-compatible native-USB stimulus.
+    3. Serial BREAK             — best-effort host stimulus.
+    4. Watchdog wait            — gives the firmware's TWDT time to fire.
+
+    Success criterion
+    -----------------
+    The **primary** signal of recovery is *verify_boot()* returning True
+    (firmware emitted a fresh ``{"event":"boot"}`` line).
+
+    Port vanish/reappear is **not** used as a success signal: on bridge
+    boards (CP210x/CH340/FTDI) the host-visible USB device is the bridge
+    chip, not the ESP32, so DTR/RTS can reset the SoC while the COM port
+    stays open.  We therefore log vanish events as auxiliary evidence
+    only and keep going through the chain until verify_boot() succeeds.
+
+    Returns the stable identifier of the recovery method that produced a
+    boot event (one of the ``RECOVERY_METHOD_*`` constants), or ``None``
+    if every stage including the watchdog wait was inconclusive.
+    """
+    strategies: List[Tuple[str, str, Callable[[str, int], None]]] = [
+        (RECOVERY_METHOD_DTR_RTS,  "DTR/RTS classic toggle",   _try_reset_dtr_rts_classic),
+        (RECOVERY_METHOD_USB_JTAG, "USB-JTAG-Serial sequence", _try_reset_usb_jtag_serial),
+        (RECOVERY_METHOD_BREAK,    "Serial BREAK",             _try_reset_break),
+    ]
+    if transport == "usb_serial_jtag":
+        # Native USB: the JTAG-Serial sequence is the one that can actually
+        # drive a reset on this transport, so try it first.
+        strategies[0], strategies[1] = strategies[1], strategies[0]
+
+    for method_id, label, strat in strategies:
+        print(f"[uart] Reset attempt: {label}...", file=sys.stderr)
+        strat(port, baud)
+
+        # Auxiliary evidence (log only — not used to decide success).
+        if _port_vanished(port, baud, deadline_s=1.0):
+            print(
+                f"[uart] {label}: port vanished (auxiliary evidence of reset).",
+                file=sys.stderr,
+            )
+
+        if verify_boot(short_timeout_s):
+            print(
+                f"[uart] {label}: firmware boot event received — recovery OK.",
+                file=sys.stderr,
+            )
+            return method_id
+        print(
+            f"[uart] {label}: no boot event within {short_timeout_s:.0f}s; "
+            "trying next strategy...",
+            file=sys.stderr,
+        )
+
+    # Final fallback: rely on the firmware's own task watchdog (TWDT) to
+    # reboot the chip on its own.  This requires the firmware to keep the
+    # watchdog armed during inference; if it does, recovery proceeds
+    # without any external action.
+    print(
+        f"[uart] All host-driven stimuli inconclusive; waiting up to "
+        f"{watchdog_timeout_s:.0f}s for the firmware task watchdog to "
+        "reboot the chip...",
+        file=sys.stderr,
+    )
+    if verify_boot(watchdog_timeout_s):
+        return RECOVERY_METHOD_WATCHDOG
+    return None
+
+
 def _open_port_after_reset(
     port: str,
     baud: int,
@@ -474,8 +657,16 @@ def capture(
     # for all remaining images (same register/bit/timing).  Skip retries
     # and immediately mark every remaining image for that fault as crash.
     MAX_CRASH_RETRIES = 0
-    JOB_TIMEOUT_S = 60.0
     GOLDEN_TIMEOUT_S = 120.0
+
+    # Per-job timeout — initially set to the configured maximum; the
+    # scheduler may shrink it after the golden phase by measuring the
+    # worst inter-result gap and multiplying by *job_timeout_safety_factor*
+    # (see :class:`SerialConfig`).
+    job_timeout_s: float = float(serial_cfg.job_timeout_max_s)
+    # Timestamps of every ``result`` message received during the *first*
+    # golden phase, used to calibrate the per-job timeout.
+    golden_result_times: List[float] = []
 
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -562,8 +753,14 @@ def capture(
         except (serial.SerialException, OSError) as exc:
             print(f"[uart] Warning: send failed: {exc}", file=sys.stderr)
 
-    def _read_event(timeout: float = JOB_TIMEOUT_S) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-        """Return (payload, None) or (None, error_kind)."""
+    def _read_event(timeout: Optional[float] = None) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Return (payload, None) or (None, error_kind).
+
+        When *timeout* is None, falls back to the (possibly calibrated)
+        per-job timeout ``job_timeout_s``.
+        """
+        if timeout is None:
+            timeout = job_timeout_s
         try:
             line = lq.get(timeout=timeout)
         except queue.Empty:
@@ -635,6 +832,11 @@ def capture(
                         int(payload.get("pred_class", -1)),
                         float(payload.get("top1_prob", 0.0)),
                     )
+                # Record the wall-clock arrival time of every golden
+                # result so the host can later calibrate the per-job
+                # timeout from the worst observed inter-result gap.
+                if is_first:
+                    golden_result_times.append(time.monotonic())
 
             if event == "memory_map":
                 _append_jsonl(jsonl_path, payload)
@@ -667,12 +869,73 @@ def capture(
                 return True
         return False
 
-    def _force_hw_reset_and_reconnect() -> bool:
-        """Close the port, force a DTR/RTS hardware reset, reopen, wait for boot.
+    def _verify_boot_during_recovery(timeout_s: float) -> bool:
+        """Open *port*, parse JSON lines, return True iff a ``boot`` event
+        is observed within *timeout_s*.
 
-        This recovers from a firmware hang where the device did not reboot on
-        its own.  Works on boards with a USB-UART bridge that supports
-        DTR/RTS auto-reset (most ESP32 dev-kits).
+        Used as the success criterion for :func:`_attempt_chip_reset`: the
+        firmware emitting a fresh ``{"event":"boot"}`` line is the only
+        proof that the chip actually rebooted and is responsive again.
+
+        The probe Serial is always closed before returning so the next
+        strategy (or the final reader-thread reopen) can take ownership
+        of the port.
+        """
+        # Reopening can fail briefly while the USB device re-enumerates
+        # (especially on usb_serial_jtag).  Poll until we get a handle or
+        # exhaust the budget.
+        probe: Optional[serial.Serial] = None
+        open_deadline = time.monotonic() + min(timeout_s, 3.0)
+        while time.monotonic() < open_deadline:
+            try:
+                probe = serial.Serial(port, baud, timeout=0.05)
+                break
+            except (serial.SerialException, OSError):
+                time.sleep(0.2)
+        if probe is None:
+            return False
+
+        try:
+            deadline = time.monotonic() + timeout_s
+            buf = bytearray()
+            while time.monotonic() < deadline:
+                try:
+                    waiting = probe.in_waiting
+                    chunk = probe.read(waiting) if waiting else probe.read(1)
+                except (serial.SerialException, OSError):
+                    return False
+                if not chunk:
+                    continue
+                buf.extend(chunk)
+                while True:
+                    i = buf.find(b"\n")
+                    if i < 0:
+                        break
+                    line = bytes(buf[:i]).decode("utf-8", errors="replace").strip()
+                    del buf[:i + 1]
+                    if not line:
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if payload.get("event") == "boot":
+                        return True
+            return False
+        finally:
+            try:
+                probe.close()
+            except Exception:
+                pass
+
+    def _force_hw_reset_and_reconnect() -> Optional[str]:
+        """Close the port, force a chip reset, reopen, and confirm boot.
+
+        Returns the stable identifier of the recovery method that produced
+        the boot event (one of the ``RECOVERY_METHOD_*`` constants), or
+        ``None`` if recovery ultimately failed.  Callers are expected to
+        record this identifier in the resulting JSONL/CSV row so post-hoc
+        analysis can attribute hangs to the strategy that fixed them.
         """
         nonlocal ser, reader
 
@@ -693,22 +956,53 @@ def capture(
             except queue.Empty:
                 break
 
-        # 4. Force DTR/RTS reset and reopen (always do_reset=True)
-        new_ser = _open_port_after_reset(port, baud, True, transport)
+        # 4. Reset-strategy chain, gated on a real boot event.
+        watchdog_wait = max(8.0, float(serial_cfg.boot_timeout_s) / 2.0)
+        method = _attempt_chip_reset(
+            port, baud, transport,
+            verify_boot=_verify_boot_during_recovery,
+            short_timeout_s=4.0,
+            watchdog_timeout_s=watchdog_wait,
+        )
+        if method is None:
+            print(
+                "[uart] HW reset: no boot event after exhausting all "
+                "strategies and watchdog wait — recovery failed.",
+                file=sys.stderr,
+            )
+            return None
+
+        # 5. Reopen the capture port for the long-lived reader thread.
+        #    The verifier already confirmed the chip is alive, so we just
+        #    need a clean handle; the boot line itself was consumed by the
+        #    verifier and is intentionally not re-injected.
+        new_ser: Optional[serial.Serial] = None
+        reopen_timeout = 5.0
+        deadline = time.monotonic() + reopen_timeout
+        while time.monotonic() < deadline:
+            try:
+                new_ser = serial.Serial(port, baud, timeout=0.05)
+                break
+            except (serial.SerialException, OSError):
+                time.sleep(0.2)
+
         if new_ser is None:
-            print("[uart] HW reset: could not reopen port.", file=sys.stderr)
-            return False
+            print(
+                "[uart] HW reset: chip booted but capture port could not "
+                "be reopened.",
+                file=sys.stderr,
+            )
+            return None
         ser = new_ser
 
-        # 5. Restart reader thread
+        # 6. Restart reader thread
         stop_ev.clear()
         reader = threading.Thread(
             target=_uart_reader_thread, args=(ser, lq, stop_ev), daemon=True,
         )
         reader.start()
 
-        # 6. Wait for boot event
-        return _wait_for_boot(timeout_s=float(serial_cfg.boot_timeout_s))
+        return method
 
     # ---- Main logic ----
     try:
@@ -736,6 +1030,38 @@ def capture(
             reader.join(timeout=2.0)
             return
 
+        # ---- Adaptive job-timeout calibration ----
+        # Use the worst inter-result gap observed during the golden phase
+        # as a proxy for the longest legitimate inference time, multiply
+        # by the configured safety factor and clamp into [min_s, max_s].
+        # Falls back to the configured maximum when the safety factor is
+        # disabled (None) or when too few golden samples were collected.
+        safety = serial_cfg.job_timeout_safety_factor
+        if safety is not None and len(golden_result_times) >= 2:
+            gaps = [
+                t1 - t0
+                for t0, t1 in zip(golden_result_times[:-1], golden_result_times[1:])
+            ]
+            max_gap_s = max(gaps)
+            calibrated = max(
+                float(serial_cfg.job_timeout_min_s),
+                min(float(serial_cfg.job_timeout_max_s), max_gap_s * float(safety)),
+            )
+            print(
+                f"[uart] Calibrated job timeout from golden: max gap "
+                f"{max_gap_s * 1000:.1f} ms × {safety:g} = {calibrated:.2f} s "
+                f"(min {serial_cfg.job_timeout_min_s:.1f} s, "
+                f"max {serial_cfg.job_timeout_max_s:.1f} s).",
+                file=sys.stderr,
+            )
+            job_timeout_s = calibrated
+        else:
+            print(
+                f"[uart] Job timeout calibration skipped; using configured "
+                f"max {job_timeout_s:.1f} s.",
+                file=sys.stderr,
+            )
+
         # ---- Fault-job dispatch loop ----
         from collections import deque
 
@@ -744,7 +1070,12 @@ def capture(
             (fi, img) for fi in range(fault_count) for img in range(image_count)
         )
         crash_retries: Dict[Tuple[int, int], int] = {}
-        crashed_faults: set = set()
+        # Per-fault recovery metadata captured the first time a fault
+        # crashes the chip.  Membership replaces the old ``crashed_faults``
+        # set; values are propagated to subsequent images of the same
+        # fault index so every inferred row carries the same
+        # ``recovery_method``/``boot_seen`` as the parent crash.
+        crashed_fault_meta: Dict[int, Dict[str, Any]] = {}
         completed = 0
         crash_outcomes = 0
 
@@ -783,19 +1114,79 @@ def capture(
                         cr[json_col] = meta[csv_col]
             return cr
 
+        def _attach_audit(
+            payload: Dict[str, Any],
+            *,
+            elapsed_ms: Optional[float],
+            boot_seen: bool,
+            result_seen: bool,
+            job_ack_seen: bool,
+            recovery_method: str,
+            inferred: bool = False,
+        ) -> Dict[str, Any]:
+            """Mutate *payload* in place with the host-side audit fields.
+
+            These fields are persisted alongside firmware-reported results
+            so post-hoc analysis can distinguish *Completed*, *Crash*,
+            *Hang* and recovered outcomes, and so the recovery strategy
+            that brought the chip back is recorded next to the failing
+            job.
+
+            Parameters
+            ----------
+            inferred : bool
+                ``True`` for rows that were *not* actually dispatched —
+                they describe images skipped because the same fault index
+                deterministically crashed on a previous image.  Their
+                ``recovery_method`` and ``boot_seen`` fields are inherited
+                from that parent crash; ``elapsed_ms``, ``result_seen``
+                and ``job_ack_seen`` are intentionally null/false because
+                no ``run_job`` was sent for these images.
+            """
+            payload["elapsed_ms"] = (
+                None if elapsed_ms is None else round(float(elapsed_ms), 3)
+            )
+            payload["timeout_ms"] = int(round(job_timeout_s * 1000.0))
+            payload["boot_seen"] = bool(boot_seen)
+            payload["result_seen"] = bool(result_seen)
+            payload["job_ack_seen"] = bool(job_ack_seen)
+            payload["recovery_method"] = recovery_method
+            payload["inferred"] = bool(inferred)
+            return payload
+
         print(f"[uart] Dispatching {total_jobs} fault jobs...", file=sys.stderr)
 
         while jobs:
             fi, img = jobs.popleft()
 
             # ---- Skip images whose fault index already crashed ----
-            if fi in crashed_faults:
+            # These are post-hoc inferred crashes (the fault deterministically
+            # crashed on the first image, so we don't dispatch the rest).
+            # ``recovery_method`` and ``boot_seen`` are inherited from the
+            # parent crash so every row of a deterministically-crashing
+            # fault carries the same recovery characterization.  The
+            # ``inferred`` flag is set to True so analyses can immediately
+            # tell which rows came from real measurements.
+            if fi in crashed_fault_meta:
+                parent = crashed_fault_meta[fi]
                 cr = _make_crash_result(fi, img)
+                _attach_audit(
+                    cr,
+                    elapsed_ms=None,
+                    boot_seen=parent.get("boot_seen", False),
+                    result_seen=False,
+                    job_ack_seen=False,
+                    recovery_method=parent.get(
+                        "recovery_method", RECOVERY_METHOD_NONE
+                    ),
+                    inferred=True,
+                )
                 _append_jsonl(jsonl_path, cr)
                 valid += 1
                 crash_outcomes += 1
                 continue
 
+            job_start_t = time.monotonic()
             _send_cmd({"cmd": "run_job", "fi": fi, "img": img})
 
             got_ack = False
@@ -803,7 +1194,7 @@ def capture(
             pending_result = None
 
             while not got_ack:
-                payload, err = _read_event(timeout=JOB_TIMEOUT_S)
+                payload, err = _read_event(timeout=job_timeout_s)
 
                 if err == "timeout":
                     print(f"[uart] Job timeout fi={fi} img={img}", file=sys.stderr)
@@ -840,6 +1231,9 @@ def capture(
                     print(f"[uart] Firmware error: {msg}", file=sys.stderr)
                     got_ack = True  # skip to next job
 
+            elapsed_ms = (time.monotonic() - job_start_t) * 1000.0
+            result_seen = pending_result is not None
+
             # ---- Handle crash / hang ----
             if not got_ack:
                 key = (fi, img)
@@ -852,28 +1246,45 @@ def capture(
                         file=sys.stderr,
                     )
                     jobs.appendleft((fi, img))
+                    crash_row_written = False
                 else:
                     # Mark this fault index as crashed — skip all remaining
                     # images for it instead of retrying each one individually.
-                    crashed_faults.add(fi)
+                    # The recovery_method/boot_seen entry is filled in
+                    # below once recovery completes; subsequent images
+                    # of the same fault inherit those values.
+                    crashed_fault_meta[fi] = {
+                        "recovery_method": RECOVERY_METHOD_NONE,
+                        "boot_seen": False,
+                    }
                     print(
                         f"[uart] Persistent crash fi={fi} img={img} "
                         "\u2014 recording as crash for all remaining images.",
                         file=sys.stderr,
                     )
-                    cr = _make_crash_result(fi, img)
-                    _append_jsonl(jsonl_path, cr)
-                    valid += 1
-                    crash_outcomes += 1
+                    crash_row = _make_crash_result(fi, img)
+                    crash_row_written = True
+                    # We will populate audit fields below after we know
+                    # which recovery method (if any) brought the chip back.
+
+                # Track how the firmware (if at all) was brought back.
+                # Default: no recovery needed/none worked — overwritten
+                # below as evidence accumulates.
+                recovery_method = (
+                    RECOVERY_METHOD_NATURAL_BOOT if boot_received else RECOVERY_METHOD_NONE
+                )
 
                 # Wait for boot if we haven't seen it already
                 if not boot_received:
                     print("[uart] Waiting for firmware reboot...", file=sys.stderr)
-                    if not _wait_for_boot(timeout_s=30.0):
+                    if _wait_for_boot(timeout_s=30.0):
+                        boot_received = True
+                        recovery_method = RECOVERY_METHOD_NATURAL_BOOT
+                    else:
                         # ---- Firmware hung: attempt forced HW reset ----
                         max_hw = serial_cfg.max_hang_recoveries
                         delay = serial_cfg.hang_recovery_delay_s
-                        recovered = False
+                        recovered_method: Optional[str] = None
                         for attempt in range(1, max_hw + 1):
                             print(
                                 f"[uart] Firmware did not reboot. "
@@ -882,29 +1293,72 @@ def capture(
                             )
                             if delay > 0:
                                 time.sleep(delay)
-                            if _force_hw_reset_and_reconnect():
+                            method = _force_hw_reset_and_reconnect()
+                            if method is not None:
                                 print(
-                                    "[uart] HW reset succeeded \u2014 device rebooted.",
+                                    f"[uart] HW reset succeeded via "
+                                    f"{method} \u2014 device rebooted.",
                                     file=sys.stderr,
                                 )
-                                recovered = True
+                                recovered_method = method
+                                boot_received = True
                                 break
 
-                        if not recovered:
+                        if recovered_method is not None:
+                            recovery_method = recovered_method
+                        else:
                             # All reset attempts exhausted for this job.
                             # Mark the fault as fatal_hang (if not already
-                            # marked as a persistent crash above).
-                            if fi not in crashed_faults:
-                                crashed_faults.add(fi)
-                                cr = _make_crash_result(fi, img)
-                                cr["status"] = "fatal_hang"
-                                cr["injection_status"] = "fatal_hang"
-                                _append_jsonl(jsonl_path, cr)
+                            # marked as a persistent crash above) and
+                            # record that no recovery method worked.
+                            recovery_method = RECOVERY_METHOD_NONE
+                            if fi not in crashed_fault_meta:
+                                crashed_fault_meta[fi] = {
+                                    "recovery_method": RECOVERY_METHOD_NONE,
+                                    "boot_seen": False,
+                                }
+                                fhr = _make_crash_result(fi, img)
+                                fhr["status"] = "fatal_hang"
+                                fhr["injection_status"] = "fatal_hang"
+                                _attach_audit(
+                                    fhr,
+                                    elapsed_ms=elapsed_ms,
+                                    boot_seen=False,
+                                    result_seen=result_seen,
+                                    job_ack_seen=False,
+                                    recovery_method=RECOVERY_METHOD_NONE,
+                                )
+                                _append_jsonl(jsonl_path, fhr)
                                 valid += 1
                                 crash_outcomes += 1
+                            elif crash_row_written:
+                                # We already prepared a crash row above
+                                # (persistent-crash branch); upgrade it
+                                # to fatal_hang since no recovery worked.
+                                crash_row["status"] = "fatal_hang"
+                                crash_row["injection_status"] = "fatal_hang"
 
                             # Remove any re-queued retries for this fault
                             jobs = deque(j for j in jobs if j[0] != fi)
+
+                            if crash_row_written:
+                                _attach_audit(
+                                    crash_row,
+                                    elapsed_ms=elapsed_ms,
+                                    boot_seen=boot_received,
+                                    result_seen=result_seen,
+                                    job_ack_seen=False,
+                                    recovery_method=recovery_method,
+                                )
+                                _append_jsonl(jsonl_path, crash_row)
+                                valid += 1
+                                crash_outcomes += 1
+                                crash_row_written = False  # already flushed
+                                # Update fault meta with the final unrecoverable state.
+                                crashed_fault_meta[fi] = {
+                                    "recovery_method": recovery_method,
+                                    "boot_seen": boot_received,
+                                }
 
                             if not jobs:
                                 print(
@@ -923,7 +1377,8 @@ def capture(
                             )
                             if delay > 0:
                                 time.sleep(delay * 2)
-                            if not _force_hw_reset_and_reconnect():
+                            last_method = _force_hw_reset_and_reconnect()
+                            if last_method is None:
                                 print(
                                     "[ERROR] Cannot recover device. "
                                     "Aborting campaign.",
@@ -931,10 +1386,35 @@ def capture(
                                 )
                                 break
                             print(
-                                "[uart] Device recovered. Continuing "
-                                "with remaining faults.",
+                                f"[uart] Device recovered via "
+                                f"{last_method}. Continuing with "
+                                "remaining faults.",
                                 file=sys.stderr,
                             )
+
+                # Flush the persistent-crash row (if not already flushed
+                # by the fatal_hang upgrade path above).
+                if crash_row_written:
+                    _attach_audit(
+                        crash_row,
+                        elapsed_ms=elapsed_ms,
+                        boot_seen=boot_received,
+                        result_seen=result_seen,
+                        job_ack_seen=False,
+                        recovery_method=recovery_method,
+                    )
+                    _append_jsonl(jsonl_path, crash_row)
+                    valid += 1
+                    crash_outcomes += 1
+
+                # Record the final recovery info for this fault so all
+                # subsequent images of the same fault index inherit it
+                # via the early-skip branch at the top of the loop.
+                if fi in crashed_fault_meta:
+                    crashed_fault_meta[fi] = {
+                        "recovery_method": recovery_method,
+                        "boot_seen": boot_received,
+                    }
 
                 # Skip golden after crash — host has cached golden data.
                 # Firmware just needs golden_done=true to accept jobs.
@@ -964,6 +1444,14 @@ def capture(
 
             # ---- Flush buffered result on successful ack ----
             if pending_result is not None:
+                _attach_audit(
+                    pending_result,
+                    elapsed_ms=elapsed_ms,
+                    boot_seen=False,
+                    result_seen=True,
+                    job_ack_seen=True,
+                    recovery_method=RECOVERY_METHOD_NONE,
+                )
                 _append_jsonl(jsonl_path, pending_result)
                 valid += 1
                 fid = pending_result.get("fault_id", pending_result.get("group_id", "?"))

@@ -48,6 +48,14 @@ analysis_runs/
 # --- PlatformIO (já listado em firmware/.gitignore; reforço na raiz) ---
 firmware/.pio/
 firmware/.riftv/
+firmware/.platformio-core/
+
+# --- ESP-IDF Component Manager cache (regenerated from override_path) ---
+# The patched esp-tflite-micro lives in firmware/components/ and is what the
+# build actually uses (see firmware/src/idf_component.yml: override_path).
+# managed_components/ is rewritten on every build and must not be versioned,
+# otherwise it can mask the patched component.
+firmware/managed_components/
 
 # --- Artefatos grandes gerados localmente (adicione pastas seus dados aqui) ---
 # *.csv

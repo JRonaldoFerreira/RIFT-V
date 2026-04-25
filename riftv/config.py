@@ -95,6 +95,16 @@ class SerialConfig:
     reset_before_capture: Optional[bool] = None  # None = auto (True for uart0, False for usb_serial_jtag)
     max_hang_recoveries: int = 3          # HW reset attempts when firmware hangs without rebooting
     hang_recovery_delay_s: float = 2.0    # seconds to wait between HW reset attempts
+    # ---- Adaptive job-timeout calibration --------------------------------
+    # The host scheduler measures the worst inter-result gap during the
+    # golden phase and uses ``max_gap × safety_factor`` as the per-job
+    # timeout, clamped to [min_s, max_s].  This avoids waiting an
+    # arbitrary ~60 s on tiny models while still leaving headroom on
+    # large ones.  Set *safety_factor* to None to disable calibration
+    # and fall back to *max_s* as a fixed timeout.
+    job_timeout_safety_factor: Optional[float] = 20.0
+    job_timeout_min_s: float = 1.0
+    job_timeout_max_s: float = 60.0
 
 
 @dataclass
@@ -269,6 +279,8 @@ def _parse_serial(raw: Optional[Dict[str, Any]]) -> SerialConfig:
             f"serial.transport must be one of {VALID_TRANSPORTS}, got '{transport}'"
         )
     reset_val = raw.get("reset_before_capture", None)
+    safety_raw = raw.get("job_timeout_safety_factor", 20.0)
+    safety = None if safety_raw is None else float(safety_raw)
     return SerialConfig(
         port=raw.get("port", "COM3"),
         baud=raw.get("baud", 460800),
@@ -278,6 +290,9 @@ def _parse_serial(raw: Optional[Dict[str, Any]]) -> SerialConfig:
         reset_before_capture=reset_val,
         max_hang_recoveries=raw.get("max_hang_recoveries", 3),
         hang_recovery_delay_s=float(raw.get("hang_recovery_delay_s", 2.0)),
+        job_timeout_safety_factor=safety,
+        job_timeout_min_s=float(raw.get("job_timeout_min_s", 1.0)),
+        job_timeout_max_s=float(raw.get("job_timeout_max_s", 60.0)),
     )
 
 

@@ -3,8 +3,8 @@
 # ──────────────────────────────────────────────────
 
 experiment:
-  name: registerfi_image_classification_fashsion_mnist_transient_with_select_bit_select
-  description: "Register-FI bit-flip campaign on Image_Classification (MNIST, int8)_permanent type"
+  name: registerfi_image_classification_fashion_mnist_transient_with_select_bit_select
+  description: "Register-FI bit-flip campaign on Image_Classification (Fashion MNIST, int8) — transient"
 
 model:
   tflite: "../models/image_classification_fashionmnist_int8.tflite"
@@ -20,7 +20,7 @@ campaign:
       - FULLY_CONNECTED
     slot_count: 1
     registers: ["a4"]              # "all" for x1–x31, or a list: [ra, sp, a0, t0, s0]
-    bits: [31]                                 # "all" for bits 0–31, or a list: [0, 7, 15, 31]
+    bits: [22]                                 # "all" for bits 0–31, or a list: [0, 7, 15, 31]
 
 sampling:
   method: stratified

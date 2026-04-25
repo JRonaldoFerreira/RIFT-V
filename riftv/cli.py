@@ -24,6 +24,7 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 from riftv.config import load_config
@@ -59,6 +60,26 @@ def main() -> None:
     if "all" in steps:
         exp.execute(verbose=args.verbose, stop_after=args.stop_after)
         return
+
+    # Hybrid campaigns require the orchestrated pipeline in
+    # Experiment._execute_hybrid (build → flash → run for register, then
+    # for memory).  Running flash/run/analyze individually only exercises
+    # the register sub-campaign and silently drops the memory side, so we
+    # block those steps here and steer the user to the full pipeline.
+    if cfg.campaign.type == "hybrid":
+        unsafe = steps & {"build", "flash", "run", "analyze", "rebuild-csv"}
+        if unsafe:
+            print(
+                "[riftv] Hybrid campaigns must be driven through the full "
+                "pipeline (sequential register + memory builds, flashes, "
+                "captures and classifications). Individual --step "
+                f"{sorted(unsafe)} would only execute the register half.\n"
+                "        Run without --step:\n"
+                f"            riftv {args.config}\n"
+                "        Or use --step prepare to (re)generate headers only.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
 
     if "prepare" in steps:
         exp.prepare()

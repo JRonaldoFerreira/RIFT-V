@@ -1,4 +1,4 @@
-# RIFT-V
+﻿# RIFT-V
 <img width="2172" height="724" alt="logo RIFT-V" src="https://github.com/user-attachments/assets/ba63077e-d856-4f2b-af38-a9b05132c784" />
 
 <div align="center">
@@ -16,7 +16,7 @@
 
 ---
 
-RIFT-V provides a declarative workflow for bit-flip fault-injection campaigns on TensorFlow Lite Micro models running on RISC-V microcontrollers such as ESP32-C3 and ESP32-C6. It supports **register**, **memory**, and **hybrid** campaigns, with stratified statistical sampling, automatic C/C++ header generation, PlatformIO build/flash orchestration, UART capture, result classification, and physical memory analysis.
+RIFT-V provides a declarative workflow for bit-flip fault-injection campaigns on TensorFlow Lite Micro models running on RISC-V microcontrollers such as ESP32-C3 and ESP32-C6. It supports **register**, **memory**, Single Event Upset(SEU), MBU, and **hybrid** campaigns, with stratified statistical sampling, automatic C/C++ header generation, PlatformIO build/flash orchestration, UART capture, result classification, and physical memory analysis.
 
 ## Requirements
 
@@ -240,7 +240,7 @@ Manual `PATH` or `PLATFORMIO_CORE_DIR` configuration is not required for the nor
 from pathlib import Path
 from riftv import load_config, Experiment
 
-config_path = Path(r"c:\Downloads\tinymlfi\framework_jose\configs\registerfi_example.yaml")
+config_path = Path(r"C:\path\to\RIFT-V\configs\registerfi_example.yaml")
 
 cfg = load_config(config_path)
 exp = Experiment(cfg)
@@ -300,6 +300,25 @@ serial:
   run_port: COM17              # Capture port, if different from the flash port
   reset_before_capture: null   # null=auto, true=force DTR/RTS, false=never
   boot_timeout_s: 30
+
+  # ---- Hang recovery cascade --------------------------------------
+  # When a faulted job fails to ack and the firmware does not reboot
+  # on its own, the host runs a reset cascade (DTR/RTS, USB-JTAG,
+  # serial BREAK, watchdog wait).  The strategy that produced a fresh
+  # boot event is recorded per-row in ``recovery_method``.
+  max_hang_recoveries: 3       # forced HW-reset attempts per hang
+  hang_recovery_delay_s: 2.0   # delay between attempts (seconds)
+
+  # ---- Adaptive per-job timeout -----------------------------------
+  # The host measures the worst inter-result gap during the golden
+  # phase and uses ``max_gap × safety_factor`` as the per-job
+  # timeout, clamped into [min_s, max_s].  This avoids waiting an
+  # arbitrary 60 s on tiny models while leaving headroom on larger
+  # ones.  Set ``job_timeout_safety_factor`` to ``null`` to disable
+  # calibration and pin the timeout to ``job_timeout_max_s``.
+  job_timeout_safety_factor: 20.0
+  job_timeout_min_s: 1.0
+  job_timeout_max_s: 60.0
 ```
 
 > To identify the correct transport, inspect the board's USB interface. If it uses CP2102, CH340, CH343, FT232, or a similar bridge, choose `uart0`. If the connector is wired directly to the SoC's native USB peripheral, choose `usb_serial_jtag`.
@@ -332,8 +351,35 @@ Each fault-injection result is classified into one of the following categories:
 | **Observed** | Predicted class differs from the golden reference but remains correct with high confidence |
 | **Warning** | Same predicted class with a significant confidence drop |
 | **Critical** | Wrong predicted class or very low confidence |
-| **Crash** | Firmware did not complete inference |
+| **Crash** | Firmware did not complete inference but rebooted on its own |
+| **Hang** | Firmware stopped responding and required a forced HW reset to recover (`status == "fatal_hang"`) |
 | **NoInjection** | Register campaign result where the requested injection did not actually occur |
+
+## Result Auditing & Recovery
+
+Every row written to `results.jsonl` / `results.csv` carries host-side audit
+fields that distinguish a *Completed* job from a *Crash*, a *Hang*, or an
+inferred sibling row, and that record which recovery strategy brought the
+chip back when needed:
+
+| Field | Meaning |
+|-------|---------|
+| `elapsed_ms` | Wall-clock between `run_job` send and `job_ack` (or timeout). `null` for inferred rows that were never dispatched. |
+| `timeout_ms` | Per-job timeout in effect when the row was produced. |
+| `boot_seen` | `true` when a `{"event":"boot"}` was observed for this fault (during the job, during the natural-reboot wait, or as part of the HW-reset cascade). |
+| `result_seen` | `true` when the firmware emitted a `result` for this specific job. |
+| `job_ack_seen` | `true` when the firmware emitted `job_ack` for this specific job. |
+| `recovery_method` | Stable id of the strategy that recovered the chip: `none`, `natural_boot`, `dtr_rts_classic`, `usb_jtag_serial`, `serial_break`, or `watchdog_wait`. Inherited by inferred rows so the whole fault carries the same characterization. |
+| `inferred` | `true` for rows synthesized after a deterministic fault crash (image was *not* actually dispatched — its `recovery_method` and `boot_seen` are inherited from the parent crash, while `elapsed_ms`/`result_seen`/`job_ack_seen` stay null/false). |
+
+The recovery cascade itself is configurable in
+`serial.{max_hang_recoveries, hang_recovery_delay_s}`; it tries DTR/RTS,
+USB-JTAG, serial BREAK and the firmware watchdog in that order, and the
+*first* strategy that produces a fresh boot event is the one recorded.
+
+The per-job timeout is calibrated automatically from the golden phase
+(see `job_timeout_safety_factor` in the YAML reference), so tiny models
+do not pay an arbitrary 60 s wall-clock penalty per crashed job.
 
 ## Physical Analysis
 
