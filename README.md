@@ -1,7 +1,7 @@
 ﻿# RIFT-V
 <img width="2172" height="724" alt="logo RIFT-V" src="https://github.com/user-attachments/assets/ba63077e-d856-4f2b-af38-a9b05132c784" />
-
 **RIFT-V** stands for **R**untime-aware **I**njection of **F**aults in **T**inyML on RISC-**V**.
+
 
 <img width="1670" height="941" alt="overview_riftv" src="https://github.com/user-attachments/assets/8a85fda0-8e81-4e3b-a27b-0ff7b36550b3" />
 
