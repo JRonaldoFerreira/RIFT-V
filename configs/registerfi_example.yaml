@@ -3,7 +3,7 @@
 # ──────────────────────────────────────────────────
 
 experiment:
-  name: registerfi_image_classification_fashsion_mnist_parmanent
+  name: registerfi_image_classification_fashsion_mnist_transient_with_select
   description: "Register-FI bit-flip campaign on Image_Classification (MNIST, int8)_permanent type"
 
 model:
@@ -12,14 +12,14 @@ model:
 
 campaign:
   type: register
-  fault_duration: transient   
+  fault_duration: transient    
   register:
     target_ops:
       - CONV_2D
       - DEPTHWISE_CONV_2D
       - FULLY_CONNECTED
     slot_count: 1
-    registers: all
+    registers: ["a4", "t2", "a7"]              # "all" for x1–x31, or a list: [ra, sp, a0, t0, s0]
 
 sampling:
   method: stratified
@@ -38,7 +38,7 @@ firmware:
   idf_target: esp32c3
 
 serial:
-  port: COM17
+  port: COM20
   baud: 460800
   boot_timeout_s: 30
   transport: usb_serial_jtag

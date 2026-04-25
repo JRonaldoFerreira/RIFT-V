@@ -470,7 +470,10 @@ def capture(
     groups_csv : Path, optional
         Path to the ``*_fault_groups.csv`` for multi-fault enrichment.
     """
-    MAX_CRASH_RETRIES = 1
+    # If a fault crashes for any image, it will deterministically crash
+    # for all remaining images (same register/bit/timing).  Skip retries
+    # and immediately mark every remaining image for that fault as crash.
+    MAX_CRASH_RETRIES = 0
     JOB_TIMEOUT_S = 60.0
     GOLDEN_TIMEOUT_S = 120.0
 
@@ -935,8 +938,13 @@ def capture(
 
                 # Skip golden after crash — host has cached golden data.
                 # Firmware just needs golden_done=true to accept jobs.
+                # NOTE: Register campaigns MUST re-run golden so the
+                # firmware collects operator timing profiles (used by
+                # compute_delay_us).  skip_golden zeroes op_profiles,
+                # causing all delays to fall back to min_timer_delay_us
+                # and injecting faults too early (100% masking).
                 golden_ok = False
-                if golden_cache:
+                if golden_cache and campaign_type != "register":
                     golden_ok = _skip_golden()
                     if not golden_ok:
                         print(
