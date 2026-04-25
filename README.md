@@ -1,12 +1,11 @@
 ﻿# RIFT-V
 <img width="2172" height="724" alt="logo RIFT-V" src="https://github.com/user-attachments/assets/ba63077e-d856-4f2b-af38-a9b05132c784" />
 
-**RIFT-V** is a runtime-aware statistical fault injection framework for evaluating the reliability of TinyML inference on RISC-V microcontrollers.
-
-<img width="1672" height="941" alt="overviewpic RIFT-V" src="https://github.com/user-attachments/assets/7029cbda-51f0-44fe-bb8b-b25f285e8f29" />
-
-
 **RIFT-V** stands for **R**untime-aware **I**njection of **F**aults in **T**inyML on RISC-**V**.
+
+<img width="1670" height="941" alt="overview_riftv" src="https://github.com/user-attachments/assets/8a85fda0-8e81-4e3b-a27b-0ff7b36550b3" />
+
+**RIFT-V** is a runtime-aware statistical fault injection framework for evaluating the reliability of TinyML inference on RISC-V microcontrollers.
 
 ---
 
