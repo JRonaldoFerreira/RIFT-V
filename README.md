@@ -1,7 +1,7 @@
 # RIFT-V
 <img width="2172" height="724" alt="logo RIFT-V" src="https://github.com/user-attachments/assets/ba63077e-d856-4f2b-af38-a9b05132c784" />
 
-**RIFT-V** is a runtime-aware statistical fault injection framework for evaluating TinyML inference reliability on RISC-V microcontrollers.
+**RIFT-V** is a runtime-aware statistical fault injection framework for evaluating the reliability of TinyML inference on RISC-V microcontrollers.
 
 <img width="1672" height="941" alt="overviewpic RIFT-V" src="https://github.com/user-attachments/assets/7029cbda-51f0-44fe-bb8b-b25f285e8f29" />
 
@@ -10,20 +10,20 @@
 
 ---
 
-Framework declarativo para campanhas de injeção de falhas (bit-flip) em modelos TFLite-Micro executados em microcontroladores RISC-V (ESP32-C3, C6, etc.). Suporta campanhas de **registradores**, **memória** (pesos do modelo) e **híbridas**, com amostragem estatística estratificada, geração automática de headers C, build/flash via PlatformIO e captura UART.
+RIFT-V provides a declarative workflow for bit-flip fault-injection campaigns on TensorFlow Lite Micro models running on RISC-V microcontrollers such as ESP32-C3 and ESP32-C6. It supports **register**, **memory**, and **hybrid** campaigns, with stratified statistical sampling, automatic C/C++ header generation, PlatformIO build/flash orchestration, UART capture, result classification, and physical memory analysis.
 
-## Requisitos
+## Requirements
 
 - Python >= 3.10
-- Uma placa ESP32 suportada e os respetivos drivers USB/serial a funcionar
-- Um ambiente virtual Python recomendado para isolar dependências
-- PlatformIO Core para build/flash do firmware
+- A supported ESP32 RISC-V board with working USB/serial drivers
+- A Python virtual environment, recommended for dependency isolation
+- PlatformIO Core for firmware build and flash steps
 
-O ponto mais importante para o utilizador final é simples: **depois de instalar os requisitos, o fluxo normal passa a ser editar o YAML e correr `riftv ...`**. O utilizador não precisa de escolher manualmente o ambiente `registerfi`/`memoryfi` nem de gerar headers à mão.
+The typical user workflow is intentionally simple: **edit a YAML configuration file and run `riftv ...`**. RIFT-V automatically selects the correct PlatformIO environment, generates the required headers, builds the firmware, flashes the board, captures results, and analyzes the campaign output.
 
-## Instalação recomendada
+## Recommended Installation
 
-### 1. Criar e ativar um ambiente virtual
+### 1. Create and activate a virtual environment
 
 **PowerShell (Windows)**
 
@@ -39,48 +39,48 @@ python -m venv .venv
 source .venv/bin/activate
 ```
 
-### 2. Instalar o framework
+### 2. Install the framework
 
 ```bash
 pip install -e .
 ```
 
-Isto instala o pacote Python `riftv` e a CLI `riftv`.
+This installs the Python package `riftv` and the `riftv` command-line interface.
 
-### 3. Instalar o perfil certo de dependências
+### 3. Install the appropriate dependency profile
 
-**Opção recomendada para a maioria dos utilizadores**
+**Recommended option for most users**
 
 ```bash
 pip install -e ".[all]"
 ```
 
-Este perfil instala:
+This profile installs:
 
-- dependências Python do framework
-- dependências de desenvolvimento
-- TensorFlow, para quantização e geração de subsets
-- PlatformIO Core, para build e flash do firmware
+- RIFT-V runtime dependencies
+- Development and test dependencies
+- TensorFlow, for quantization and test-subset generation
+- PlatformIO Core, for firmware build and flash operations
 
-**Perfis úteis**
+**Useful profiles**
 
-- `pip install -e .` — apenas o framework e a CLI
-- `pip install -e ".[dev]"` — framework + testes/lint
-- `pip install -e ".[all]"` — framework + dev + TensorFlow + PlatformIO
+- `pip install -e .` — framework and CLI only
+- `pip install -e ".[dev]"` — framework plus test/lint dependencies
+- `pip install -e ".[all]"` — framework plus development tools, TensorFlow, and PlatformIO
 
-> Nota: drivers USB/serial da placa e componentes de toolchain/SDK descarregados pelo PlatformIO continuam dependentes do sistema operativo.
+> USB/serial drivers and toolchain/SDK packages downloaded by PlatformIO remain operating-system dependent.
 
-### 4. Verificação rápida
+### 4. Quick verification
 
 ```bash
 riftv --help
 ```
 
-Se o comando acima funcionar, a instalação da CLI está correta.
+If this command works, the CLI installation is correct.
 
-### 5. Opcional — manter o cache do PlatformIO dentro do projeto
+### 5. Optional: keep the PlatformIO cache inside the project
 
-Isto é útil quando quiser evitar dependência do diretório global do utilizador.
+This is useful when you want to avoid relying on the user's global PlatformIO directory.
 
 **PowerShell**
 
@@ -94,76 +94,76 @@ $env:PLATFORMIO_CORE_DIR = "$PWD/firmware/.platformio-core"
 export PLATFORMIO_CORE_DIR="$PWD/firmware/.platformio-core"
 ```
 
-## Estrutura do Projeto
+## Project Structure
 
-```
-riftv/                   # Pacote Python principal (RIFT-V)
-  cli.py                 # Entry point CLI
-  config.py              # Schema YAML e loader de configuração
-  population.py          # Introspecção do modelo, geração de população e amostragem
-  experiment.py          # Orquestrador: fases opcionais quantize/subset, depois prepare → build → …
-  headers.py             # Geração de headers C para o firmware
-  builder.py             # Build e flash via PlatformIO
-  uart.py                # Captura UART (JSON lines do firmware)
-  classify.py            # Classificação dos resultados (Masked, Critical, Crash, etc.)
-  analysis.py            # Análise física do modelo (criticidade por tensor, operador, offset)
+```text
+riftv/                   # Main Python package
+  cli.py                 # CLI entry point
+  config.py              # YAML schema and configuration loader
+  population.py          # Model introspection, population generation, and sampling
+  experiment.py          # Orchestrator: prepare → build → flash → run → analyze
+  headers.py             # C/C++ header generation for the firmware
+  builder.py             # PlatformIO build and flash orchestration
+  uart.py                # UART capture from firmware JSON-line streams
+  classify.py            # Result classification: Masked, Critical, Crash, etc.
+  analysis.py            # Physical memory analysis by tensor, operator, and offset
 
-configs/                 # Exemplos de configuração YAML
+configs/                 # Example YAML configurations
   registerfi_example.yaml
   memoryfi_example.yaml
   hybrid_campaign.yaml
   multi_injection_memory_example.yaml
   multi_injection_register_example.yaml
 
-firmware/                # Firmware ESP32 (PlatformIO)
+firmware/                # ESP32 firmware project
   src/
-    main_unified.cpp     # Entrada principal (selecção por macro)
-    register_fi.cc/h     # Módulo de injeção em registradores
-    memory_fi.cc/h       # Módulo de injeção em memória (pesos do modelo)
+    main_unified.cpp     # Unified firmware entry point selected by compile-time macros
+    register_fi.cc/h     # Register fault-injection module
+    memory_fi.cc/h       # Memory fault-injection module for model weights
 
-tests/                   # Testes (pytest)
-models/                  # Modelos .tflite e subsets .npz
-runs/                    # Saídas de campanhas (geradas automaticamente)
+tests/                   # Pytest test suite
+models/                  # TFLite models and NPZ test subsets
+runs/                    # Automatically generated campaign outputs
 ```
 
-## Uso
+## Usage
 
-### O que o utilizador precisa realmente de configurar
+### What users usually need to configure
 
-Na maioria dos casos, o utilizador só precisa de rever estes campos no YAML:
+In most cases, users only need to review these YAML fields:
 
-- `model.tflite` — modelo TFLite a usar
-- `model.subset_npz` — subset de teste para o firmware
-- `campaign.type` — `register`, `memory` ou `hybrid`
-- `serial.port` — porta série da placa
-- `serial.transport` — `uart0` ou `usb_serial_jtag`
-- `firmware.board` — board PlatformIO, se for diferente do exemplo
+- `model.tflite` — TFLite model to use
+- `model.subset_npz` — test subset to embed into the firmware
+- `campaign.type` — `register`, `memory`, or `hybrid`
+- `serial.port` — serial port used by the board
+- `serial.transport` — `uart0` or `usb_serial_jtag`
+- `firmware.board` — PlatformIO board identifier, if different from the example
 
-O resto do pipeline é tratado pelo framework.
+The rest of the pipeline is handled by RIFT-V.
 
-### Fluxo recomendado para o dia a dia
+### Recommended daily workflow
 
-1. Escolher ou copiar um YAML em `configs/`
-2. Ajustar `serial.port` e `serial.transport`
-3. Executar o pipeline completo
+1. Choose or copy a YAML file from `configs/`
+2. Adjust `serial.port` and `serial.transport`
+3. Run the full pipeline
 
 ```bash
 riftv configs/registerfi_example.yaml
 ```
 
-Esse comando executa automaticamente:
+This command automatically executes:
 
-- `prepare()` — gera população, amostragem e headers
-- `build()` — compila o firmware
-- `flash()` — grava o firmware na placa
-- `run()` — captura a UART
-- `analyze()` — classifica os resultados
+- `prepare()` — generates the population, statistical sample, and firmware headers
+- `build()` — builds the firmware
+- `flash()` — flashes the firmware to the board
+- `run()` — captures UART output
+- `analyze()` — classifies the collected results
 
-Também escolhe automaticamente o ambiente PlatformIO correto com base em `campaign.type`.
+It also automatically selects the correct PlatformIO environment based on `campaign.type`.
 
-### Passos individuais
+### Running individual steps
 
-Use os passos individuais quando quiser depurar alguma fase específica:
+Use individual steps when debugging or repeating a specific phase:
 
 ```bash
 riftv configs/registerfi_example.yaml --step prepare
@@ -172,23 +172,23 @@ riftv configs/registerfi_example.yaml --step flash
 riftv configs/registerfi_example.yaml --step run
 riftv configs/registerfi_example.yaml --step analyze
 
-# Regerar results.csv a partir de results.jsonl
+# Rebuild results.csv from results.jsonl
 riftv configs/memoryfi_example.yaml --step rebuild-csv --run-dir runs/my_run
 
-# Analisar um run já existente
+# Analyze an existing run
 riftv configs/memoryfi_example.yaml --step analyze --run-dir runs/my_run
 ```
 
-### Quando usar a CLI e quando usar a API Python
+### CLI vs. Python API
 
-- Use a **CLI** (`riftv`) para o fluxo normal de campanha
-- Use a **API Python** (`import riftv`) quando quiser integrar o RIFT-V em notebooks, scripts próprios ou pipelines maiores
+- Use the **CLI** (`riftv`) for the standard campaign workflow
+- Use the **Python API** (`import riftv`) when integrating RIFT-V into notebooks, custom scripts, or larger automation pipelines
 
-### Uso programático
+### Programmatic usage
 
-O ciclo principal é `prepare()` → `build()` → `flash()` → `run()` → `analyze()`.
+The main lifecycle is `prepare()` → `build()` → `flash()` → `run()` → `analyze()`.
 
-Se já tiver um `.tflite` int8 e um `.npz` compatíveis com o YAML, pode ir diretamente para `prepare()`. Se ainda só tiver um modelo Keras ou precisar de gerar o subset de teste, use antes as fases opcionais `quantize_model()` e `prepare_test_subset()`.
+If you already have a compatible int8 `.tflite` model and `.npz` test subset, you can start directly from `prepare()`. If you still need to convert a Keras/SavedModel model or generate a test subset, use the optional `quantize_model()` and `prepare_test_subset()` phases first.
 
 ```python
 from riftv import load_config, Experiment
@@ -196,8 +196,8 @@ from riftv import load_config, Experiment
 cfg = load_config("configs/memoryfi_example.yaml")
 exp = Experiment(cfg)
 
-# Opcional — só se precisar de gerar estes ficheiros a partir do modelo / dados:
-# exp.quantize_model("models/meu_modelo.h5", dataset_name="fashion_mnist")
+# Optional — only needed when generating these files from a model or dataset:
+# exp.quantize_model("models/my_model.h5", dataset_name="fashion_mnist")
 # exp.prepare_test_subset(subset_size=100, dataset_name="fashion_mnist")
 
 exp.prepare()
@@ -207,7 +207,7 @@ exp.run()
 exp.analyze()
 ```
 
-Se quiser tudo numa chamada só:
+To execute the full pipeline in one call:
 
 ```python
 from riftv import load_config, Experiment
@@ -217,24 +217,22 @@ exp = Experiment(cfg)
 exp.execute()
 ```
 
-### Novo comportamento para scripts externos
+### External scripts
 
-Se o utilizador ativar o ambiente virtual onde o RIFT-V foi instalado e executar o script com esse Python, o framework passa a resolver automaticamente:
+If a user activates the Python environment where RIFT-V is installed and runs a script with that Python interpreter, RIFT-V automatically resolves:
 
-- o executável do PlatformIO a partir do próprio ambiente ativo
-- o `PLATFORMIO_CORE_DIR` local ao projeto de firmware, por omissão em `firmware/.platformio-core`
+- The PlatformIO executable from the active environment
+- The local `PLATFORMIO_CORE_DIR`, which defaults to `firmware/.platformio-core`
 
-Isso significa que o utilizador pode criar scripts Python **em qualquer pasta**, desde que:
+This means users can create Python scripts **outside the repository**, as long as:
 
-- o ambiente com RIFT-V (`riftv`) esteja ativo
-- o script faça `import riftv`
-- o YAML usado aponte corretamente para o `firmware/src`
+- The environment with RIFT-V (`riftv`) is active
+- The script imports `riftv`
+- The YAML file correctly points to `firmware/src`
 
-Já não é necessário configurar manualmente `PATH` nem `PLATFORMIO_CORE_DIR` para o fluxo programático normal.
+Manual `PATH` or `PLATFORMIO_CORE_DIR` configuration is not required for the normal programmatic workflow.
 
-### Exemplo: script fora do repositório
-
-Exemplo de um script guardado noutro diretório, desde que o YAML aponte para os caminhos corretos do projeto:
+### Example: running a script outside the repository
 
 ```python
 from pathlib import Path
@@ -247,96 +245,104 @@ exp = Experiment(cfg)
 exp.execute()
 ```
 
-Exemplo de execução:
+Example execution:
 
 ```powershell
-python C:\meus_scripts\run_registerfi.py
+python C:\my_scripts\run_registerfi.py
 ```
 
-## Configuração YAML
+## YAML Configuration
 
-Cada experiência é definida por um ficheiro YAML com as seguintes secções:
+Each experiment is defined by a YAML file with the following sections:
 
-| Secção | Descrição |
-|--------|-----------|
-| `experiment` | Nome e descrição |
-| `model` | Caminhos para `.tflite` e `.npz` |
-| `campaign` | Tipo (`register`/`memory`/`hybrid`), duração, operadores alvo |
-| `sampling` | Método estratificado, confiança, margem, seed |
-| `firmware` | Directório src, plataforma, board |
-| `serial` | Porta, baud rate, timeout, **transporte** (`uart0` ou `usb_serial_jtag`) |
-| `output` | Directório de saída, formatos |
+| Section | Description |
+|---------|-------------|
+| `experiment` | Experiment name and description |
+| `model` | Paths to the `.tflite` model and `.npz` subset |
+| `campaign` | Campaign type, fault duration, target operators, and model-specific options |
+| `sampling` | Stratified sampling method, confidence, margin, prior probability, seed, and grouping columns |
+| `firmware` | Firmware source directory, PlatformIO platform, board, framework, and target |
+| `serial` | Serial port, baud rate, boot timeout, and transport mode |
+| `output` | Output directory and generated formats |
 
-Veja os exemplos em `configs/` para referência — em particular `memoryfi_esp32_c6_example.yaml` e `memoryfi_esp32_c3_supermini_example.yaml`.
+See the examples in `configs/`, especially:
 
-### Transporte serial (`serial.transport`)
+- `registerfi_example.yaml`
+- `memoryfi_example.yaml`
+- `hybrid_campaign.yaml`
+- `memoryfi_esp32_c6_example.yaml`
+- `memoryfi_esp32_c3_supermini_example.yaml`
 
-O canal usado pelo firmware para falar com o host depende de **como o conector USB da placa está ligado**:
+### Serial transport (`serial.transport`)
 
-| Valor | Quando usar | Reset DTR/RTS |
+The communication channel between firmware and host depends on **how the board's USB connector is wired**.
+
+| Value | When to use | DTR/RTS reset |
 |-------|-------------|---------------|
-| `uart0` (default) | Placas com **USB-UART bridge** (CP2102, CH340, FTDI) — ex.: ESP32-C2, DevKits clássicos com chip bridge | Ativado automaticamente |
-| `usb_serial_jtag` | Placas em que o USB vai **directo ao controlador USB Serial/JTAG nativo** do chip — ex.: ESP32-C3 Super Mini, C6/H2/P4 DevKitM com USB nativo | Desativado (não funciona sem bridge) |
+| `uart0` | Boards with a USB-UART bridge such as CP2102, CH340, or FTDI | Automatically enabled |
+| `usb_serial_jtag` | Boards whose USB connector is wired directly to the native USB Serial/JTAG peripheral, such as ESP32-C3 Super Mini or ESP32-C6/H2/P4 native USB boards | Disabled, because DTR/RTS reset does not work without a bridge |
 
-Quando `transport: usb_serial_jtag`:
+When `transport: usb_serial_jtag`:
 
-- O builder injecta `-DFI_TRANSPORT_USB_SERIAL_JTAG=1` e `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` no `sdkconfig`, fazendo o firmware usar o driver `usb_serial_jtag` em vez de `UART0`.
-- O host salta o toggle DTR/RTS (que não reseta o chip nesse modo) e envia um `{"cmd":"start"}` proativo — o firmware re-emite o evento `boot` a cada ~1 s como rede de segurança.
+- The builder injects `-DFI_TRANSPORT_USB_SERIAL_JTAG=1` and `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` into `sdkconfig`
+- The firmware uses the `usb_serial_jtag` driver instead of `UART0`
+- The host skips DTR/RTS toggling and waits for the firmware boot event
 
-Campos opcionais relacionados:
+Related optional fields:
 
 ```yaml
 serial:
   port: COM17
   baud: 460800
   transport: usb_serial_jtag
-  run_port: COM17              # porta de captura se for diferente da de flash
-  reset_before_capture: null   # null=auto, true=forçar DTR/RTS, false=nunca
+  run_port: COM17              # Capture port, if different from the flash port
+  reset_before_capture: null   # null=auto, true=force DTR/RTS, false=never
   boot_timeout_s: 30
 ```
 
-> **Como saber qual usar?** Procure o número do chip USB na placa: se encontrar um CP2102, CH340, CH343, FT232 ou similar, é `uart0`; se o conector USB-C/micro-USB vai directo ao SoC (ex.: C3 Super Mini), é `usb_serial_jtag`.
+> To identify the correct transport, inspect the board's USB interface. If it uses CP2102, CH340, CH343, FT232, or a similar bridge, choose `uart0`. If the connector is wired directly to the SoC's native USB peripheral, choose `usb_serial_jtag`.
 
-#### Identificar pelo Gerenciador de Dispositivos (Windows)
+#### Identifying the transport in Windows Device Manager
 
-O nome que o Windows atribui à porta COM é um forte indicador:
+The COM-port name assigned by Windows is often a strong indicator:
 
-| Nome no Gerenciador de Dispositivos | Tipo | `transport` |
-|-------------------------------------|------|-------------|
-| *"Dispositivo Serial USB"* (driver genérico `usbser.sys`) | USB CDC nativo do SoC | `usb_serial_jtag` |
-| *"USB-Enhanced-SERIAL CH343"* / *"USB-SERIAL CH340"* | Bridge WCH CH343/CH340 | `uart0` |
-| *"Silicon Labs CP210x USB to UART Bridge"* | Bridge Silicon Labs CP2102/CP2104 | `uart0` |
-| *"USB Serial Port"* (driver FTDI) | Bridge FTDI FT232 | `uart0` |
+| Device Manager name | Type | `transport` |
+|---------------------|------|-------------|
+| *"USB Serial Device"* using the generic `usbser.sys` driver | Native USB CDC / USB Serial-JTAG | `usb_serial_jtag` |
+| *"USB-Enhanced-SERIAL CH343"* or *"USB-SERIAL CH340"* | WCH USB-UART bridge | `uart0` |
+| *"Silicon Labs CP210x USB to UART Bridge"* | Silicon Labs USB-UART bridge | `uart0` |
+| *"USB Serial Port"* | FTDI USB-UART bridge | `uart0` |
 
-**Exemplos reais testados:**
+Tested examples:
 
-- `ESP32-C3 Super Mini` → *"Dispositivo Serial USB (COM17)"* → `transport: usb_serial_jtag`
+- `ESP32-C3 Super Mini` → *"USB Serial Device (COM17)"* → `transport: usb_serial_jtag`
 - `ESP32-C6 DevKitC WiFi ZigBee N4` → *"USB-Enhanced-SERIAL CH343 (COM18)"* → `transport: uart0`
 
-## Classificação de Resultados
+## Result Classification
 
-Cada resultado de inferência com falha é classificado em:
+Each fault-injection result is classified into one of the following categories:
 
-| Classe | Significado |
-|--------|-------------|
-| **Masked** | Saída idêntica ao golden (sem efeito) |
-| **Acceptable** | Mesma classe predita, com variação < 5% na confiança |
-| **Good** | Resultado melhor que o golden (corrige uma predição errada) |
-| **Observed** | Classe predita diferente do golden, mas correcta e com alta confiança |
-| **Warning** | Mesma classe mas com queda significativa de confiança |
-| **Critical** | Classe predita errada ou confiança muito baixa |
-| **Crash** | Firmware não completou a inferência |
+| Class | Meaning |
+|-------|---------|
+| **Masked** | Output is identical to the golden reference |
+| **Acceptable** | Same predicted class, with less than 5% confidence variation |
+| **Good** | Faulted result improves a wrong golden prediction |
+| **Observed** | Predicted class differs from the golden reference but remains correct with high confidence |
+| **Warning** | Same predicted class with a significant confidence drop |
+| **Critical** | Wrong predicted class or very low confidence |
+| **Crash** | Firmware did not complete inference |
+| **NoInjection** | Register campaign result where the requested injection did not actually occur |
 
-## Análise Física
+## Physical Analysis
 
-O módulo `analysis` permite análise espacial da criticidade das falhas:
+The `analysis` module supports physical-space analysis of fault criticality:
 
-- Criticidade por tensor e por operador
-- Binning por offset físico no blob do modelo
-- Heatmap tensor × offset
-- Análise de contiguidade entre tensores adjacentes
-- Comparação semântica vs. física (Gini / entropia)
-- Vulnerabilidade por posição de bit
+- Criticality by tensor and operator
+- Binning by physical offset in the serialized model blob
+- Tensor × offset heatmap data
+- Contiguity analysis across adjacent tensors
+- Semantic vs. physical criticality comparison
+- Bit-position vulnerability analysis
 
 ```python
 from riftv import generate_physical_report
@@ -346,16 +352,16 @@ print(report.summary())
 report.save("runs/my_campaign/")
 ```
 
-## Ambientes PlatformIO
+## PlatformIO Environments
 
-O ficheiro `firmware/platformio.ini` define dois ambientes de build:
+The `firmware/platformio.ini` file defines two campaign build environments:
 
-- **`registerfi`** — define `FI_CAMPAIGN_REGISTER=1`
-- **`memoryfi`** — define `FI_CAMPAIGN_MEMORY=1`
+- **`registerfi`** — defines `FI_CAMPAIGN_REGISTER=1`
+- **`memoryfi`** — defines `FI_CAMPAIGN_MEMORY=1`
 
-O RIFT-V selecciona automaticamente o ambiente correcto com base no `campaign.type`.
+RIFT-V automatically selects the correct environment based on `campaign.type`.
 
-## Testes
+## Tests
 
 ```bash
 pip install -e ".[dev]"
