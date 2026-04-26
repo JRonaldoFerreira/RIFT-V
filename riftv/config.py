@@ -79,6 +79,7 @@ class FirmwareConfig:
     flash_size: Optional[str] = None          # e.g. "2MB", "4MB" — overrides board default
     idf_target: Optional[str] = None          # e.g. "esp32c6" — override IDF_TARGET
     sdkconfig_defaults: List[str] = field(default_factory=list)  # extra sdkconfig fragments
+    tensor_arena_size_kb: Optional[int] = None  # None = auto-detect from heap at runtime
 
 
 # Valid serial transports — extend this tuple when adding new channels.
@@ -267,6 +268,7 @@ def _parse_firmware(raw: Optional[Dict[str, Any]]) -> FirmwareConfig:
         flash_size=raw.get("flash_size", None),
         idf_target=raw.get("idf_target", None),
         sdkconfig_defaults=sdk_defaults,
+        tensor_arena_size_kb=raw.get("tensor_arena_size_kb", None),
     )
 
 

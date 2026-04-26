@@ -3,10 +3,10 @@
 #include <stdint.h>
 
 /*
- * RegisterFI — Interrupt Exception Frame approach (DEFAULT)
+ * RegisterFI — Interrupt Exception Frame approach
  *
- * By default, RegisterFI uses the RISC-V interrupt exception frame to
- * inject faults into real, architecturally-named CPU registers:
+ * RegisterFI uses the RISC-V interrupt exception frame to inject faults
+ * into real, architecturally-named CPU registers:
  *
  *   1. The esp_timer callback fires via ESP_TIMER_ISR (interrupt context).
  *   2. The interrupt entry code (_interrupt_handler in vectors.S) has
@@ -23,53 +23,15 @@
  *   - Corrupts the register DURING operator execution (faithful fault model)
  *   - Is independent of compiler prologue layout
  *
- * REGISTER_FI_USE_SAVED_SP_MICROFI (optional, opt-in)
- *
- * When explicitly defined, switches to the MicroFI-paper saved-SP approach
- * where a global captures the stack pointer at the operator hook entry and
- * the ISR indexes into stack-word slots.  This path has known limitations
- * (slot names are not real register names; the captured SP may not match
- * the operator kernel's frame).  Define it only for comparison/research.
+ * sp and gp are not restored by restore_general_regs in vectors.S, so
+ * faults targeting those registers are applied via _fi_trampoline (asm)
+ * which XORs the live register after mret.
  */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* Maximum number of uint32_t stack-word slots addressable by register_id.
- * Covers 32 × 4 = 128 bytes of stack frame, which is sufficient for the
- * callee-saved registers + locals saved by a typical RISC-V prologue.
- */
-#define REGISTER_FI_MAX_STACK_SLOTS 32u
-
-#ifdef REGISTER_FI_USE_SAVED_SP_MICROFI
-/*
- * g_register_fi_saved_sp
- *   Volatile global written by REGISTER_FI_SAVE_SP() at each instrumented
- *   point in the inference path.  Read by the timer ISR to locate the
- *   function's stack frame.  Zero means "no valid frame captured yet".
- */
-extern volatile uintptr_t g_register_fi_saved_sp;
-
-/*
- * REGISTER_FI_SAVE_SP()
- *   MicroFI-style macro: captures the current RISC-V stack pointer into
- *   g_register_fi_saved_sp.  Must be called from task context (not ISR).
- *   Designed to be placed at the beginning of every function / hook on
- *   the inference path so that the ISR always sees a recent SP value.
- *
- *   On RISC-V  (ESP32-C3):  mv %0, sp
- */
-#define REGISTER_FI_SAVE_SP() do {       \
-    uintptr_t _microfi_sp_tmp;           \
-    __asm__ volatile("mv %0, sp"        \
-                     : "=r"(_microfi_sp_tmp)); \
-    g_register_fi_saved_sp = _microfi_sp_tmp;  \
-} while (0)
-
-#else  /* !REGISTER_FI_USE_SAVED_SP_MICROFI */
-#define REGISTER_FI_SAVE_SP() ((void)0)
-#endif /* REGISTER_FI_USE_SAVED_SP_MICROFI */
 
 #if defined(FI_CAMPAIGN_REGISTER)
 #include "register_fault_list.h"

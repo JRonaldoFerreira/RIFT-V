@@ -33,6 +33,7 @@ firmware:
   framework: espidf
   monitor_speed: 460800
   flash_size: 4MB # flash_size: 2MB  # uncomment if your module has 2MB instead of the board-default 4MB
+  # tensor_arena_size_kb: 48   # omit to auto-detect from available heap
 
 serial:
   port: COM17

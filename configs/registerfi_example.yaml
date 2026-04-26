@@ -37,6 +37,8 @@ firmware:
   framework: espidf
   monitor_speed: 460800
   idf_target: esp32c3
+  # tensor_arena_size_kb: 48   # omit to auto-detect from available heap
+  flash_size: 2MB
 
 serial:
   port: COM20

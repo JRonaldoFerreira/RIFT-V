@@ -10,18 +10,9 @@
 #include "esp_attr.h"
 #include "esp_timer.h"
 #include "esp_check.h"
-#ifndef REGISTER_FI_USE_SAVED_SP_MICROFI
 #include "riscv/rvruntime-frames.h"
-#endif
 #include "freertos/FreeRTOS.h"
 
-#ifdef REGISTER_FI_USE_SAVED_SP_MICROFI
-/* MicroFI approach: the SP saved by REGISTER_FI_SAVE_SP() at each
- * instrumented inference function.  Initialised to 0 (invalid). */
-volatile uintptr_t g_register_fi_saved_sp = 0;
-#endif
-
-#ifndef REGISTER_FI_USE_SAVED_SP_MICROFI
 /* Trampoline globals — written by the ISR, read by _fi_trampoline (asm).
  * sp and gp are NOT restored from RvExcFrame by restore_general_regs
  * in vectors.S; we redirect mepc to an IRAM trampoline that XORs the
@@ -32,12 +23,9 @@ volatile uint32_t g_fi_trampoline_mepc    = 0;
 volatile uint32_t g_fi_trampoline_sp_mask = 0;
 volatile uint32_t g_fi_trampoline_gp_mask = 0;
 }
-#endif  /* !REGISTER_FI_USE_SAVED_SP_MICROFI */
 
 namespace {
 
-#ifndef REGISTER_FI_USE_SAVED_SP_MICROFI
-/* ---- Excframe path (DEFAULT) ---- */
 /* FreeRTOS internals used to access the interrupt exception frame.
  * When a timer interrupt fires during operator execution, vectors.S
  * saves ALL 31 GPRs into an RvExcFrame on the task stack, then
@@ -49,37 +37,9 @@ struct minimal_tcb_t {
   StackType_t* pxTopOfStack;
 };
 extern "C" void* pxCurrentTCBs[];
-#endif  /* !REGISTER_FI_USE_SAVED_SP_MICROFI */
 
 static register_fi_context_t* g_ctx = nullptr;
 
-#ifdef REGISTER_FI_USE_SAVED_SP_MICROFI
-/* ---- MicroFI path (opt-in) ---- */
-/* Stack-slot descriptors: register_id is a word-index into the function
- * stack frame.  The names are informational; the actual CPU register at
- * each slot depends on the compiler prologue.  The paper simply accesses
- * "the N-th saved 32-bit word on the stack". */
-static const char* kSlotNames[REGISTER_FI_MAX_STACK_SLOTS] = {
-    "slot_0",  "slot_1",  "slot_2",  "slot_3",
-    "slot_4",  "slot_5",  "slot_6",  "slot_7",
-    "slot_8",  "slot_9",  "slot_10", "slot_11",
-    "slot_12", "slot_13", "slot_14", "slot_15",
-    "slot_16", "slot_17", "slot_18", "slot_19",
-    "slot_20", "slot_21", "slot_22", "slot_23",
-    "slot_24", "slot_25", "slot_26", "slot_27",
-    "slot_28", "slot_29", "slot_30", "slot_31",
-};
-
-/* MicroFI path does not need the mepc trampoline — all slots are
- * accessible through the saved stack pointer and directly modifiable. */
-IRAM_ATTR static inline void do_bitflip(uint32_t* /*frame*/, uint32_t* target,
-                                         uint8_t /*reg_id*/, uint32_t mask) {
-    *target ^= mask;
-}
-IRAM_ATTR static inline void reset_trampoline(void) {}
-
-#else
-/* ---- Excframe path (DEFAULT) ---- */
 /* Uses RvExcFrame offsets via pxCurrentTCBs[0]->pxTopOfStack.
  * During the ISR, this pointer holds the interrupt exception frame
  * (set by rtos_int_enter), containing all 31 GPRs of the interrupted
@@ -136,8 +96,6 @@ IRAM_ATTR static inline void reset_trampoline(void) {
     g_fi_trampoline_gp_mask = 0;
 }
 
-#endif  /* REGISTER_FI_USE_SAVED_SP_MICROFI */
-
 #ifdef REGISTER_FI_RUNTIME_CHECK
 
 #ifndef REGCHECK_TARGET_REG_ID
@@ -153,12 +111,8 @@ static struct {
   uint8_t bit_index;
   uint32_t active_op_index;
   uint32_t delay_us;
-#ifdef REGISTER_FI_USE_SAVED_SP_MICROFI
-  uintptr_t saved_sp;     /* SP captured by REGISTER_FI_SAVE_SP() */
-#else
-  void* tcb_raw;          /* legacy: pxCurrentTCBs[0] */
-  void* top_of_stack;     /* legacy: tcb->pxTopOfStack */
-#endif
+  void* tcb_raw;          /* pxCurrentTCBs[0] */
+  void* top_of_stack;     /* tcb->pxTopOfStack */
   void* frame_ptr;
   void* slot_ptr;
   void* expected_ptr;
@@ -166,12 +120,6 @@ static struct {
   uint32_t value_after;
 } g_regcheck = {};
 
-#ifdef REGISTER_FI_USE_SAVED_SP_MICROFI
-IRAM_ATTR static uint32_t* regcheck_expected_ptr(uint32_t* stack_base, uint8_t slot_index) {
-  if (stack_base == nullptr || slot_index >= REGISTER_FI_MAX_STACK_SLOTS) return nullptr;
-  return &stack_base[slot_index];
-}
-#else
 IRAM_ATTR static uint32_t* regcheck_expected_ptr(RvExcFrame* frame, uint8_t reg_id) {
   switch (reg_id) {
     case 0:  return reinterpret_cast<uint32_t*>(&frame->ra);
@@ -208,7 +156,6 @@ IRAM_ATTR static uint32_t* regcheck_expected_ptr(RvExcFrame* frame, uint8_t reg_
     default: return nullptr;
   }
 }
-#endif  /* REGISTER_FI_USE_SAVED_SP_MICROFI */
 
 #endif  // REGISTER_FI_RUNTIME_CHECK
 
@@ -225,21 +172,9 @@ const register_fault_t* current_fault(const register_fi_context_t* ctx) {
   return &ctx->fault_list[idx];
 }
 
-#ifdef REGISTER_FI_USE_SAVED_SP_MICROFI
-/* MicroFI (opt-in): register_id is a word-slot index into the function's
- * stack frame.  stack_base points to the first word at the saved SP.
- * This accesses the real stack of the last instrumented function, exactly
- * as described in the MicroFI paper. */
-IRAM_ATTR uint32_t* resolve_register_slot(uint32_t* stack_base, uint8_t slot_index) {
-  if (stack_base == nullptr || slot_index >= REGISTER_FI_MAX_STACK_SLOTS) {
-    return nullptr;
-  }
-  return &stack_base[slot_index];
-}
-#else
-/* Excframe (DEFAULT): register_id maps to a named field inside the
- * RvExcFrame interrupt exception frame.  During the ISR,
- * pxCurrentTCBs[0]->pxTopOfStack points to this frame. */
+/* register_id maps to a named field inside the RvExcFrame interrupt
+ * exception frame.  During the ISR, pxCurrentTCBs[0]->pxTopOfStack
+ * points to this frame. */
 IRAM_ATTR uint32_t* resolve_register_slot(RvExcFrame* frame, uint8_t register_id) {
   if (frame == nullptr || register_id >= (sizeof(kRegisterDescriptors) / sizeof(kRegisterDescriptors[0]))) {
     return nullptr;
@@ -247,7 +182,6 @@ IRAM_ATTR uint32_t* resolve_register_slot(RvExcFrame* frame, uint8_t register_id
   const uint32_t offset = kRegisterDescriptors[register_id].offset;
   return reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(frame) + offset);
 }
-#endif  /* REGISTER_FI_USE_SAVED_SP_MICROFI */
 
 uint32_t compute_delay_us(register_fi_context_t* ctx, const register_fault_t* fault) {
   if (fault == nullptr) {
@@ -284,34 +218,12 @@ IRAM_ATTR void register_timer_isr(void* arg) {
     return;
   }
 
-#ifdef REGISTER_FI_USE_SAVED_SP_MICROFI
-  /* ------------------------------------------------------------------ */
-  /* MicroFI approach (opt-in) — faithful to the paper.                  */
-  /*                                                                     */
-  /* The saved SP (captured via REGISTER_FI_SAVE_SP() at each            */
-  /* instrumented function entry) points to the base of the function's   */
-  /* stack frame.  We treat this as a uint32_t[] array.                  */
-  /*                                                                     */
-  /* NOTE: This path has known limitations — see register_fi.h header.   */
-  /* ------------------------------------------------------------------ */
-  const uintptr_t saved_sp = g_register_fi_saved_sp;
-  if (saved_sp == 0u) {
-    ctx->last_injection_status = REGISTER_FI_INVALID_FRAME;
-    ctx->timer_armed = false;
-    return;
-  }
-  auto* frame = reinterpret_cast<uint32_t*>(saved_sp);
-#else
-  /* ------------------------------------------------------------------ */
-  /* Excframe path (DEFAULT) — interrupt exception frame.                */
-  /*                                                                     */
-  /* pxCurrentTCBs[0]->pxTopOfStack points to the RvExcFrame that        */
-  /* _interrupt_handler (vectors.S) saved on the task stack when the      */
-  /* timer interrupt fired.  rtos_int_enter stored it before switching    */
-  /* to the ISR stack.  Contains ALL 31 GPRs of the interrupted code.    */
-  /* Modifying a field here (e.g. frame->s3) means the corrupted value   */
-  /* goes directly into the CPU register when mret executes.             */
-  /* ------------------------------------------------------------------ */
+  /* pxCurrentTCBs[0]->pxTopOfStack points to the RvExcFrame that
+   * _interrupt_handler (vectors.S) saved on the task stack when the
+   * timer interrupt fired.  rtos_int_enter stored it before switching
+   * to the ISR stack.  Contains ALL 31 GPRs of the interrupted code.
+   * Modifying a field here (e.g. frame->s3) means the corrupted value
+   * goes directly into the CPU register when mret executes. */
   void* tcb_raw = pxCurrentTCBs[0];
   if (tcb_raw == nullptr) {
     ctx->last_injection_status = REGISTER_FI_INVALID_FRAME;
@@ -327,7 +239,6 @@ IRAM_ATTR void register_timer_isr(void* arg) {
   }
 
   auto* frame = reinterpret_cast<RvExcFrame*>(tcb->pxTopOfStack);
-#endif  /* REGISTER_FI_USE_SAVED_SP_MICROFI */
 
   reset_trampoline();
 
@@ -416,12 +327,8 @@ IRAM_ATTR void register_timer_isr(void* arg) {
       g_regcheck.bit_index = fault->bit_index;
       g_regcheck.active_op_index = static_cast<uint32_t>(ctx->active_op_index);
       g_regcheck.delay_us = ctx->current_delay_us;
-#ifdef REGISTER_FI_USE_SAVED_SP_MICROFI
-      g_regcheck.saved_sp = saved_sp;
-#else
       g_regcheck.tcb_raw = tcb_raw;
       g_regcheck.top_of_stack = reinterpret_cast<void*>(tcb->pxTopOfStack);
-#endif
       g_regcheck.frame_ptr = frame;
       g_regcheck.slot_ptr = target;
       g_regcheck.expected_ptr = regcheck_expected_ptr(frame, fault->register_id);
@@ -485,10 +392,6 @@ void register_fi_init(register_fi_context_t* ctx,
   ctx->timer_handle = nullptr;
   ctx->permanent_active = false;
   ctx->permanent_original_bit = false;
-
-#ifdef REGISTER_FI_USE_SAVED_SP_MICROFI
-  g_register_fi_saved_sp = 0;
-#endif
 
 #ifdef REGISTER_FI_RUNTIME_CHECK
   g_regcheck = {};
@@ -556,9 +459,6 @@ void register_fi_begin_inference(register_fi_context_t* ctx, int32_t fault_index
   ctx->last_injection_status = REGISTER_FI_IDLE;
   ctx->permanent_active = false;
   ctx->permanent_original_bit = false;
-#ifdef REGISTER_FI_USE_SAVED_SP_MICROFI
-  g_register_fi_saved_sp = 0;
-#endif
 #ifdef MULTI_FI_MAX_COUNT
   ctx->op_fault_next_idx = 0;
   for (uint8_t i = 0; i < MULTI_FI_MAX_COUNT; ++i) {
@@ -816,17 +716,10 @@ const char* register_fi_status_name(register_fi_injection_status_t status) {
 }
 
 const char* register_fi_register_name(uint8_t register_id) {
-#ifdef REGISTER_FI_USE_SAVED_SP_MICROFI
-  if (register_id >= REGISTER_FI_MAX_STACK_SLOTS) {
-    return "invalid";
-  }
-  return kSlotNames[register_id];
-#else
   if (register_id >= (sizeof(kRegisterDescriptors) / sizeof(kRegisterDescriptors[0]))) {
     return "invalid";
   }
   return kRegisterDescriptors[register_id].name;
-#endif
 }
 
 #ifdef REGISTER_FI_RUNTIME_CHECK
@@ -836,25 +729,7 @@ void register_fi_runtime_check_print(void) {
   }
   const bool match = (g_regcheck.slot_ptr == g_regcheck.expected_ptr);
   const bool changed = (g_regcheck.value_before != g_regcheck.value_after);
-#ifdef REGISTER_FI_USE_SAVED_SP_MICROFI
-  printf("[REGMAP-RUNTIME-MICROFI] slot_id=%u(%s) bit=%u op=%lu delay=%lu "
-         "saved_sp=0x%08lx stack_base=%p slot=%p expected=%p match=%s "
-         "before=0x%08lx after=0x%08lx changed=%s\n",
-         static_cast<unsigned>(g_regcheck.register_id),
-         register_fi_register_name(g_regcheck.register_id),
-         static_cast<unsigned>(g_regcheck.bit_index),
-         static_cast<unsigned long>(g_regcheck.active_op_index),
-         static_cast<unsigned long>(g_regcheck.delay_us),
-         static_cast<unsigned long>(g_regcheck.saved_sp),
-         g_regcheck.frame_ptr,
-         g_regcheck.slot_ptr,
-         g_regcheck.expected_ptr,
-         match ? "YES" : "NO",
-         static_cast<unsigned long>(g_regcheck.value_before),
-         static_cast<unsigned long>(g_regcheck.value_after),
-         changed ? "YES" : "NO");
-#else
-  printf("[REGMAP-RUNTIME-LEGACY] reg_id=%u(%s) bit=%u op=%lu delay=%lu "
+  printf("[REGMAP-RUNTIME] reg_id=%u(%s) bit=%u op=%lu delay=%lu "
          "tcb=%p tos=%p frame=%p slot=%p expected=%p match=%s "
          "before=0x%08lx after=0x%08lx changed=%s\n",
          static_cast<unsigned>(g_regcheck.register_id),
@@ -871,7 +746,6 @@ void register_fi_runtime_check_print(void) {
          static_cast<unsigned long>(g_regcheck.value_before),
          static_cast<unsigned long>(g_regcheck.value_after),
          changed ? "YES" : "NO");
-#endif
   fflush(stdout);
   g_regcheck = {};
 }
@@ -907,10 +781,6 @@ void register_fi_clear_group(register_fi_context_t* ctx) {
 
 extern "C" void microfi_before_op(int op_index) {
   if (g_ctx != nullptr && op_index >= 0) {
-    /* MicroFI: capture SP at the operator hook – closest instrumented
-     * point before the actual kernel runs.  The ISR will index into
-     * the stack frame from this saved SP value. */
-    REGISTER_FI_SAVE_SP();
     register_fi_before_op(g_ctx, static_cast<uint32_t>(op_index));
   }
 }

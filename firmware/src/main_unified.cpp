@@ -53,14 +53,18 @@ constexpr const char* kTag = "registerfi";
 constexpr const char* kTag = "memoryfi";
 #endif
 
-constexpr size_t kTensorArenaSize = 48 * 1024;
 #if defined(FI_CAMPAIGN_REGISTER)
 constexpr uint32_t kRegisterTimerMinDelayUs = 25u;
 constexpr uint32_t kRegisterTimerGuardUs = 8u;
 #endif
 
-alignas(16) static uint8_t g_tensor_arena[kTensorArenaSize];
+static uint8_t* g_tensor_arena = nullptr;
+static size_t g_tensor_arena_size = 0;
+
+constexpr size_t kArenaHeapReserveBytes = 16 * 1024;
+#if defined(FI_CAMPAIGN_MEMORY)
 static uint8_t* g_model_ram = nullptr;
+#endif
 
 #if defined(FI_CAMPAIGN_REGISTER)
 static register_fi_context_t g_register_fi_ctx;
@@ -148,10 +152,6 @@ InferenceSummary run_inference(tflite::MicroInterpreter* interpreter,
                                const float* image_ptr,
                                uint32_t image_size,
                                int32_t fault_index) {
-#if defined(FI_CAMPAIGN_REGISTER)
-  REGISTER_FI_SAVE_SP();
-#endif
-
   TfLiteTensor* input = interpreter->input(0);
   if (input == nullptr || input->type != kTfLiteInt8) {
     ESP_LOGE(kTag, "Input tensor is not int8.");
@@ -537,11 +537,43 @@ extern "C" void app_main(void) {
   tflite::MicroMutableOpResolver<RIFTV_RESOLVER_OP_COUNT> resolver;
   riftv_populate_resolver(resolver);
 
-  tflite::MicroInterpreter interpreter(model, resolver, g_tensor_arena, kTensorArenaSize);
-  if (interpreter.AllocateTensors() != kTfLiteOk) {
-    ESP_LOGE(kTag, "AllocateTensors failed.");
+  // ---- Auto-detect tensor arena size ----
+#ifdef TENSOR_ARENA_SIZE_KB
+  g_tensor_arena_size = static_cast<size_t>(TENSOR_ARENA_SIZE_KB) * 1024u;
+#else
+  {
+    const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    g_tensor_arena_size = (largest > kArenaHeapReserveBytes)
+                              ? (largest - kArenaHeapReserveBytes)
+                              : 0u;
+  }
+#endif
+  if (g_tensor_arena_size == 0u) {
+    ESP_LOGE(kTag, "No heap available for tensor arena.");
     return;
   }
+  g_tensor_arena = static_cast<uint8_t*>(
+      heap_caps_aligned_alloc(16, g_tensor_arena_size, MALLOC_CAP_8BIT));
+  if (g_tensor_arena == nullptr) {
+    ESP_LOGE(kTag, "Failed to allocate tensor arena (%u bytes).",
+             static_cast<unsigned>(g_tensor_arena_size));
+    return;
+  }
+
+  tflite::MicroInterpreter interpreter(model, resolver, g_tensor_arena, g_tensor_arena_size);
+  if (interpreter.AllocateTensors() != kTfLiteOk) {
+    ESP_LOGE(kTag, "AllocateTensors failed (arena %u bytes).",
+             static_cast<unsigned>(g_tensor_arena_size));
+    heap_caps_free(g_tensor_arena);
+    g_tensor_arena = nullptr;
+    return;
+  }
+
+  const size_t arena_used = interpreter.arena_used_bytes();
+  ESP_LOGI(kTag, "Tensor arena: %u / %u bytes used (%.1f%%)",
+           static_cast<unsigned>(arena_used),
+           static_cast<unsigned>(g_tensor_arena_size),
+           100.0f * static_cast<float>(arena_used) / static_cast<float>(g_tensor_arena_size));
 
 #if defined(FI_CAMPAIGN_REGISTER)
   register_fi_init(&g_register_fi_ctx, g_fault_list, g_fault_list_count, kRegisterTimerMinDelayUs,
@@ -561,6 +593,10 @@ extern "C" void app_main(void) {
 
   // ---- Announce boot (neutral — firmware does NOT decide to resume) ----
   protocol_send_boot();
+
+  proto_printf("{\"event\":\"arena_info\",\"arena_size\":%lu,\"arena_used\":%lu}\n",
+               static_cast<unsigned long>(g_tensor_arena_size),
+               static_cast<unsigned long>(arena_used));
 
 #if defined(FI_CAMPAIGN_MEMORY)
   proto_printf("{\"event\":\"memory_map\","
@@ -661,7 +697,7 @@ extern "C" void app_main(void) {
 #if defined(FI_CAMPAIGN_REGISTER)
       {
         const tflite::Model* fi_model = tflite::GetModel(g_model_data);
-        tflite::MicroInterpreter fi_interp(fi_model, resolver, g_tensor_arena, kTensorArenaSize);
+        tflite::MicroInterpreter fi_interp(fi_model, resolver, g_tensor_arena, g_tensor_arena_size);
         if (fi_interp.AllocateTensors() != kTfLiteOk) {
 #if defined(MULTI_FI_MAX_COUNT)
           if (static_cast<uint32_t>(fi) < g_fault_group_count) {

@@ -51,6 +51,7 @@ def _context_fingerprint(cfg: ExperimentConfig, pio_env: str) -> str:
         "idf_target": cfg.firmware.idf_target,
         "monitor_speed": cfg.firmware.monitor_speed,
         "sdkconfig_defaults": cfg.firmware.sdkconfig_defaults,
+        "tensor_arena_size_kb": cfg.firmware.tensor_arena_size_kb,
         "serial_transport": cfg.serial.transport,
         "pio_env": pio_env,
     }, sort_keys=True)
@@ -168,6 +169,10 @@ def _generate_ini(
     # Serial transport — tells firmware whether to use UART0 or USB Serial/JTAG
     if cfg.serial.transport == "usb_serial_jtag":
         flags.append("-DFI_TRANSPORT_USB_SERIAL_JTAG=1")
+
+    # Tensor arena size — when omitted, firmware auto-detects from available heap
+    if cfg.firmware.tensor_arena_size_kb is not None:
+        flags.append(f"-DTENSOR_ARENA_SIZE_KB={cfg.firmware.tensor_arena_size_kb}")
 
     flags_str = "\n    ".join(flags)
 

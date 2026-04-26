@@ -1,3 +1,26 @@
 {
-    "cmake.sourceDirectory": "C:/Downloads/tinymlfi/framework_jose/firmware"
+    "cmake.sourceDirectory": "C:/Downloads/tinymlfi/framework_jose/firmware",
+    "files.associations": {
+        "array": "cpp",
+        "chrono": "cpp",
+        "deque": "cpp",
+        "forward_list": "cpp",
+        "list": "cpp",
+        "string": "cpp",
+        "unordered_map": "cpp",
+        "unordered_set": "cpp",
+        "vector": "cpp",
+        "string_view": "cpp",
+        "rope": "cpp",
+        "slist": "cpp",
+        "format": "cpp",
+        "generator": "cpp",
+        "initializer_list": "cpp",
+        "ranges": "cpp",
+        "span": "cpp",
+        "stacktrace": "cpp",
+        "text_encoding": "cpp",
+        "regex": "cpp",
+        "valarray": "cpp"
+    }
 }
