@@ -449,6 +449,7 @@ def _try_reset_break(port: str, baud: int) -> None:
 # Stable, machine-readable identifiers used in the ``recovery_method`` field
 # written to JSONL/CSV.  These are kept deliberately short so they are easy
 # to filter on in pandas/Excel.
+RECOVERY_METHOD_SUPERVISOR = "pico_supervisor"
 RECOVERY_METHOD_DTR_RTS = "dtr_rts_classic"
 RECOVERY_METHOD_USB_JTAG = "usb_jtag_serial"
 RECOVERY_METHOD_BREAK = "serial_break"
@@ -736,6 +737,19 @@ def capture(
     baud = serial_cfg.baud
     do_reset = _resolve_reset_flag(serial_cfg)
 
+    # ---- Optional out-of-band Pico supervisor for hard resets ----
+    pico_sup: Optional["PicoSupervisor"] = None  # type: ignore[name-defined]
+    if serial_cfg.supervisor_port:
+        try:
+            from riftv.supervisor import PicoSupervisor
+            pico_sup = PicoSupervisor(serial_cfg.supervisor_port)
+        except Exception as exc:
+            print(
+                f"[uart] WARNING: Could not connect to Pico supervisor on "
+                f"{serial_cfg.supervisor_port}: {exc}",
+                file=sys.stderr,
+            )
+
     print(f"[uart] Listening on {port} @ {baud} baud  (transport={transport})", file=sys.stderr)
     print(f"[uart] Campaign: {fault_count} faults x {image_count} images = {fault_count * image_count} jobs", file=sys.stderr)
 
@@ -802,12 +816,19 @@ def capture(
         nonlocal valid
         _send_cmd({"cmd": "run_golden"})
         print("[uart] Running golden phase...", file=sys.stderr)
+        golden_deadline = time.monotonic() + GOLDEN_TIMEOUT_S
 
         while True:
-            payload, err = _read_event(timeout=GOLDEN_TIMEOUT_S)
-            if err == "timeout":
+            remaining = golden_deadline - time.monotonic()
+            if remaining <= 0:
                 print("[uart] Golden phase timeout!", file=sys.stderr)
                 return False
+            payload, err = _read_event(timeout=min(GOLDEN_TIMEOUT_S, max(0.1, remaining)))
+            if err == "timeout":
+                if time.monotonic() >= golden_deadline:
+                    print("[uart] Golden phase timeout!", file=sys.stderr)
+                    return False
+                continue
             if err:
                 continue
             if payload is None:
@@ -882,21 +903,24 @@ def capture(
         of the port.
         """
         # Reopening can fail briefly while the USB device re-enumerates
-        # (especially on usb_serial_jtag).  Poll until we get a handle or
-        # exhaust the budget.
+        # (especially on usb_serial_jtag).  On Windows the re-enumeration
+        # can take 3-8 s, so we dedicate most of the budget to waiting
+        # for the port and reserve a small slice for reading the boot
+        # line (which arrives almost immediately after the port appears).
         probe: Optional[serial.Serial] = None
-        open_deadline = time.monotonic() + min(timeout_s, 3.0)
+        overall_deadline = time.monotonic() + timeout_s
+        open_deadline = time.monotonic() + max(timeout_s - 2.0, timeout_s * 0.5)
         while time.monotonic() < open_deadline:
             try:
                 probe = serial.Serial(port, baud, timeout=0.05)
                 break
             except (serial.SerialException, OSError):
-                time.sleep(0.2)
+                time.sleep(0.3)
         if probe is None:
             return False
 
         try:
-            deadline = time.monotonic() + timeout_s
+            deadline = overall_deadline
             buf = bytearray()
             while time.monotonic() < deadline:
                 try:
@@ -956,14 +980,46 @@ def capture(
             except queue.Empty:
                 break
 
-        # 4. Reset-strategy chain, gated on a real boot event.
-        watchdog_wait = max(8.0, float(serial_cfg.boot_timeout_s) / 2.0)
-        method = _attempt_chip_reset(
-            port, baud, transport,
-            verify_boot=_verify_boot_during_recovery,
-            short_timeout_s=4.0,
-            watchdog_timeout_s=watchdog_wait,
-        )
+        # 4a. Pico supervisor — out-of-band physical EN/RST reset.
+        #     Most reliable strategy for usb_serial_jtag boards where the
+        #     USB peripheral may have died.  Tried first when available.
+        method: Optional[str] = None
+        if pico_sup is not None:
+            print("[uart] Reset attempt: Pico supervisor (USB power cycle)...", file=sys.stderr)
+            try:
+                pico_sup.power_cycle(off_ms=3000)
+                # The Pico cuts USB 5 V for 3 s then restores — this
+                # forces Windows to detect a real USB disconnect/reconnect.
+                # Allow generous time for USB re-enumeration + boot.
+                boot_wait = 15.0 if transport == "usb_serial_jtag" else 6.0
+                if _verify_boot_during_recovery(boot_wait):
+                    print(
+                        "[uart] Pico supervisor: firmware boot event "
+                        "received — recovery OK.",
+                        file=sys.stderr,
+                    )
+                    method = RECOVERY_METHOD_SUPERVISOR
+                else:
+                    print(
+                        "[uart] Pico supervisor: power cycled but no "
+                        "boot event — falling back to software strategies.",
+                        file=sys.stderr,
+                    )
+            except Exception as exc:
+                print(
+                    f"[uart] Pico supervisor reset failed: {exc}",
+                    file=sys.stderr,
+                )
+
+        # 4b. Software reset-strategy chain (DTR/RTS, USB-JTAG, BREAK, WDT).
+        if method is None:
+            watchdog_wait = max(8.0, float(serial_cfg.boot_timeout_s) / 2.0)
+            method = _attempt_chip_reset(
+                port, baud, transport,
+                verify_boot=_verify_boot_during_recovery,
+                short_timeout_s=4.0,
+                watchdog_timeout_s=watchdog_wait,
+            )
         if method is None:
             print(
                 "[uart] HW reset: no boot event after exhausting all "
@@ -1192,9 +1248,14 @@ def capture(
             got_ack = False
             boot_received = False
             pending_result = None
+            job_deadline = time.monotonic() + job_timeout_s
 
             while not got_ack:
-                payload, err = _read_event(timeout=job_timeout_s)
+                remaining = job_deadline - time.monotonic()
+                if remaining <= 0:
+                    print(f"[uart] Job deadline exceeded fi={fi} img={img}", file=sys.stderr)
+                    break
+                payload, err = _read_event(timeout=max(0.1, remaining))
 
                 if err == "timeout":
                     print(f"[uart] Job timeout fi={fi} img={img}", file=sys.stderr)
@@ -1437,8 +1498,26 @@ def capture(
                     golden_ok = _run_golden(is_first=False)
 
                 if not golden_ok:
-                    print("[ERROR] Golden recovery failed after crash.", file=sys.stderr)
-                    break
+                    print(
+                        "[uart] Golden recovery failed — attempting HW reset "
+                        "before giving up...",
+                        file=sys.stderr,
+                    )
+                    rescue = _force_hw_reset_and_reconnect()
+                    if rescue is not None:
+                        print(
+                            f"[uart] HW reset succeeded via {rescue} — "
+                            "retrying golden...",
+                            file=sys.stderr,
+                        )
+                        golden_ok = _run_golden(is_first=False)
+                    if not golden_ok:
+                        print(
+                            "[ERROR] Golden recovery failed after crash "
+                            "and HW reset.",
+                            file=sys.stderr,
+                        )
+                        break
 
                 continue  # next job from the deque
 
@@ -1496,6 +1575,8 @@ def capture(
     finally:
         stop_ev.set()
         ser.close()
+        if pico_sup is not None:
+            pico_sup.close()
 
     build_csv(jsonl_path, csv_path, campaign_type=campaign_type,
               is_multi=is_multi, groups_csv=groups_csv)

@@ -3,7 +3,7 @@
 # ──────────────────────────────────────────────────
 
 experiment:
-  name: registerfi_image_classification_fashion_mnist_transient_with_select_bit_select
+  name: registerfi_image_classification_fashion_mnist_transient_all_registers_USB_RaspRelé_2
   description: "Register-FI bit-flip campaign on Image_Classification (Fashion MNIST, int8) — transient"
 
 model:
@@ -19,8 +19,8 @@ campaign:
       - DEPTHWISE_CONV_2D
       - FULLY_CONNECTED
     slot_count: 1
-    registers: ["a4"]              # "all" for x1–x31, or a list: [ra, sp, a0, t0, s0]
-    bits: [22]                                 # "all" for bits 0–31, or a list: [0, 7, 15, 31]
+    registers: all              # "all" for x1–x31, or a list: [ra, sp, a0, t0, s0]
+    bits: all                                 # "all" for bits 0–31, or a list: [0, 7, 15, 31]
 
 sampling:
   method: stratified
@@ -33,21 +33,21 @@ sampling:
 firmware:
   src_dir: "../firmware/src"
   platform: espressif32
-  board: esp32-c3-devkitm-1
+  board: esp32-c6-devkitm-1
   framework: espidf
   monitor_speed: 460800
-  idf_target: esp32c3
+  idf_target: esp32c6
   # tensor_arena_size_kb: 48   # omit to auto-detect from available heap
   flash_size: 2MB
 
 serial:
-  port: COM20
+  port: COM19                  # COM do ESP32-C6 usb_serial_jtag
   baud: 460800
   boot_timeout_s: 30
   transport: usb_serial_jtag
-  max_hang_recoveries: 3       # forced resets when firmware hangs without rebooting
-  hang_recovery_delay_s: 2.0
-  # run_port: COM17       # uncomment if capture port differs from flash port
+  supervisor_port: COM22       # COM do Raspberry Pi Pico
+  max_hang_recoveries: 3
+  hang_recovery_delay_s: 2.0      # uncomment if capture port differs from flash port
   
 
 output:

@@ -45,11 +45,27 @@ def classify_row(row: pd.Series) -> str:
         if injection_status in NON_INJECTION_STATUSES:
             return "NoInjection"
 
-    pred = int(row["pred_class"])
-    golden_pred = int(row["golden_pred_class_ref"])
-    label = int(row["label"])
-    prob = float(row["top1_prob"])
-    golden_prob = float(row["golden_top1_prob_ref"])
+    pred_raw = pd.to_numeric(row.get("pred_class"), errors="coerce")
+    golden_pred_raw = pd.to_numeric(row.get("golden_pred_class_ref"), errors="coerce")
+    label_raw = pd.to_numeric(row.get("label"), errors="coerce")
+    prob_raw = pd.to_numeric(row.get("top1_prob"), errors="coerce")
+    golden_prob_raw = pd.to_numeric(row.get("golden_top1_prob_ref"), errors="coerce")
+
+    # Some fault rows may miss a golden reference (e.g., unmatched image_id).
+    # Keep classification robust instead of crashing on NaN->int casts.
+    if pd.isna(golden_pred_raw) or pd.isna(golden_prob_raw):
+        if not pd.isna(pred_raw) and not pd.isna(label_raw) and int(pred_raw) == int(label_raw):
+            return "Observed"
+        return "Critical"
+
+    if pd.isna(pred_raw) or pd.isna(label_raw) or pd.isna(prob_raw):
+        return "Critical"
+
+    pred = int(pred_raw)
+    golden_pred = int(golden_pred_raw)
+    label = int(label_raw)
+    prob = float(prob_raw)
+    golden_prob = float(golden_prob_raw)
 
     if pred == golden_pred and np.isclose(prob, golden_prob, atol=1e-6):
         return "Masked"
@@ -75,7 +91,7 @@ def classify_results(results_csv: Path, output_csv: Path) -> pd.DataFrame:
     The CSV must contain both golden (phase=="golden") and fault rows.
     Returns the classified DataFrame (fault rows only).
     """
-    df = pd.read_csv(results_csv)
+    df = pd.read_csv(results_csv, low_memory=False)
 
     golden_df = df[df["phase"] == "golden"].copy()
     fault_df = df[(df["event"] == "result") & (df["phase"] == "fault")].copy()
