@@ -3,8 +3,8 @@
 # ──────────────────────────────────────────────────
 
 experiment:
-  name: registerfi_image_classification_fashion_mnist_transient_all_registers_USB_RaspRelé_2
-  description: "Register-FI bit-flip campaign on Image_Classification (Fashion MNIST, int8) — transient"
+  name: registerfi_image_classification_transient_all_registers
+  description: "Register-FI bit-flip campaign on image_classification (MNIST, int8) — transient"
 
 model:
   tflite: "../models/image_classification_fashionmnist_int8.tflite"
@@ -41,11 +41,11 @@ firmware:
   flash_size: 2MB
 
 serial:
-  port: COM19                  # COM do ESP32-C6 usb_serial_jtag
+  port: COM18                  # COM do ESP32-C6 usb_serial_jtag
   baud: 460800
   boot_timeout_s: 30
-  transport: usb_serial_jtag
-  supervisor_port: COM22       # COM do Raspberry Pi Pico
+  transport: uart0
+  #supervisor_port: COM22       # COM do Raspberry Pi Pico
   max_hang_recoveries: 3
   hang_recovery_delay_s: 2.0      # uncomment if capture port differs from flash port
   

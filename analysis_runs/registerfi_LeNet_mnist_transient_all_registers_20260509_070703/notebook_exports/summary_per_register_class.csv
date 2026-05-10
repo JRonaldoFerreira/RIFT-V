@@ -1,4 +1,0 @@
-Register Class,N,Masked %,Acceptable %,Warning %,Critical %,Crash %,Crit+Crash %,CI 95% low,CI 95% high
-special,27400,30.23,0.0,0.0,0.3,69.47,69.77,69.22,70.31
-caller_saved,142200,45.34,1.65,0.94,13.51,37.14,50.65,50.39,50.91
-callee_saved,108400,55.74,1.14,0.64,5.49,36.51,42.0,41.7,42.29
