@@ -1,0 +1,11 @@
+tensor_a_index,tensor_a_name,tensor_a_offset,tensor_a_size,tensor_b_index,tensor_b_name,tensor_b_offset,tensor_b_size,gap_bytes,tensor_a_critical_rate,tensor_b_critical_rate,crit_rate_diff
+11,sequential_1_1/conv2d_3_1/convolution,568,144,10,sequential_1_1/conv2d_3_1/Relu;sequential_1_1/conv2d_3_1/BiasAdd;sequential_1_1/conv2d_3_1/convolution;sequential_1_1/conv2d_3_1/Squeeze,724,64,12,0.011466666666666667,0.1355681818181818,0.12410151515151514
+10,sequential_1_1/conv2d_3_1/Relu;sequential_1_1/conv2d_3_1/BiasAdd;sequential_1_1/conv2d_3_1/convolution;sequential_1_1/conv2d_3_1/Squeeze,724,64,9,sequential_1_1/conv2d_4_1/convolution,800,4608,12,0.1355681818181818,0.0036388140161725067,0.1319293678020093
+9,sequential_1_1/conv2d_4_1/convolution,800,4608,8,sequential_1_1/conv2d_4_1/Relu;sequential_1_1/conv2d_4_1/BiasAdd;sequential_1_1/conv2d_4_1/convolution;sequential_1_1/conv2d_4_1/Squeeze,5420,128,12,0.0036388140161725067,0.271,0.2673611859838275
+8,sequential_1_1/conv2d_4_1/Relu;sequential_1_1/conv2d_4_1/BiasAdd;sequential_1_1/conv2d_4_1/convolution;sequential_1_1/conv2d_4_1/Squeeze,5420,128,7,sequential_1_1/conv2d_5_1/convolution,5560,18432,12,0.271,0.0021409921671018276,0.2688590078328982
+7,sequential_1_1/conv2d_5_1/convolution,5560,18432,6,sequential_1_1/conv2d_5_1/Relu;sequential_1_1/conv2d_5_1/BiasAdd;sequential_1_1/conv2d_5_1/convolution;sequential_1_1/conv2d_5_1/Squeeze,24004,256,12,0.0021409921671018276,0.09,0.08785900783289817
+6,sequential_1_1/conv2d_5_1/Relu;sequential_1_1/conv2d_5_1/BiasAdd;sequential_1_1/conv2d_5_1/convolution;sequential_1_1/conv2d_5_1/Squeeze,24004,256,5,sequential_1_1/dense_2_1/MatMul,24272,2048,12,0.09,0.0023943661971830986,0.0876056338028169
+5,sequential_1_1/dense_2_1/MatMul,24272,2048,4,sequential_1_1/dense_2_1/Relu;sequential_1_1/dense_2_1/BiasAdd,26332,128,12,0.0023943661971830986,0.1719047619047619,0.16951039570757878
+4,sequential_1_1/dense_2_1/Relu;sequential_1_1/dense_2_1/BiasAdd,26332,128,3,sequential_1_1/dense_3_1/MatMul,26472,320,12,0.1719047619047619,0.0036065573770491803,0.1682982045277127
+3,sequential_1_1/dense_3_1/MatMul,26472,320,2,sequential_1_1/dense_3_1/BiasAdd,26804,40,12,0.0036065573770491803,0.33485714285714285,0.3312505854800937
+2,sequential_1_1/dense_3_1/BiasAdd,26804,40,1,sequential_1_1/global_average_pooling2d_1_1/Mean/reduction_indices,26856,8,12,0.33485714285714285,,

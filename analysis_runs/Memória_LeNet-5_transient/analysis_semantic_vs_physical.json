@@ -1,0 +1,11 @@
+{
+  "semantic_gini": 0.7088,
+  "physical_gini": 0.9859,
+  "semantic_entropy": 1.7969,
+  "physical_entropy": 2.634,
+  "num_tensors": 10,
+  "num_physical_bins": 346,
+  "bin_size": 128,
+  "verdict": "physical",
+  "explanation": "Criticality is more concentrated by physical address range than by tensor/operator."
+}

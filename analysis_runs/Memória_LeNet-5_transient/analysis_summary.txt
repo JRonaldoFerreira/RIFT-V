@@ -1,0 +1,18 @@
+============================================================
+  Model-Physical Analysis Report
+============================================================
+
+  Total enriched fault results: 181,093
+
+  Most critical tensor: le_net5_1_1/lenet5_1/conv2_1/Relu;le_net5_1_1/lenet5_1/conv2_1/BiasAdd;le_net5_1_1/lenet5_1/conv2_1/convolution;le_net5_1_1/lenet5_1/conv2_1/Squeeze (rate=0.284)
+  Most critical operator: CONV_2D (rate=0.022)
+
+  Semantic vs Physical verdict: physical
+    Semantic  Gini=0.7088  Entropy=1.7969
+    Physical  Gini=0.9859  Entropy=2.6340
+    Criticality is more concentrated by physical address range than by tensor/operator.
+
+  Hottest physical region: [0xf640, 0xf680) rate=0.166 (1700.0 faults)
+  Most vulnerable bit position: bit 2 (rate=0.012)
+
+============================================================

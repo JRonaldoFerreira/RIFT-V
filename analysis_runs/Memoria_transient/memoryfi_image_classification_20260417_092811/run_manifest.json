@@ -1,0 +1,14 @@
+{
+  "experiment": "memoryfi_image_classification",
+  "campaign_type": "memory",
+  "fault_duration": "transient",
+  "output_dir": "C:\\Downloads\\framework_jose\\runs\\memoryfi_image_classification_20260417_092811",
+  "tflite": "C:\\Downloads\\framework_jose\\models\\image_classification_fashionmnist_int8.tflite",
+  "subset_npz": "C:\\Downloads\\framework_jose\\models\\fashion_mnist_100_subset.npz",
+  "sampling": {
+    "confidence": 0.95,
+    "margin": 0.05,
+    "p_prior": 0.5,
+    "seed": 1337
+  }
+}
