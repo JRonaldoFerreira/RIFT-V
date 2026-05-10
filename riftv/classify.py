@@ -101,11 +101,41 @@ def classify_results(results_csv: Path, output_csv: Path) -> pd.DataFrame:
     if fault_df.empty:
         raise ValueError("No fault rows found in results CSV.")
 
-    # Build golden reference lookup
+    # Build golden reference lookup from the golden phase rows.
     golden_ref = golden_df[["image_id", "pred_class", "top1_prob"]].rename(columns={
         "pred_class": "golden_pred_class_ref",
         "top1_prob": "golden_top1_prob_ref",
     })
+
+    # Fallback: recover any image_id missing from the golden phase by
+    # mining the per-fault rows.  The firmware caches golden_pred_class /
+    # golden_top1_prob per image_id and echoes them on every fault result,
+    # so a single non-NaN row is enough to reconstruct the reference even
+    # when the golden phase dropped a sample over UART.
+    if (
+        "golden_pred_class" in fault_df.columns
+        and "golden_top1_prob" in fault_df.columns
+    ):
+        existing_ids = set(golden_ref["image_id"].dropna().astype("int64").tolist())
+        fb = fault_df.dropna(subset=["image_id", "golden_pred_class", "golden_top1_prob"])
+        if not fb.empty:
+            fb = fb[~fb["image_id"].astype("int64").isin(existing_ids)]
+        if not fb.empty:
+            fb = (
+                fb.drop_duplicates(subset=["image_id"], keep="first")[
+                    ["image_id", "golden_pred_class", "golden_top1_prob"]
+                ]
+                .rename(columns={
+                    "golden_pred_class": "golden_pred_class_ref",
+                    "golden_top1_prob": "golden_top1_prob_ref",
+                })
+            )
+            recovered = sorted(int(x) for x in fb["image_id"].astype("int64").unique())
+            print(
+                f"[classify] Recovered golden reference for {len(recovered)} "
+                f"image_id(s) missing from the golden phase: {recovered}"
+            )
+            golden_ref = pd.concat([golden_ref, fb], ignore_index=True)
 
     merged = fault_df.merge(golden_ref, on="image_id", how="left")
 
