@@ -32,8 +32,9 @@ CSV_COLUMNS = [
     #   - elapsed_ms / timeout_ms : wall-clock measurements per job
     #   - boot_seen / result_seen / job_ack_seen : protocol observation flags
     #   - recovery_method : which reset strategy brought the chip back
-    #   - inferred : True for rows synthesized from a parent fault crash
-    #                (image was not actually dispatched)
+    #   - inferred : True for rows synthesized after a parent fatal_hang
+    #                (image was not actually dispatched because the chip
+    #                was unrecoverable for that fault index)
     "elapsed_ms", "timeout_ms",
     "boot_seen", "result_seen", "job_ack_seen", "recovery_method",
     "inferred",
@@ -654,9 +655,16 @@ def capture(
     groups_csv : Path, optional
         Path to the ``*_fault_groups.csv`` for multi-fault enrichment.
     """
-    # If a fault crashes for any image, it will deterministically crash
-    # for all remaining images (same register/bit/timing).  Skip retries
-    # and immediately mark every remaining image for that fault as crash.
+    # Every (fault, image) job is dispatched independently: a crash on
+    # one image is *not* extrapolated to the remaining images of the same
+    # fault index.  This avoids biasing per-fault crash rates upward when
+    # the crash is data-dependent (i.e. only some inputs cause it).
+    # The only scenario in which we still skip remaining images of a fault
+    # is a fully unrecoverable hang (``fatal_hang``) — at that point the
+    # chip cannot accept jobs anyway, so the rest are inherently untestable.
+    # ``MAX_CRASH_RETRIES`` controls per-(fault, image) retries on crash;
+    # it is kept at 0 because the recovery path itself already covers boot
+    # waits and HW-reset attempts before we declare an outcome.
     MAX_CRASH_RETRIES = 0
     GOLDEN_TIMEOUT_S = 120.0
 
@@ -1126,12 +1134,51 @@ def capture(
             (fi, img) for fi in range(fault_count) for img in range(image_count)
         )
         crash_retries: Dict[Tuple[int, int], int] = {}
-        # Per-fault recovery metadata captured the first time a fault
-        # crashes the chip.  Membership replaces the old ``crashed_faults``
-        # set; values are propagated to subsequent images of the same
-        # fault index so every inferred row carries the same
-        # ``recovery_method``/``boot_seen`` as the parent crash.
+        # Per-fault recovery metadata.  Populated in two cases:
+        #
+        # 1. ``fatal_hang``: every HW-reset attempt failed for some image of
+        #    that fault.  The chip is gone for that fault index, so the
+        #    remaining images cannot be physically dispatched.
+        #
+        # 2. ``crash_inference_threshold`` reached: if T > 0 in
+        #    ``SerialConfig.crash_inference_threshold`` and we observe T
+        #    consecutive crashes for the same fault index (any ok/SDC in
+        #    between resets the counter), we declare the fault consistently
+        #    crashing and synthesize the remaining images as inferred
+        #    crashes.  T = 0 disables this and every image is dispatched
+        #    on its own.  T = 1 reproduces the legacy "deterministic crash"
+        #    behaviour (one crash → infer the rest immediately).
+        #
+        # Membership in this dict causes the early-skip branch at the top
+        # of the loop to synthesize ``inferred=True`` crash rows for the
+        # remaining images of that fault.
         crashed_fault_meta: Dict[int, Dict[str, Any]] = {}
+        # Consecutive-crash counter per fault, used by the inference
+        # threshold policy.  Reset to 0 (entry removed) every time a
+        # non-crash result is observed for that fault.  Only consulted
+        # when ``crash_inference_threshold > 0``.
+        consecutive_crashes_per_fault: Dict[int, int] = {}
+        crash_inference_T: int = max(0, int(serial_cfg.crash_inference_threshold))
+        if crash_inference_T == 0:
+            print(
+                "[uart] Crash-inference disabled (threshold=0): every "
+                "(fault, image) pair will be dispatched.",
+                file=sys.stderr,
+            )
+        elif crash_inference_T == 1:
+            print(
+                "[uart] Crash-inference threshold = 1: remaining images of a "
+                "fault are inferred as crash immediately after the first "
+                "crash (legacy 'deterministic crash' mode).",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[uart] Crash-inference threshold = {crash_inference_T}: a "
+                f"fault must crash {crash_inference_T} times in a row before "
+                "its remaining images are inferred.",
+                file=sys.stderr,
+            )
         completed = 0
         crash_outcomes = 0
 
@@ -1193,11 +1240,15 @@ def capture(
             inferred : bool
                 ``True`` for rows that were *not* actually dispatched —
                 they describe images skipped because the same fault index
-                deterministically crashed on a previous image.  Their
-                ``recovery_method`` and ``boot_seen`` fields are inherited
-                from that parent crash; ``elapsed_ms``, ``result_seen``
-                and ``job_ack_seen`` are intentionally null/false because
-                no ``run_job`` was sent for these images.
+                left the chip in an unrecoverable state (``fatal_hang``)
+                on a previous image, so the remaining jobs could not be
+                physically run.  Their ``recovery_method`` and
+                ``boot_seen`` fields are inherited from that parent
+                fatal_hang; ``elapsed_ms``, ``result_seen`` and
+                ``job_ack_seen`` are intentionally null/false because no
+                ``run_job`` was sent for these images.  Ordinary
+                (recoverable) crashes are *never* marked ``inferred``:
+                each image is dispatched and measured on its own.
             """
             payload["elapsed_ms"] = (
                 None if elapsed_ms is None else round(float(elapsed_ms), 3)
@@ -1215,14 +1266,13 @@ def capture(
         while jobs:
             fi, img = jobs.popleft()
 
-            # ---- Skip images whose fault index already crashed ----
-            # These are post-hoc inferred crashes (the fault deterministically
-            # crashed on the first image, so we don't dispatch the rest).
-            # ``recovery_method`` and ``boot_seen`` are inherited from the
-            # parent crash so every row of a deterministically-crashing
-            # fault carries the same recovery characterization.  The
-            # ``inferred`` flag is set to True so analyses can immediately
-            # tell which rows came from real measurements.
+            # ---- Skip images whose fault index is unrecoverable ----
+            # This branch only fires when a previous image of this fault
+            # triggered a ``fatal_hang`` (every HW-reset attempt failed) —
+            # the chip cannot accept jobs for this fault anymore, so we
+            # synthesize ``inferred=True`` crash rows for the rest.
+            # Ordinary (recoverable) crashes do *not* land here: their
+            # remaining images are dispatched normally and measured.
             if fi in crashed_fault_meta:
                 parent = crashed_fault_meta[fi]
                 cr = _make_crash_result(fi, img)
@@ -1309,24 +1359,23 @@ def capture(
                     jobs.appendleft((fi, img))
                     crash_row_written = False
                 else:
-                    # Mark this fault index as crashed — skip all remaining
-                    # images for it instead of retrying each one individually.
-                    # The recovery_method/boot_seen entry is filled in
-                    # below once recovery completes; subsequent images
-                    # of the same fault inherit those values.
-                    crashed_fault_meta[fi] = {
-                        "recovery_method": RECOVERY_METHOD_NONE,
-                        "boot_seen": False,
-                    }
+                    # Record this single (fault, image) as a crash and let
+                    # the loop continue with the next image of the same
+                    # fault.  We deliberately do *not* add ``fi`` to
+                    # ``crashed_fault_meta`` here: a crash on one image is
+                    # not extrapolated to the rest, because the crash may
+                    # be data-dependent (only some inputs trigger it).
+                    # The fault index is only marked unrecoverable below
+                    # if every HW-reset attempt fails (fatal_hang).
                     print(
-                        f"[uart] Persistent crash fi={fi} img={img} "
-                        "\u2014 recording as crash for all remaining images.",
+                        f"[uart] Crash fi={fi} img={img} "
+                        "\u2014 recording crash, continuing with next image.",
                         file=sys.stderr,
                     )
                     crash_row = _make_crash_result(fi, img)
                     crash_row_written = True
-                    # We will populate audit fields below after we know
-                    # which recovery method (if any) brought the chip back.
+                    # Audit fields are populated below once we know which
+                    # recovery method (if any) brought the chip back.
 
                 # Track how the firmware (if at all) was brought back.
                 # Default: no recovery needed/none worked — overwritten
@@ -1369,15 +1418,23 @@ def capture(
                             recovery_method = recovered_method
                         else:
                             # All reset attempts exhausted for this job.
-                            # Mark the fault as fatal_hang (if not already
-                            # marked as a persistent crash above) and
-                            # record that no recovery method worked.
+                            # The fault index is now unrecoverable: mark
+                            # it in ``crashed_fault_meta`` so the remaining
+                            # images are synthesized via the early-skip
+                            # branch (the chip cannot accept jobs anyway).
                             recovery_method = RECOVERY_METHOD_NONE
-                            if fi not in crashed_fault_meta:
-                                crashed_fault_meta[fi] = {
-                                    "recovery_method": RECOVERY_METHOD_NONE,
-                                    "boot_seen": False,
-                                }
+                            crashed_fault_meta[fi] = {
+                                "recovery_method": RECOVERY_METHOD_NONE,
+                                "boot_seen": False,
+                            }
+                            if crash_row_written:
+                                # Upgrade the crash row prepared above to
+                                # fatal_hang since no recovery worked.
+                                crash_row["status"] = "fatal_hang"
+                                crash_row["injection_status"] = "fatal_hang"
+                            else:
+                                # Retry path was taken (no crash row yet);
+                                # emit a fresh fatal_hang row for this job.
                                 fhr = _make_crash_result(fi, img)
                                 fhr["status"] = "fatal_hang"
                                 fhr["injection_status"] = "fatal_hang"
@@ -1392,12 +1449,6 @@ def capture(
                                 _append_jsonl(jsonl_path, fhr)
                                 valid += 1
                                 crash_outcomes += 1
-                            elif crash_row_written:
-                                # We already prepared a crash row above
-                                # (persistent-crash branch); upgrade it
-                                # to fatal_hang since no recovery worked.
-                                crash_row["status"] = "fatal_hang"
-                                crash_row["injection_status"] = "fatal_hang"
 
                             # Remove any re-queued retries for this fault
                             jobs = deque(j for j in jobs if j[0] != fi)
@@ -1477,6 +1528,34 @@ def capture(
                         "boot_seen": boot_received,
                     }
 
+                # ---- Crash-inference threshold accounting ----
+                # Count consecutive crashes for this fault.  Once we've
+                # observed *T* in a row (with no ok/SDC in between), mark
+                # the fault as consistently crashing so the remaining
+                # images are synthesized as inferred crashes.
+                #   T = 0 → block disabled, every image dispatched.
+                #   T = 1 → infer immediately after the first crash
+                #           (legacy "deterministic crash" mode).
+                #   T > 1 → require T consecutive crashes (1 original
+                #           + T-1 verifications) before inferring.
+                if crash_inference_T > 0 and fi not in crashed_fault_meta:
+                    consecutive_crashes_per_fault[fi] = (
+                        consecutive_crashes_per_fault.get(fi, 0) + 1
+                    )
+                    if consecutive_crashes_per_fault[fi] >= crash_inference_T:
+                        crashed_fault_meta[fi] = {
+                            "recovery_method": recovery_method,
+                            "boot_seen": boot_received,
+                        }
+                        remaining = sum(1 for j in jobs if j[0] == fi)
+                        print(
+                            f"[uart] Crash-inference triggered: "
+                            f"{consecutive_crashes_per_fault[fi]} consecutive "
+                            f"crashes on fi={fi} \u2014 inferring {remaining} "
+                            f"remaining images as crash.",
+                            file=sys.stderr,
+                        )
+
                 # Skip golden after crash — host has cached golden data.
                 # Firmware just needs golden_done=true to accept jobs.
                 # NOTE: Register campaigns MUST re-run golden so the
@@ -1533,6 +1612,12 @@ def capture(
                 )
                 _append_jsonl(jsonl_path, pending_result)
                 valid += 1
+                # A successful (non-crash) result resets the consecutive-
+                # crash counter for this fault, so any later crash starts
+                # a fresh streak instead of being charged against earlier
+                # ones.  Only relevant when crash_inference_threshold > 0.
+                if crash_inference_T > 0:
+                    consecutive_crashes_per_fault.pop(fi, None)
                 fid = pending_result.get("fault_id", pending_result.get("group_id", "?"))
                 st = pending_result.get("injection_status", "?")
                 print(

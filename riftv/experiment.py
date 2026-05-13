@@ -62,6 +62,7 @@ class Experiment:
         output_path: Optional[str | Path] = None,
         representative_data: Optional["np.ndarray"] = None,
         dataset_name: Optional[str] = None,
+        calibration_data_path: Optional[str | Path] = None,
         num_calibration_samples: int = 500,
         preprocess_fn=None,
     ) -> Path:
@@ -84,6 +85,11 @@ class Experiment:
         dataset_name:
             ``"mnist"``, ``"fashion_mnist"``, ``"cifar10"``, or
             ``"cifar100"``.  Used for auto-loading calibration data.
+        calibration_data_path:
+            Path to a ``.npz`` file with calibration images.  Must contain
+            one of these key pairs: ``(images, labels)``,
+            ``(x_test, y_test)``, or ``(x, y)``.  Takes priority over
+            *dataset_name* when *representative_data* is not provided.
         num_calibration_samples:
             How many samples to use for calibration (default 500).
         preprocess_fn:
@@ -103,6 +109,7 @@ class Experiment:
             output_path=output_path,
             representative_data=representative_data,
             dataset_name=dataset_name,
+            calibration_data_path=calibration_data_path,
             num_calibration_samples=num_calibration_samples,
             preprocess_fn=preprocess_fn,
         )
@@ -358,7 +365,10 @@ class Experiment:
         subset_path = self.cfg.subset_npz_path
         if subset_path.exists():
             subset = np.load(subset_path)
-            image_count = len(subset["labels"])
+            for _k in ("labels", "y_test", "y"):
+                if _k in subset:
+                    image_count = len(subset[_k])
+                    break
 
         print(f"[experiment] Capturing UART → {csv}", file=sys.stderr)
         uart_capture(

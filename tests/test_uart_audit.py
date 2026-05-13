@@ -104,8 +104,10 @@ def test_build_csv_propagates_audit_fields(tmp_path: Path) -> None:
             "inferred": False,
         },
         # Inherited row: same fault_id as the parent (44/0), but
-        # synthesized for image 1 because the parent crashed
-        # deterministically.  recovery_method/boot_seen are inherited.
+        # synthesized for image 1 because the parent left the chip in
+        # an unrecoverable state (fatal_hang) and image 1 could not be
+        # physically dispatched.  recovery_method/boot_seen are
+        # inherited from the parent row.
         {
             "event": "result",
             "phase": "fault",

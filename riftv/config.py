@@ -97,6 +97,29 @@ class SerialConfig:
     supervisor_port: Optional[str] = None  # Pico supervisor COM port for out-of-band EN/RST reset
     max_hang_recoveries: int = 3          # HW reset attempts when firmware hangs without rebooting
     hang_recovery_delay_s: float = 2.0    # seconds to wait between HW reset attempts
+    # ---- Crash-inference threshold (statistical / cost trade-off) -------
+    # Number of consecutive crashes needed on the *same* fault index
+    # before its remaining images are synthesized as ``inferred=True``
+    # crash rows (skipping the actual dispatch + crash-recovery cost).
+    # Any ok/SDC observation on the same fault resets the counter, so
+    # the crashes must be strictly back-to-back.
+    #
+    # 0 (default)  → never infer; every (fault, image) pair is dispatched
+    #                and measured.  Most statistically faithful — the only
+    #                images skipped are those after a ``fatal_hang`` (chip
+    #                physically unable to accept jobs).  Recommended.
+    # 1            → infer immediately after the *first* crash.  Equivalent
+    #                to the legacy "deterministic crash" assumption: cheap
+    #                but biased for intermittent faults (a fault with true
+    #                p_crash = 0.1 reported as 100 % crash if it tripped
+    #                on the first image).
+    # N ≥ 2        → require N consecutive crashes (1 original + N-1
+    #                verification crashes) before inferring.  Middle ground
+    #                between the two extremes.  N=6 misses intermittent
+    #                faults with p_crash ≥ 0.95 about 77 % of the time but
+    #                catches anything with p_crash ≤ 0.5 with ≥ 96.9 %
+    #                probability.
+    crash_inference_threshold: int = 0
     # ---- Adaptive job-timeout calibration --------------------------------
     # The host scheduler measures the worst inter-result gap during the
     # golden phase and uses ``max_gap × safety_factor`` as the per-job
@@ -294,6 +317,13 @@ def _parse_serial(raw: Optional[Dict[str, Any]]) -> SerialConfig:
         supervisor_port=raw.get("supervisor_port", None),
         max_hang_recoveries=raw.get("max_hang_recoveries", 3),
         hang_recovery_delay_s=float(raw.get("hang_recovery_delay_s", 2.0)),
+        crash_inference_threshold=int(
+            raw.get(
+                "crash_inference_threshold",
+                # Backward-compat alias from the short-lived previous name.
+                raw.get("crash_verification_batch", 0),
+            )
+        ),
         job_timeout_safety_factor=safety,
         job_timeout_min_s=float(raw.get("job_timeout_min_s", 1.0)),
         job_timeout_max_s=float(raw.get("job_timeout_max_s", 60.0)),

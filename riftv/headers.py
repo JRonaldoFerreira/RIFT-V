@@ -195,9 +195,24 @@ def generate_model_header(tflite_path: Path) -> str:
 
 def generate_subset_header(npz_path: Path) -> str:
     subset = np.load(npz_path)
-    images = subset["images"].astype(np.float32)
-    labels = subset["labels"].astype(np.int32)
-    test_indices = subset["test_indices"].astype(np.int32)
+
+    # Support multiple key-naming conventions produced by different scripts.
+    _IMG_KEYS = ("images", "x_test", "x")
+    _LBL_KEYS = ("labels", "y_test", "y")
+    _IDX_KEYS = ("test_indices", "indices")
+
+    def _pick(keys):
+        for k in keys:
+            if k in subset:
+                return subset[k]
+        raise KeyError(
+            f"Cannot find any of {keys} in '{npz_path}'. "
+            f"Available keys: {list(subset.keys())}"
+        )
+
+    images = _pick(_IMG_KEYS).astype(np.float32)
+    labels = _pick(_LBL_KEYS).astype(np.int32)
+    test_indices = _pick(_IDX_KEYS).astype(np.int32)
 
     n, h, w, c = images.shape
     flat = images.reshape(-1)

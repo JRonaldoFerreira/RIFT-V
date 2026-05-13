@@ -34,6 +34,7 @@ def quantize_model(
     output_path: Union[str, Path],
     representative_data: Optional[np.ndarray] = None,
     dataset_name: Optional[str] = None,
+    calibration_data_path: Optional[Union[str, Path]] = None,
     num_calibration_samples: int = 500,
     preprocess_fn: Optional[Callable[[np.ndarray], np.ndarray]] = None,
 ) -> Path:
@@ -53,6 +54,12 @@ def quantize_model(
         One of ``"mnist"``, ``"fashion_mnist"``, ``"cifar10"``,
         ``"cifar100"``.  Used to load calibration data when
         *representative_data* is not provided.
+    calibration_data_path:
+        Path to a ``.npz`` file containing calibration images.  The file
+        must have image arrays stored under one of the recognised key
+        pairs: ``(images, labels)``, ``(x_test, y_test)``, or ``(x, y)``.
+        Only the images are used for calibration.  Takes priority over
+        *dataset_name* when *representative_data* is not provided.
     num_calibration_samples:
         Maximum number of samples drawn from the calibration set.
     preprocess_fn:
@@ -87,6 +94,9 @@ def quantize_model(
         )
 
     # Resolve calibration data
+    if representative_data is None and calibration_data_path is not None:
+        x_cal, _ = _load_test_npz(calibration_data_path)
+        representative_data = x_cal
     if representative_data is None and dataset_name is not None:
         (x_train, _), _ = _load_dataset(dataset_name)
         representative_data = x_train
