@@ -9,7 +9,7 @@
 # Revise os campos marcados com "# REVIEW" antes de rodar uma nova campanha.
 
 experiment:
-  name: lenet5_registerfi_mnist_crash_until_10
+  name: lenet5_registerfi_mnist_crash_until_4
   description: "Register-FI bit-flip campaign on LeNet-5 (MNIST, int8) — transient"
 
 model:
@@ -24,12 +24,15 @@ campaign:
       - CONV_2D
       - FULLY_CONNECTED
     slot_count: 1
-    registers: all                      # "all" para x1–x31, ou lista [ra, sp, a0, t0, s0]
+    registers: [
+      "ra", "s0", "s1", "s2", "s3", 
+      "s4", "s5", "s6", "s7", "s8", 
+      "s9", "s10", "s11"]                      # "all" para x1–x31, ou lista [ra, sp, a0, t0, s0]
     bits: all                           # "all" para bits 0–31, ou lista [0, 7, 15, 31]
 
 sampling:
   method: stratified
-  confidence: 0.95
+  confidence: 0.90
   margin: 0.05
   p_prior: 0.5
   seed: 1337
@@ -64,7 +67,7 @@ serial:
   #                 the streak).  Middle ground.
   # See SerialConfig in riftv/config.py for the full bias / runtime
   # trade-off table.
-  crash_inference_threshold: 1
+  crash_inference_threshold: 4
 
 output:
   dir: "../runs/{name}_{timestamp}"

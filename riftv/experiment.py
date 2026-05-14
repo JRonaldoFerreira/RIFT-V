@@ -168,8 +168,20 @@ class Experiment:
         Path
             The written ``.npz`` file.
         """
-        if output_path is None:
-            output_path = self.cfg.subset_npz_path
+        user_supplied_path = output_path is not None
+        configured_path = self.cfg.subset_npz_path
+        if not user_supplied_path:
+            # Derive a filename that reflects the actual parameters used,
+            # placed next to the path configured in the YAML so that
+            # downstream steps (which read cfg.subset_npz_path) keep working.
+            if dataset_name is not None:
+                stem = f"{dataset_name}_{subset_size}_subset"
+            elif test_data_path is not None:
+                stem = f"{Path(test_data_path).stem}_{subset_size}_subset"
+            else:
+                stem = f"subset_{subset_size}"
+            output_path = configured_path.with_name(f"{stem}.npz")
+
         result = _prepare_test_subset(
             output_path=output_path,
             subset_size=subset_size,
@@ -180,6 +192,21 @@ class Experiment:
             seed=seed,
             preprocess_fn=preprocess_fn,
         )
+
+        # Keep cfg.subset_npz_path in sync with the file we just wrote so
+        # that prepare()/run() pick up the right .npz instead of the stale
+        # name baked into the YAML.
+        if Path(result).resolve() != configured_path.resolve():
+            try:
+                rel = Path(result).resolve().relative_to(self.cfg._root)
+                self.cfg.model.subset_npz = str(rel).replace("\\", "/")
+            except ValueError:
+                self.cfg.model.subset_npz = str(Path(result).resolve())
+            print(
+                f"[experiment] cfg.model.subset_npz updated → {self.cfg.model.subset_npz}",
+                file=sys.stderr,
+            )
+
         print(
             f"[experiment] Test subset ready at {result}",
             file=sys.stderr,
