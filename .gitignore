@@ -40,7 +40,7 @@ Thumbs.db
 
 # --- Saídas de experimentos (descomente se NÃO quiser ignorar) ---
 runs/
-# analysis_runs/  # versionado para manter os notebooks de análise
+analysis_runs/
 
 # --- Arquivos grandes de resultados ---
 *.jsonl
