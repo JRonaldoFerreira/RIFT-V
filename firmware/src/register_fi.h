@@ -83,7 +83,14 @@ typedef struct {
  * to 6+ instructions plus an `sltu` for carry, which alone accounts for
  * ~10 cycles of every hook invocation on the C6.  At 160 MHz, even
  * 4 billion cycles is only ~25 s, which is far longer than any single
- * fault-injection campaign run between resets. */
+ * fault-injection campaign run between resets.
+ *
+ * The "fast"/"slow" pair lets the host tell empty-hook overhead apart
+ * from real per-injection work.  Without that split the
+ * `overhead_summary` mixed timer arming/tear-down with the cycles spent
+ * walking through the other ~15 operators that carry no fault, making
+ * it impossible to tell whether the remaining gap to microFI lives in
+ * the timer backend or in the hook dispatch itself. */
 typedef struct {
   uint32_t before_op_cycles;
   uint32_t before_op_count;
@@ -94,6 +101,20 @@ typedef struct {
   uint32_t isr_entry_cycles;
   uint32_t isr_entry_count;
   uint32_t injections;
+  /* Fine-grained breakdown for the per-stage diagnosis recommended in
+   * the RIFT-V design notes.  Each pair stores cycles and call count
+   * separately so the host can compute averages without dividing two
+   * unrelated totals. */
+  uint32_t before_fast_cycles;   /* before_op hook with no work to do */
+  uint32_t before_fast_count;
+  uint32_t before_slow_cycles;   /* before_op hook that arms the timer */
+  uint32_t before_slow_count;
+  uint32_t timer_arm_cycles;     /* `esp_timer_start_once` itself      */
+  uint32_t timer_arm_count;
+  uint32_t after_fast_cycles;    /* after_op hook with no work to do  */
+  uint32_t after_fast_count;
+  uint32_t timer_stop_cycles;    /* `esp_timer_stop` + cleanup         */
+  uint32_t timer_stop_count;
 } register_fi_overhead_t;
 
 typedef struct {
@@ -105,6 +126,15 @@ typedef struct {
   volatile bool timer_armed;
   volatile uint32_t current_delay_us;
   volatile register_fi_injection_status_t last_injection_status;
+
+  /* Cached resolution of the active fault, computed once per
+   * inference inside `register_fi_begin_inference`.  The hot path in
+   * `microfi_before_op` then collapses to a couple of compares on the
+   * non-target operators, skipping bounds checks, fault-list indexing
+   * and bit-mask construction every call. */
+  const register_fault_t* active_fault_ptr;
+  uint32_t active_target_op;
+  uint32_t active_reg_mask;
 
   bool profiling_enabled;
   uint64_t op_start_time_us[32];
@@ -171,6 +201,28 @@ void register_fi_clear_group(register_fi_context_t* ctx);
 // Hooks called from the patched TFLM loop.
 void microfi_before_op(int op_index);
 void microfi_after_op(int op_index);
+
+/* Call-site gating globals — read by `micro_interpreter_graph.cc` to
+ * decide whether to dispatch the hooks at all for the current
+ * operator.  Defined in `register_fi.cc` and updated atomically (32-bit
+ * stores on RV32 are intrinsically atomic) by
+ * `register_fi_begin_inference` and `register_fi_set_profiling`.
+ *
+ *   g_microfi_profile_all_ops:
+ *     non-zero during the golden/profiling phase so every operator is
+ *     timed by `register_fi_before_op` / `register_fi_after_op`.
+ *
+ *   g_microfi_active_op_mask:
+ *     one bit per tracked operator (bit `op_index`).  During the
+ *     faulted phase only the bits matching the active fault(s) are set,
+ *     so the TFLM loop completely skips the no-op hook on the other
+ *     ~15 operators per inference.
+ *
+ * Together these cut `before_op_count` / `after_op_count` from ~16 ×
+ * `injections` to ~1 × `injections` outside of profiling — the largest
+ * single optimisation against the microFI-style ~1300 cycles target. */
+extern volatile uint32_t g_microfi_active_op_mask;
+extern volatile uint8_t  g_microfi_profile_all_ops;
 
 #ifdef REGISTER_FI_RUNTIME_CHECK
 void register_fi_runtime_check_print(void);

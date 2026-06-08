@@ -31,6 +31,45 @@ extern "C" void microfi_before_op(int op_index);
 extern "C" void microfi_after_op(int op_index);
 
 /*
+ * Call-site gating for the RIFT-V fault-injection hooks.
+ *
+ * Without gating, every operator (~16 per inference for LeNet5/MNIST)
+ * pays the cost of a full function call + cycle-counter snapshot in
+ * both `microfi_before_op` and `microfi_after_op`, even when the
+ * active fault targets a single operator.  At 11k cycles / injection
+ * with 10 injections that meant `before_op_count = after_op_count = 160`,
+ * so 15/16 of the per-hook overhead was spent on operators that
+ * carried no work.
+ *
+ * `g_microfi_active_op_mask` is updated by `register_fi_begin_inference`
+ * to hold one bit per operator that is a fault target for the current
+ * inference.  `g_microfi_profile_all_ops` is flipped to 1 during the
+ * golden phase so the per-operator timings are still collected by the
+ * profiler.  When the gate is closed we skip the entire hook
+ * dispatch — function call, cycle reads and accumulator update — for
+ * the operators that have no fault.
+ *
+ * The TFLM library deliberately does NOT include "register_fi.h".
+ * The gate globals are defined in the firmware campaign sources
+ * (`register_fi.cc` / `memory_fi.cc`).
+ */
+extern "C" volatile uint32_t g_microfi_active_op_mask;
+extern "C" volatile uint8_t g_microfi_profile_all_ops;
+
+static inline __attribute__((always_inline)) bool microfi_should_dispatch(
+    uint32_t op_index) {
+  if (g_microfi_profile_all_ops) {
+    return true;
+  }
+  if (op_index >= 32u) {
+    /* Out of the bitmask range: dispatch unconditionally rather than
+     * silently swallowing a possible injection target. */
+    return true;
+  }
+  return (g_microfi_active_op_mask & (1u << op_index)) != 0u;
+}
+
+/*
  * MicroFI saved-SP instrumentation.
  * When REGISTER_FI_USE_SAVED_SP_MICROFI is active, capture the stack pointer
  * right before each operator invoke() – this is the closest point to the
@@ -298,12 +337,22 @@ TfLiteStatus MicroInterpreterGraph::InvokeSubgraph(int subgraph_idx) {
 #endif
 
     TFLITE_DCHECK(registration->invoke);
-    microfi_before_op(static_cast<int>(current_operator_index_));
+    /* Hook dispatch is gated by the active op mask — see comment at
+     * the top of this file.  The compiler keeps the `should_dispatch`
+     * call as a single load + bit-test in the hot path because the
+     * helper is `always_inline`. */
+    const bool dispatch_hook =
+        microfi_should_dispatch(current_operator_index_);
+    if (dispatch_hook) {
+      microfi_before_op(static_cast<int>(current_operator_index_));
+    }
     /* MicroFI: capture SP immediately before the kernel invoke – this is
      * the tightest instrumentation point on the inference call path. */
     MICROFI_SAVE_SP_INLINE();
     invoke_status = registration->invoke(context_, node);
-    microfi_after_op(static_cast<int>(current_operator_index_));
+    if (dispatch_hook) {
+      microfi_after_op(static_cast<int>(current_operator_index_));
+    }
 #ifdef USE_TFLM_COMPRESSION
     GetMicroContext(context_)->ResetDecompressionMemoryAllocations();
 #endif  // USE_TFLM_COMPRESSION

@@ -23,6 +23,14 @@ extern void _fi_trampoline(void);
 volatile uint32_t g_fi_trampoline_mepc    = 0;
 volatile uint32_t g_fi_trampoline_sp_mask = 0;
 volatile uint32_t g_fi_trampoline_gp_mask = 0;
+
+/* Call-site gating globals — see `register_fi.h` for rationale.
+ * Defined here (instead of inside the anonymous namespace below) so
+ * `micro_interpreter_graph.cc` can read them with extern linkage and
+ * the TFLM loop can short-circuit the hook dispatch without paying
+ * for a function call to a no-op. */
+volatile uint32_t g_microfi_active_op_mask = 0u;
+volatile uint8_t  g_microfi_profile_all_ops = 0u;
 }
 
 namespace {
@@ -184,6 +192,21 @@ IRAM_ATTR uint32_t* resolve_register_slot(RvExcFrame* frame, uint8_t register_id
   return reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(frame) + offset);
 }
 
+/* Integer-only re-implementation of the slot-centre formula.  On RV32
+ * the float version compiled to soft-float library calls (`__mulsf3`,
+ * `__floatunsisf`, `__fixunssfsi`) totalling ~120 cycles per
+ * invocation; this version costs ~10 cycles and is bit-identical for
+ * the values the campaign uses today.
+ *
+ * The original semantics were
+ *   center  = (time_slot_index + 0.5) / slot_count
+ *   delay   = floor(mean_us * center)
+ * which is exactly
+ *   delay   = (mean_us * (2*time_slot_index + 1)) / (2*slot_count)
+ *
+ * The intermediate multiplication can overflow 32 bits when
+ * `mean_us` × `(2*time_slot_index + 1)` exceeds ~4.29e9, so the
+ * product is promoted to 64-bit only when necessary. */
 uint32_t compute_delay_us(register_fi_context_t* ctx, const register_fault_t* fault) {
   if (fault == nullptr) {
     return 0;
@@ -200,9 +223,13 @@ uint32_t compute_delay_us(register_fi_context_t* ctx, const register_fault_t* fa
     return 0;
   }
 
-  const uint32_t slot_count = fault->time_slot_count == 0 ? 1u : fault->time_slot_count;
-  const float center = (static_cast<float>(fault->time_slot_index) + 0.5f) / static_cast<float>(slot_count);
-  uint32_t delay_us = static_cast<uint32_t>(static_cast<float>(mean_us) * center);
+  const uint32_t slot_count = fault->time_slot_count == 0u ? 1u : fault->time_slot_count;
+  const uint32_t numerator = 2u * static_cast<uint32_t>(fault->time_slot_index) + 1u;
+  const uint32_t denominator = 2u * slot_count;
+
+  uint32_t delay_us = static_cast<uint32_t>(
+      (static_cast<uint64_t>(mean_us) * numerator) / denominator);
+
   if (delay_us < ctx->min_timer_delay_us) {
     delay_us = ctx->min_timer_delay_us;
   }
@@ -421,6 +448,11 @@ void register_fi_init(register_fi_context_t* ctx,
   ctx->current_delay_us = 0;
   ctx->last_injection_status = REGISTER_FI_IDLE;
   ctx->profiling_enabled = false;
+  ctx->active_fault_ptr = nullptr;
+  ctx->active_target_op = UINT32_MAX;
+  ctx->active_reg_mask = 0u;
+  g_microfi_active_op_mask = 0u;
+  g_microfi_profile_all_ops = 0u;
   for (uint32_t i = 0; i < kMaxTrackedOps; ++i) {
     ctx->op_start_time_us[i] = 0;
     ctx->op_profiles[i] = {0u, 0u, 0u};
@@ -486,6 +518,9 @@ void register_fi_deinit(register_fi_context_t* ctx) {
 void register_fi_set_profiling(register_fi_context_t* ctx, bool enabled) {
   if (ctx != nullptr) {
     ctx->profiling_enabled = enabled;
+    /* Profiling must observe every operator; flip the call-site gate
+     * so the TFLM loop dispatches both hooks unconditionally. */
+    g_microfi_profile_all_ops = enabled ? 1u : 0u;
   }
 }
 
@@ -501,6 +536,32 @@ void register_fi_begin_inference(register_fi_context_t* ctx, int32_t fault_index
   ctx->last_injection_status = REGISTER_FI_IDLE;
   ctx->permanent_active = false;
   ctx->permanent_original_bit = false;
+
+  /* Resolve the active fault once, so the per-operator hot path stays
+   * a single compare against `active_target_op` instead of a bounds
+   * check + array load + field access every time it fires. */
+  ctx->active_fault_ptr = nullptr;
+  ctx->active_target_op = UINT32_MAX;
+  ctx->active_reg_mask = 0u;
+  uint32_t op_mask = 0u;
+
+  if (fault_index >= 0 &&
+      static_cast<uint32_t>(fault_index) < ctx->fault_count) {
+    const register_fault_t* f = &ctx->fault_list[fault_index];
+    ctx->active_fault_ptr = f;
+    ctx->active_target_op = f->op_index;
+    ctx->active_reg_mask = 1u << f->bit_index;
+    if (f->op_index < 32u) {
+      op_mask = 1u << f->op_index;
+    } else {
+      /* Operator out of bitmask range — fall back to dispatching every
+       * hook so we never silently drop an injection.  The op-index
+       * domain in the campaigns to-date is <= 31, but keep the safety
+       * net to match the kMaxTrackedOps guard in `register_fi_before_op`. */
+      op_mask = 0xFFFFFFFFu;
+    }
+  }
+
 #ifdef MULTI_FI_MAX_COUNT
   ctx->op_fault_next_idx = 0;
   for (uint8_t i = 0; i < MULTI_FI_MAX_COUNT; ++i) {
@@ -508,7 +569,30 @@ void register_fi_begin_inference(register_fi_context_t* ctx, int32_t fault_index
     ctx->permanent_injected[i] = false;
     ctx->permanent_original_bits[i] = false;
   }
+  /* When a multi-fault group is armed, every operator that hosts at
+   * least one of its faults must run the slow path.  Build the union
+   * here so the TFLM loop short-circuits everywhere else. */
+  if (ctx->group_fault_count > 0u) {
+    op_mask = 0u;
+    for (uint8_t i = 0; i < ctx->group_fault_count; ++i) {
+      const register_fault_t* f = ctx->group_faults[i];
+      if (f != nullptr && f->op_index < 32u) {
+        op_mask |= (1u << f->op_index);
+      } else if (f != nullptr) {
+        op_mask = 0xFFFFFFFFu;
+      }
+    }
+  }
 #endif
+
+  /* Profiling needs every operator; respect that by keeping the mask
+   * fully on while profiling is active.  Otherwise expose the precise
+   * union computed above so the TFLM loop can skip non-target ops. */
+  if (g_microfi_profile_all_ops) {
+    g_microfi_active_op_mask = 0xFFFFFFFFu;
+  } else {
+    g_microfi_active_op_mask = op_mask;
+  }
 }
 
 void register_fi_end_inference(register_fi_context_t* ctx) {
@@ -531,22 +615,42 @@ void register_fi_end_inference(register_fi_context_t* ctx) {
   ctx->current_delay_us = 0;
   ctx->permanent_active = false;
   ctx->permanent_original_bit = false;
+  ctx->active_fault_ptr = nullptr;
+  ctx->active_target_op = UINT32_MAX;
+  ctx->active_reg_mask = 0u;
+  if (!g_microfi_profile_all_ops) {
+    g_microfi_active_op_mask = 0u;
+  }
 }
 
 /* Helper: arm the esp_timer and (when overhead accounting is on)
  * snapshot `arm_cycles` + the expected delay in cycles so the ISR can
- * later compute the context-switch portion of the per-injection cost. */
+ * later compute the context-switch portion of the per-injection cost.
+ *
+ * Also splits the `esp_timer_start_once` cost into a dedicated
+ * `timer_arm_cycles` accumulator.  Without that split it was
+ * impossible to tell whether the residual ~1k cycle gap to the
+ * microFI paper lived in the timer backend or in the hook dispatcher
+ * itself. */
 static inline bool arm_timer_with_accounting(register_fi_context_t* ctx,
                                              uint32_t delay_us) {
+  const uint32_t hz = g_fi_cpu_freq_hz;
+  uint32_t arm_start_cycle = 0u;
   if (ctx->overhead_enabled) {
-    const uint32_t hz = g_fi_cpu_freq_hz;
     ctx->arm_delay_cycles = (hz > 0u)
         ? static_cast<uint32_t>(static_cast<uint64_t>(delay_us) * hz / 1000000ull)
         : 0u;
     ctx->arm_cycles = fi_read_cycles();
+    arm_start_cycle = ctx->arm_cycles;
   }
   auto* timer = static_cast<esp_timer_handle_t>(ctx->timer_handle);
-  return esp_timer_start_once(timer, delay_us) == ESP_OK;
+  const bool ok = esp_timer_start_once(timer, delay_us) == ESP_OK;
+  if (ctx->overhead_enabled) {
+    const uint32_t arm_exit_cycle = fi_read_cycles();
+    ctx->overhead.timer_arm_cycles += (arm_exit_cycle - arm_start_cycle);
+    ctx->overhead.timer_arm_count  += 1u;
+  }
+  return ok;
 }
 
 /* Outlined slow path — only invoked when a fault is actually scheduled
@@ -687,13 +791,12 @@ void register_fi_before_op(register_fi_context_t* ctx, uint32_t op_index) {
     ctx->op_start_time_us[op_index] = static_cast<uint64_t>(esp_timer_get_time());
   }
 
-  /* FAST PATH — single load of `active_fault_index` + a couple of
-   * compares.  In the common case (the current op carries no fault),
-   * this is the only work the function does between the two cycle
-   * reads, so the per-hook tax stays close to the cost of two `csrr`
-   * plus an accumulator update.  The expensive multi-FI / permanent /
-   * timer-arming logic lives in `register_fi_before_op_slow`, kept
-   * out-of-line so its register pressure never bloats this wrapper. */
+  /* FAST PATH — now a single compare against the cached target op,
+   * plus one read each for the multi-FI / permanent-fault flags that
+   * also force the slow path.  When the TFLM call-site gate is on,
+   * this function is no longer even called for non-target operators,
+   * so the leftover work here is dominated by the two `csrr` reads
+   * for the cycle accumulator. */
   bool has_work = false;
 #ifdef MULTI_FI_MAX_COUNT
   if (ctx->group_fault_count > 0u) {
@@ -706,9 +809,8 @@ void register_fi_before_op(register_fi_context_t* ctx, uint32_t op_index) {
   }
 #endif
   if (!has_work) {
-    const int32_t fi = ctx->active_fault_index;
-    if (fi >= 0 && static_cast<uint32_t>(fi) < ctx->fault_count &&
-        ctx->fault_list[fi].op_index == op_index) {
+    if (ctx->active_fault_ptr != nullptr &&
+        ctx->active_target_op == op_index) {
       has_work = true;
     }
   }
@@ -719,8 +821,16 @@ void register_fi_before_op(register_fi_context_t* ctx, uint32_t op_index) {
 
   if (ctx->overhead_enabled) {
     const uint32_t exit_cycle = fi_read_cycles();
-    ctx->overhead.before_op_cycles += (exit_cycle - before_entry_cycle);
+    const uint32_t delta = exit_cycle - before_entry_cycle;
+    ctx->overhead.before_op_cycles += delta;
     ctx->overhead.before_op_count  += 1u;
+    if (has_work) {
+      ctx->overhead.before_slow_cycles += delta;
+      ctx->overhead.before_slow_count  += 1u;
+    } else {
+      ctx->overhead.before_fast_cycles += delta;
+      ctx->overhead.before_fast_count  += 1u;
+    }
   }
 }
 
@@ -743,8 +853,15 @@ void register_fi_after_op(register_fi_context_t* ctx, uint32_t op_index) {
     }
   }
 
+  /* Track whether this invocation actually touched the timer/state so
+   * the overhead accumulator can attribute the call to the fast or
+   * slow path. */
+  const bool was_active_op = (ctx->active_op_index == static_cast<int32_t>(op_index));
+  bool did_timer_stop = false;
+  uint32_t timer_stop_cycles = 0u;
+
   do {
-    if (ctx->active_op_index != static_cast<int32_t>(op_index)) {
+    if (!was_active_op) {
       break;
     }
 
@@ -752,8 +869,13 @@ void register_fi_after_op(register_fi_context_t* ctx, uint32_t op_index) {
     if (ctx->permanent_active) {
       if (ctx->timer_handle != nullptr && ctx->timer_armed) {
         auto* timer = static_cast<esp_timer_handle_t>(ctx->timer_handle);
+        const uint32_t stop_start = ctx->overhead_enabled ? fi_read_cycles() : 0u;
         if (esp_timer_is_active(timer)) {
           esp_timer_stop(timer);
+        }
+        if (ctx->overhead_enabled) {
+          timer_stop_cycles = fi_read_cycles() - stop_start;
+          did_timer_stop = true;
         }
         ctx->timer_armed = false;
       }
@@ -769,8 +891,13 @@ void register_fi_after_op(register_fi_context_t* ctx, uint32_t op_index) {
 
     if (ctx->timer_handle != nullptr && ctx->timer_armed) {
       auto* timer = static_cast<esp_timer_handle_t>(ctx->timer_handle);
+      const uint32_t stop_start = ctx->overhead_enabled ? fi_read_cycles() : 0u;
       if (esp_timer_is_active(timer)) {
         esp_timer_stop(timer);
+      }
+      if (ctx->overhead_enabled) {
+        timer_stop_cycles = fi_read_cycles() - stop_start;
+        did_timer_stop = true;
       }
       ctx->timer_armed = false;
       if (ctx->last_injection_status == REGISTER_FI_ARMED) {
@@ -788,8 +915,19 @@ void register_fi_after_op(register_fi_context_t* ctx, uint32_t op_index) {
 
   if (ctx->overhead_enabled) {
     const uint32_t exit_cycle = fi_read_cycles();
-    ctx->overhead.after_op_cycles += static_cast<uint32_t>(exit_cycle - after_entry_cycle);
+    const uint32_t delta = exit_cycle - after_entry_cycle;
+    ctx->overhead.after_op_cycles += delta;
     ctx->overhead.after_op_count  += 1u;
+    if (was_active_op) {
+      /* Slow after_op work is implicit in `after_op_cycles - after_fast_cycles`. */
+    } else {
+      ctx->overhead.after_fast_cycles += delta;
+      ctx->overhead.after_fast_count  += 1u;
+    }
+    if (did_timer_stop) {
+      ctx->overhead.timer_stop_cycles += timer_stop_cycles;
+      ctx->overhead.timer_stop_count  += 1u;
+    }
   }
 }
 

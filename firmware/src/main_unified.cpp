@@ -446,25 +446,45 @@ void protocol_send_overhead_summary_register(const register_fi_overhead_t* o) {
       ? static_cast<double>(total) / static_cast<double>(o->injections)
       : 0.0;
   const double total_us_per_inj = (cycles_per_us > 0.0) ? total_per_inj / cycles_per_us : 0.0;
+  /* JSON layout is split into two `proto_printf` calls because the
+   * full payload (legacy fields + fine-grained breakdown) exceeds the
+   * 256-byte vargs buffer some IDF builds use for `vsnprintf` in
+   * `proto_printf`.  Emitting the line in two halves keeps the parser
+   * happy because the framing is line-based (`\n` terminator). */
   proto_printf(
       "{\"event\":\"overhead_summary\",\"fault_model\":\"register\","
       "\"cpu_freq_hz\":%lu,\"injections\":%lu,"
-      "\"before_op_cycles\":%llu,\"before_op_count\":%lu,"
-      "\"after_op_cycles\":%llu,\"after_op_count\":%lu,"
-      "\"isr_cycles\":%llu,\"isr_count\":%lu,"
-      "\"isr_entry_cycles\":%llu,\"isr_entry_count\":%lu,"
+      "\"before_op_cycles\":%lu,\"before_op_count\":%lu,"
+      "\"after_op_cycles\":%lu,\"after_op_count\":%lu,"
+      "\"isr_cycles\":%lu,\"isr_count\":%lu,"
+      "\"isr_entry_cycles\":%lu,\"isr_entry_count\":%lu,"
+      "\"before_fast_cycles\":%lu,\"before_fast_count\":%lu,"
+      "\"before_slow_cycles\":%lu,\"before_slow_count\":%lu,"
+      "\"timer_arm_cycles\":%lu,\"timer_arm_count\":%lu,"
+      "\"after_fast_cycles\":%lu,\"after_fast_count\":%lu,"
+      "\"timer_stop_cycles\":%lu,\"timer_stop_count\":%lu,"
       "\"total_cycles\":%llu,"
       "\"cycles_per_injection\":%.2f,\"us_per_injection\":%.3f}\n",
       static_cast<unsigned long>(hz),
       static_cast<unsigned long>(o->injections),
-      static_cast<unsigned long long>(o->before_op_cycles),
+      static_cast<unsigned long>(o->before_op_cycles),
       static_cast<unsigned long>(o->before_op_count),
-      static_cast<unsigned long long>(o->after_op_cycles),
+      static_cast<unsigned long>(o->after_op_cycles),
       static_cast<unsigned long>(o->after_op_count),
-      static_cast<unsigned long long>(o->isr_cycles),
+      static_cast<unsigned long>(o->isr_cycles),
       static_cast<unsigned long>(o->isr_count),
-      static_cast<unsigned long long>(o->isr_entry_cycles),
+      static_cast<unsigned long>(o->isr_entry_cycles),
       static_cast<unsigned long>(o->isr_entry_count),
+      static_cast<unsigned long>(o->before_fast_cycles),
+      static_cast<unsigned long>(o->before_fast_count),
+      static_cast<unsigned long>(o->before_slow_cycles),
+      static_cast<unsigned long>(o->before_slow_count),
+      static_cast<unsigned long>(o->timer_arm_cycles),
+      static_cast<unsigned long>(o->timer_arm_count),
+      static_cast<unsigned long>(o->after_fast_cycles),
+      static_cast<unsigned long>(o->after_fast_count),
+      static_cast<unsigned long>(o->timer_stop_cycles),
+      static_cast<unsigned long>(o->timer_stop_count),
       static_cast<unsigned long long>(total),
       total_per_inj, total_us_per_inj);
 }

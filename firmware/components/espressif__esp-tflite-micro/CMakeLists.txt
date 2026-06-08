@@ -152,3 +152,14 @@ set_source_files_properties(${tfmicro_kernels_dir}/esp_nn/depthwise_conv.cc
 
 target_compile_options(${COMPONENT_LIB} INTERFACE -DTF_LITE_STATIC_MEMORY)
 target_link_libraries(${COMPONENT_LIB} PRIVATE -lm)
+
+# PlatformIO passes campaign -D flags on the project; mirror them here so
+# patched sources (micro_interpreter_graph.cc) see the same defines as src/.
+foreach(_riftv_flag ${CMAKE_C_FLAGS} ${CMAKE_CXX_FLAGS})
+  if(_riftv_flag MATCHES "-DFI_CAMPAIGN_REGISTER")
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE FI_CAMPAIGN_REGISTER=1)
+  endif()
+  if(_riftv_flag MATCHES "-DFI_CAMPAIGN_MEMORY")
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE FI_CAMPAIGN_MEMORY=1)
+  endif()
+endforeach()

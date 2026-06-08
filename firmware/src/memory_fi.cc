@@ -320,6 +320,11 @@ void memory_fi_clear_group(memory_fi_context_t* ctx) {
 // ---- Operator hooks for memory campaign ---------------------------------
 #if defined(FI_CAMPAIGN_MEMORY)
 
+/* Call-site gating in micro_interpreter_graph.cc — memory FI does not
+ * use per-op masks; keep hooks on every operator (mask all ones). */
+extern "C" volatile uint32_t g_microfi_active_op_mask = 0xFFFFFFFFu;
+extern "C" volatile uint8_t g_microfi_profile_all_ops = 0u;
+
 /* `flatten` collapses the wrapper + memory_fi_*_op into one leaf
  * function per hook, matching the register-FI optimization. */
 extern "C" __attribute__((hot, flatten)) void microfi_before_op(int op_index) {
