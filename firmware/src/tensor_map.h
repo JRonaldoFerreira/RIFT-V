@@ -9,16 +9,18 @@ typedef struct {
 } tensor_span_t;
 
 static const tensor_span_t g_tensor_map[] = {
-  {"sequential_1_1/global_average_pooling2d_1_1/Mean/reduction_indices", 1u, 26856u, 8u},
-  {"sequential_1_1/dense_3_1/BiasAdd", 2u, 26804u, 40u},
-  {"sequential_1_1/dense_3_1/MatMul", 3u, 26472u, 320u},
-  {"sequential_1_1/dense_2_1/Relu;sequential_1_1/dense_2_1/BiasAdd", 4u, 26332u, 128u},
-  {"sequential_1_1/dense_2_1/MatMul", 5u, 24272u, 2048u},
-  {"sequential_1_1/conv2d_5_1/Relu;sequential_1_1/conv2d_5_1/BiasAdd;sequential_1_1/conv2d_5_1/convolution;sequential_1_1/conv2d_5_1/Squeeze", 6u, 24004u, 256u},
-  {"sequential_1_1/conv2d_5_1/convolution", 7u, 5560u, 18432u},
-  {"sequential_1_1/conv2d_4_1/Relu;sequential_1_1/conv2d_4_1/BiasAdd;sequential_1_1/conv2d_4_1/convolution;sequential_1_1/conv2d_4_1/Squeeze", 8u, 5420u, 128u},
-  {"sequential_1_1/conv2d_4_1/convolution", 9u, 800u, 4608u},
-  {"sequential_1_1/conv2d_3_1/Relu;sequential_1_1/conv2d_3_1/BiasAdd;sequential_1_1/conv2d_3_1/convolution;sequential_1_1/conv2d_3_1/Squeeze", 10u, 724u, 64u},
-  {"sequential_1_1/conv2d_3_1/convolution", 11u, 568u, 144u},
+  {"LeNet5_MicroFI_like_1/Flatten_1/strided_slice/stack", 1u, 63184u, 4u},
+  {"arith.constant", 2u, 63168u, 4u},
+  {"LeNet5_MicroFI_like_1/Flatten_1/Reshape/shape/1", 3u, 63152u, 4u},
+  {"LeNet5_MicroFI_like_1/FC2_1/BiasAdd", 4u, 63100u, 40u},
+  {"LeNet5_MicroFI_like_1/FC2_1/MatMul", 5u, 62248u, 840u},
+  {"LeNet5_MicroFI_like_1/FC1_1/BiasAdd", 6u, 61900u, 336u},
+  {"LeNet5_MicroFI_like_1/FC1_1/MatMul", 7u, 51808u, 10080u},
+  {"LeNet5_MicroFI_like_1/Conv3_1/BiasAdd;LeNet5_MicroFI_like_1/Conv3_1/convolution;LeNet5_MicroFI_like_1/Conv3_1/Squeeze", 8u, 51316u, 480u},
+  {"LeNet5_MicroFI_like_1/Conv3_1/convolution", 9u, 3304u, 48000u},
+  {"LeNet5_MicroFI_like_1/Conv2_1/BiasAdd;LeNet5_MicroFI_like_1/Conv2_1/convolution;LeNet5_MicroFI_like_1/Conv2_1/Squeeze", 10u, 3228u, 64u},
+  {"LeNet5_MicroFI_like_1/Conv2_1/convolution", 11u, 816u, 2400u},
+  {"LeNet5_MicroFI_like_1/Conv1_1/BiasAdd;LeNet5_MicroFI_like_1/Conv1_1/convolution;LeNet5_MicroFI_like_1/Conv1_1/Squeeze", 12u, 780u, 24u},
+  {"LeNet5_MicroFI_like_1/Conv1_1/convolution", 13u, 616u, 150u},
 };
-static const uint32_t g_tensor_map_count = 11u;
+static const uint32_t g_tensor_map_count = 13u;

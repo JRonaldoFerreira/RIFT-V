@@ -549,52 +549,15 @@ static inline bool arm_timer_with_accounting(register_fi_context_t* ctx,
   return esp_timer_start_once(timer, delay_us) == ESP_OK;
 }
 
-void register_fi_before_op(register_fi_context_t* ctx, uint32_t op_index) {
-  if (ctx == nullptr || op_index >= kMaxTrackedOps) {
-    return;
-  }
-
-  const uint32_t before_entry_cycle = ctx->overhead_enabled ? fi_read_cycles() : 0u;
-
-  if (ctx->profiling_enabled) {
-    ctx->op_start_time_us[op_index] = static_cast<uint64_t>(esp_timer_get_time());
-  }
-
-  /* Body wrapped in do/while(0) so every early-exit path passes
-   * through a single accounting block below.  This keeps the overhead
-   * counter consistent across the multi-FI, permanent-fault and
-   * single-fault branches without sprinkling exit-accounting at
-   * every `return`. */
-  do {
-  /* FAST PATH — detect "no work for this op" and break out before
-   * touching any expensive state.  This is the common case during a
-   * fault-injection campaign: a single inference fires ~16 hook calls
-   * but only one of them targets the faulted operator.  Making the
-   * remaining 15 calls cheap is what brings the per-injection cost
-   * close to microFI's reported 1300 cycles. */
-  {
-    bool has_work = false;
-#ifdef MULTI_FI_MAX_COUNT
-    if (ctx->group_fault_count > 0u) {
-      has_work = true;
-    }
-#endif
-#if !defined(FI_FAULT_TRANSIENT)
-    if (ctx->permanent_active) {
-      has_work = true;
-    }
-#endif
-    if (!has_work) {
-      const int32_t fi = ctx->active_fault_index;
-      if (fi < 0 || static_cast<uint32_t>(fi) >= ctx->fault_count) {
-        break;
-      }
-      if (ctx->fault_list[fi].op_index != op_index) {
-        break;
-      }
-    }
-  }
-
+/* Outlined slow path — only invoked when a fault is actually scheduled
+ * for the current operator.  `noinline` keeps its register pressure
+ * (multi-FI sorting, timer arming, permanent-fault bookkeeping) out of
+ * the hot wrapper below, which is called ~16× per inference but does
+ * real work only once.  Result: the wrapper's prologue/epilogue is
+ * dominated by the cheap leaf path. */
+namespace {
+__attribute__((noinline)) static void register_fi_before_op_slow(
+    register_fi_context_t* ctx, uint32_t op_index) {
 #ifdef MULTI_FI_MAX_COUNT
   if (ctx->group_fault_count > 0) {
     ctx->op_fault_count = 0;
@@ -629,7 +592,7 @@ void register_fi_before_op(register_fi_context_t* ctx, uint32_t op_index) {
 #endif
 
     if (!has_faults || ctx->timer_handle == nullptr) {
-      break;
+      return;
     }
 
     // Insertion-sort op_faults by delay (ascending) so the ISR can
@@ -656,7 +619,7 @@ void register_fi_before_op(register_fi_context_t* ctx, uint32_t op_index) {
       first_delay = ctx->min_timer_delay_us;
       if (first_delay == 0u) {
         ctx->last_injection_status = REGISTER_FI_TIMING_WINDOW_TOO_SHORT;
-        break;
+        return;
       }
     }
 
@@ -667,7 +630,7 @@ void register_fi_before_op(register_fi_context_t* ctx, uint32_t op_index) {
     } else {
       ctx->last_injection_status = REGISTER_FI_TIMER_NOT_FIRED;
     }
-    break;
+    return;
   }
 #endif
 
@@ -680,13 +643,13 @@ void register_fi_before_op(register_fi_context_t* ctx, uint32_t op_index) {
       ctx->timer_armed = true;
       ctx->last_injection_status = REGISTER_FI_ARMED;
     }
-    break;
+    return;
   }
 #endif
 
   const register_fault_t* fault = current_fault(ctx);
   if (fault == nullptr || fault->op_index != op_index || ctx->timer_handle == nullptr) {
-    break;
+    return;
   }
 
   uint32_t delay_us = compute_delay_us(ctx, fault);
@@ -700,7 +663,7 @@ void register_fi_before_op(register_fi_context_t* ctx, uint32_t op_index) {
       ctx->current_delay_us = delay_us;
     } else {
       ctx->last_injection_status = REGISTER_FI_TIMING_WINDOW_TOO_SHORT;
-      break;
+      return;
     }
   }
 
@@ -710,11 +673,53 @@ void register_fi_before_op(register_fi_context_t* ctx, uint32_t op_index) {
   } else {
     ctx->last_injection_status = REGISTER_FI_TIMER_NOT_FIRED;
   }
-  } while (0);
+}
+}  // namespace
+
+void register_fi_before_op(register_fi_context_t* ctx, uint32_t op_index) {
+  if (ctx == nullptr || op_index >= kMaxTrackedOps) {
+    return;
+  }
+
+  const uint32_t before_entry_cycle = ctx->overhead_enabled ? fi_read_cycles() : 0u;
+
+  if (ctx->profiling_enabled) {
+    ctx->op_start_time_us[op_index] = static_cast<uint64_t>(esp_timer_get_time());
+  }
+
+  /* FAST PATH — single load of `active_fault_index` + a couple of
+   * compares.  In the common case (the current op carries no fault),
+   * this is the only work the function does between the two cycle
+   * reads, so the per-hook tax stays close to the cost of two `csrr`
+   * plus an accumulator update.  The expensive multi-FI / permanent /
+   * timer-arming logic lives in `register_fi_before_op_slow`, kept
+   * out-of-line so its register pressure never bloats this wrapper. */
+  bool has_work = false;
+#ifdef MULTI_FI_MAX_COUNT
+  if (ctx->group_fault_count > 0u) {
+    has_work = true;
+  }
+#endif
+#if !defined(FI_FAULT_TRANSIENT)
+  if (ctx->permanent_active) {
+    has_work = true;
+  }
+#endif
+  if (!has_work) {
+    const int32_t fi = ctx->active_fault_index;
+    if (fi >= 0 && static_cast<uint32_t>(fi) < ctx->fault_count &&
+        ctx->fault_list[fi].op_index == op_index) {
+      has_work = true;
+    }
+  }
+
+  if (has_work) {
+    register_fi_before_op_slow(ctx, op_index);
+  }
 
   if (ctx->overhead_enabled) {
     const uint32_t exit_cycle = fi_read_cycles();
-    ctx->overhead.before_op_cycles += static_cast<uint32_t>(exit_cycle - before_entry_cycle);
+    ctx->overhead.before_op_cycles += (exit_cycle - before_entry_cycle);
     ctx->overhead.before_op_count  += 1u;
   }
 }
@@ -910,13 +915,17 @@ void register_fi_clear_group(register_fi_context_t* ctx) {
 }
 #endif
 
-extern "C" void microfi_before_op(int op_index) {
+/* `flatten` asks the compiler to inline every call in the body — with
+ * the slow path already outlined via `noinline`, this collapses the
+ * TFLM-facing wrapper + the per-op hook into a single hot leaf
+ * function, eliminating one frame setup per hook invocation. */
+extern "C" __attribute__((hot, flatten)) void microfi_before_op(int op_index) {
   if (g_ctx != nullptr && op_index >= 0) {
     register_fi_before_op(g_ctx, static_cast<uint32_t>(op_index));
   }
 }
 
-extern "C" void microfi_after_op(int op_index) {
+extern "C" __attribute__((hot, flatten)) void microfi_after_op(int op_index) {
   if (g_ctx != nullptr && op_index >= 0) {
     register_fi_after_op(g_ctx, static_cast<uint32_t>(op_index));
   }

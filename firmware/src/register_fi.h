@@ -78,14 +78,20 @@ typedef struct {
  * `injections` counts the number of bit-flips actually applied during
  * the campaign, so the per-injection averages are simply
  * `total_cycles / injections`. */
+/* Counters are 32-bit (not 64-bit) to keep the per-hook accumulator
+ * update down to a single load/add/store on RV32 — 64-bit adds compile
+ * to 6+ instructions plus an `sltu` for carry, which alone accounts for
+ * ~10 cycles of every hook invocation on the C6.  At 160 MHz, even
+ * 4 billion cycles is only ~25 s, which is far longer than any single
+ * fault-injection campaign run between resets. */
 typedef struct {
-  uint64_t before_op_cycles;
+  uint32_t before_op_cycles;
   uint32_t before_op_count;
-  uint64_t after_op_cycles;
+  uint32_t after_op_cycles;
   uint32_t after_op_count;
-  uint64_t isr_cycles;
+  uint32_t isr_cycles;
   uint32_t isr_count;
-  uint64_t isr_entry_cycles;
+  uint32_t isr_entry_cycles;
   uint32_t isr_entry_count;
   uint32_t injections;
 } register_fi_overhead_t;

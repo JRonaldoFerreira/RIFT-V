@@ -28,10 +28,12 @@ typedef struct {
  * flip happens directly inside `memory_fi_before_op`), so the
  * accounting is simpler than the register path: there is no ISR
  * dispatch latency and no separate timer cost. */
+/* 32-bit counters: same rationale as register_fi_overhead_t.  Saves a
+ * uint64 read-modify-write per hook call on RV32. */
 typedef struct {
-  uint64_t before_op_cycles;
+  uint32_t before_op_cycles;
   uint32_t before_op_count;
-  uint64_t after_op_cycles;
+  uint32_t after_op_cycles;
   uint32_t after_op_count;
   uint32_t injections;
 } memory_fi_overhead_t;

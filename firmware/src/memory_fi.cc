@@ -94,37 +94,14 @@ static inline void _force_stuck_bit(uint8_t* addr, uint8_t original_byte,
   }
 }
 
-void memory_fi_before_op(memory_fi_context_t* ctx, uint32_t op_index) {
-  if (ctx == nullptr) {
-    return;
-  }
-
-  const uint32_t entry_cycle = ctx->overhead_enabled ? fi_read_cycles() : 0u;
+/* Outlined memory-FI slow path — same rationale as register_fi: keep
+ * the hot wrapper's prologue minimal so the per-hook tax is dominated
+ * by the cycle reads + accumulator update, not by stacking unused
+ * callee-saved registers. */
+namespace {
+__attribute__((noinline)) static uint32_t memory_fi_before_op_slow(
+    memory_fi_context_t* ctx, uint32_t op_index) {
   uint32_t injected_now = 0u;
-
-  do {
-  /* FAST PATH — same rationale as register_fi: during a single
-   * inference only one operator carries a scheduled fault, so the
-   * remaining ~15 hook calls must be as cheap as possible to keep the
-   * per-injection overhead comparable to microFI. */
-  {
-    bool has_work = false;
-#ifdef MULTI_FI_MAX_COUNT
-    if (ctx->group_fault_count > 0u) {
-      has_work = true;
-    }
-#endif
-    if (!has_work) {
-      const int32_t fi = ctx->active_fault_index;
-      if (fi < 0 || static_cast<uint32_t>(fi) >= ctx->fault_count) {
-        break;
-      }
-      const uint32_t target_op = ctx->fault_list[fi].op_index;
-      if (target_op != op_index && target_op != FI_OP_INDEX_WILDCARD) {
-        break;
-      }
-    }
-  }
 
 #ifdef MULTI_FI_MAX_COUNT
   if (ctx->group_fault_count > 0) {
@@ -157,13 +134,13 @@ void memory_fi_before_op(memory_fi_context_t* ctx, uint32_t op_index) {
       ctx->injected_this_inference = true;
       injected_now += 1u;
     }
-    break;
+    return injected_now;
   }
 #endif
 
   if (ctx->active_fault_index < 0 ||
       static_cast<uint32_t>(ctx->active_fault_index) >= ctx->fault_count) {
-    break;
+    return injected_now;
   }
   const memory_fault_t* fault = &ctx->fault_list[ctx->active_fault_index];
 
@@ -175,12 +152,11 @@ void memory_fi_before_op(memory_fi_context_t* ctx, uint32_t op_index) {
     }
     _force_stuck_bit(addr, ctx->saved_original_byte, fault->bit_index);
     ctx->injected_this_inference = true;
-    injected_now += 1u;
-    break;
+    return injected_now + 1u;
   }
 
   if (fault->op_index != op_index) {
-    break;
+    return injected_now;
   }
 
   uint8_t* addr = memory_fi_resolve_addr(ctx, fault);
@@ -188,12 +164,44 @@ void memory_fi_before_op(memory_fi_context_t* ctx, uint32_t op_index) {
   *addr ^= static_cast<uint8_t>(1u << fault->bit_index);
   ctx->injection_active = true;
   ctx->injected_this_inference = true;
-  injected_now += 1u;
-  } while (0);
+  return injected_now + 1u;
+}
+}  // namespace
+
+void memory_fi_before_op(memory_fi_context_t* ctx, uint32_t op_index) {
+  if (ctx == nullptr) {
+    return;
+  }
+
+  const uint32_t entry_cycle = ctx->overhead_enabled ? fi_read_cycles() : 0u;
+
+  /* FAST PATH — bail out before any expensive work when no fault is
+   * scheduled for this operator (the common case: ~15 of every 16
+   * hook calls). */
+  bool has_work = false;
+#ifdef MULTI_FI_MAX_COUNT
+  if (ctx->group_fault_count > 0u) {
+    has_work = true;
+  }
+#endif
+  if (!has_work) {
+    const int32_t fi = ctx->active_fault_index;
+    if (fi >= 0 && static_cast<uint32_t>(fi) < ctx->fault_count) {
+      const uint32_t target_op = ctx->fault_list[fi].op_index;
+      if (target_op == op_index || target_op == FI_OP_INDEX_WILDCARD) {
+        has_work = true;
+      }
+    }
+  }
+
+  uint32_t injected_now = 0u;
+  if (has_work) {
+    injected_now = memory_fi_before_op_slow(ctx, op_index);
+  }
 
   if (ctx->overhead_enabled) {
     const uint32_t exit_cycle = fi_read_cycles();
-    ctx->overhead.before_op_cycles += static_cast<uint32_t>(exit_cycle - entry_cycle);
+    ctx->overhead.before_op_cycles += (exit_cycle - entry_cycle);
     ctx->overhead.before_op_count  += 1u;
     ctx->overhead.injections       += injected_now;
   }
@@ -312,7 +320,9 @@ void memory_fi_clear_group(memory_fi_context_t* ctx) {
 // ---- Operator hooks for memory campaign ---------------------------------
 #if defined(FI_CAMPAIGN_MEMORY)
 
-extern "C" void microfi_before_op(int op_index) {
+/* `flatten` collapses the wrapper + memory_fi_*_op into one leaf
+ * function per hook, matching the register-FI optimization. */
+extern "C" __attribute__((hot, flatten)) void microfi_before_op(int op_index) {
 #if defined(FI_FAULT_TRANSIENT)
   if (g_memory_ctx != nullptr && op_index >= 0) {
     memory_fi_before_op(g_memory_ctx, static_cast<uint32_t>(op_index));
@@ -322,7 +332,7 @@ extern "C" void microfi_before_op(int op_index) {
 #endif
 }
 
-extern "C" void microfi_after_op(int op_index) {
+extern "C" __attribute__((hot, flatten)) void microfi_after_op(int op_index) {
 #if defined(FI_FAULT_TRANSIENT)
   if (g_memory_ctx != nullptr && op_index >= 0) {
     memory_fi_after_op(g_memory_ctx, static_cast<uint32_t>(op_index));
