@@ -17,6 +17,7 @@
 
 #include "model_data.h"
 #include "mnist_subset.h"
+#include "fi_cycles.h"
 
 #if defined(FI_CAMPAIGN_REGISTER) && defined(FI_CAMPAIGN_MEMORY)
 #error "Define only one campaign: FI_CAMPAIGN_REGISTER or FI_CAMPAIGN_MEMORY"
@@ -434,6 +435,108 @@ void protocol_send_done(void) {
   proto_printf("{\"event\":\"done\"}\n");
 }
 
+#if defined(FI_CAMPAIGN_REGISTER)
+void protocol_send_overhead_summary_register(const register_fi_overhead_t* o) {
+  if (o == nullptr) return;
+  const uint32_t hz = g_fi_cpu_freq_hz ? g_fi_cpu_freq_hz : 1u;
+  const double cycles_per_us = static_cast<double>(hz) / 1e6;
+  const uint64_t total = o->before_op_cycles + o->after_op_cycles +
+                         o->isr_cycles + o->isr_entry_cycles;
+  const double total_per_inj = (o->injections > 0u)
+      ? static_cast<double>(total) / static_cast<double>(o->injections)
+      : 0.0;
+  const double total_us_per_inj = (cycles_per_us > 0.0) ? total_per_inj / cycles_per_us : 0.0;
+  proto_printf(
+      "{\"event\":\"overhead_summary\",\"fault_model\":\"register\","
+      "\"cpu_freq_hz\":%lu,\"injections\":%lu,"
+      "\"before_op_cycles\":%llu,\"before_op_count\":%lu,"
+      "\"after_op_cycles\":%llu,\"after_op_count\":%lu,"
+      "\"isr_cycles\":%llu,\"isr_count\":%lu,"
+      "\"isr_entry_cycles\":%llu,\"isr_entry_count\":%lu,"
+      "\"total_cycles\":%llu,"
+      "\"cycles_per_injection\":%.2f,\"us_per_injection\":%.3f}\n",
+      static_cast<unsigned long>(hz),
+      static_cast<unsigned long>(o->injections),
+      static_cast<unsigned long long>(o->before_op_cycles),
+      static_cast<unsigned long>(o->before_op_count),
+      static_cast<unsigned long long>(o->after_op_cycles),
+      static_cast<unsigned long>(o->after_op_count),
+      static_cast<unsigned long long>(o->isr_cycles),
+      static_cast<unsigned long>(o->isr_count),
+      static_cast<unsigned long long>(o->isr_entry_cycles),
+      static_cast<unsigned long>(o->isr_entry_count),
+      static_cast<unsigned long long>(total),
+      total_per_inj, total_us_per_inj);
+}
+#endif
+
+#if defined(FI_CAMPAIGN_MEMORY)
+void protocol_send_overhead_summary_memory(const memory_fi_overhead_t* o) {
+  if (o == nullptr) return;
+  const uint32_t hz = g_fi_cpu_freq_hz ? g_fi_cpu_freq_hz : 1u;
+  const double cycles_per_us = static_cast<double>(hz) / 1e6;
+  const uint64_t total = o->before_op_cycles + o->after_op_cycles;
+  const double total_per_inj = (o->injections > 0u)
+      ? static_cast<double>(total) / static_cast<double>(o->injections)
+      : 0.0;
+  const double total_us_per_inj = (cycles_per_us > 0.0) ? total_per_inj / cycles_per_us : 0.0;
+  proto_printf(
+      "{\"event\":\"overhead_summary\",\"fault_model\":\"memory\","
+      "\"cpu_freq_hz\":%lu,\"injections\":%lu,"
+      "\"before_op_cycles\":%llu,\"before_op_count\":%lu,"
+      "\"after_op_cycles\":%llu,\"after_op_count\":%lu,"
+      "\"total_cycles\":%llu,"
+      "\"cycles_per_injection\":%.2f,\"us_per_injection\":%.3f}\n",
+      static_cast<unsigned long>(hz),
+      static_cast<unsigned long>(o->injections),
+      static_cast<unsigned long long>(o->before_op_cycles),
+      static_cast<unsigned long>(o->before_op_count),
+      static_cast<unsigned long long>(o->after_op_cycles),
+      static_cast<unsigned long>(o->after_op_count),
+      static_cast<unsigned long long>(total),
+      total_per_inj, total_us_per_inj);
+}
+#endif
+
+void protocol_send_overhead_calibration(const char* fault_model,
+                                        int32_t fault_idx,
+                                        int32_t image_id,
+                                        uint32_t reps,
+                                        uint64_t baseline_cycles_total,
+                                        uint64_t fi_cycles_total,
+                                        uint32_t baseline_injections,
+                                        uint32_t fi_injections) {
+  const uint32_t hz = g_fi_cpu_freq_hz ? g_fi_cpu_freq_hz : 1u;
+  const double cycles_per_us = static_cast<double>(hz) / 1e6;
+  const double baseline_per_inf = static_cast<double>(baseline_cycles_total) / static_cast<double>(reps);
+  const double fi_per_inf = static_cast<double>(fi_cycles_total) / static_cast<double>(reps);
+  const double delta_per_inf = fi_per_inf - baseline_per_inf;
+  const uint32_t inj_per_inf = (fi_injections + reps - 1u) / reps;  /* ceil */
+  const double per_inj = (inj_per_inf > 0u)
+      ? delta_per_inf / static_cast<double>(inj_per_inf)
+      : delta_per_inf;
+  const double per_inj_us = (cycles_per_us > 0.0) ? per_inj / cycles_per_us : 0.0;
+  proto_printf(
+      "{\"event\":\"overhead_calibration\",\"fault_model\":\"%s\","
+      "\"fault_id\":%ld,\"image_id\":%ld,\"reps\":%lu,\"cpu_freq_hz\":%lu,"
+      "\"baseline_cycles_total\":%llu,\"fi_cycles_total\":%llu,"
+      "\"baseline_cycles_per_inference\":%.2f,\"fi_cycles_per_inference\":%.2f,"
+      "\"delta_cycles_per_inference\":%.2f,"
+      "\"baseline_injections\":%lu,\"fi_injections\":%lu,"
+      "\"injections_per_inference\":%lu,"
+      "\"cycles_per_injection\":%.2f,\"us_per_injection\":%.3f}\n",
+      fault_model,
+      static_cast<long>(fault_idx), static_cast<long>(image_id),
+      static_cast<unsigned long>(reps), static_cast<unsigned long>(hz),
+      static_cast<unsigned long long>(baseline_cycles_total),
+      static_cast<unsigned long long>(fi_cycles_total),
+      baseline_per_inf, fi_per_inf, delta_per_inf,
+      static_cast<unsigned long>(baseline_injections),
+      static_cast<unsigned long>(fi_injections),
+      static_cast<unsigned long>(inj_per_inf),
+      per_inj, per_inj_us);
+}
+
 }  // extern "C"
 
 // -------------------------------------------------------------------
@@ -445,6 +548,8 @@ enum FiCommand {
   FI_CMD_RUN_GOLDEN,
   FI_CMD_SKIP_GOLDEN,
   FI_CMD_RUN_JOB,
+  FI_CMD_MEASURE_OVERHEAD,
+  FI_CMD_GET_OVERHEAD,
   FI_CMD_DONE,
 };
 
@@ -452,6 +557,7 @@ struct FiCommandData {
   FiCommand type;
   int32_t fault_idx;
   int32_t image_id;
+  int32_t reps;
 };
 
 static int32_t json_extract_int(const char* json, const char* key) {
@@ -472,6 +578,7 @@ static FiCommandData parse_command(const char* line) {
   cmd.type = FI_CMD_UNKNOWN;
   cmd.fault_idx = -1;
   cmd.image_id = -1;
+  cmd.reps = 0;
   if (strstr(line, "\"skip_golden\"")) {
     cmd.type = FI_CMD_SKIP_GOLDEN;
   } else if (strstr(line, "\"run_golden\"")) {
@@ -480,6 +587,14 @@ static FiCommandData parse_command(const char* line) {
     cmd.type = FI_CMD_RUN_JOB;
     cmd.fault_idx = json_extract_int(line, "fi");
     cmd.image_id = json_extract_int(line, "img");
+  } else if (strstr(line, "\"measure_overhead\"")) {
+    cmd.type = FI_CMD_MEASURE_OVERHEAD;
+    cmd.fault_idx = json_extract_int(line, "fi");
+    cmd.image_id = json_extract_int(line, "img");
+    cmd.reps = json_extract_int(line, "reps");
+    if (cmd.reps <= 0) cmd.reps = 50;
+  } else if (strstr(line, "\"get_overhead\"")) {
+    cmd.type = FI_CMD_GET_OVERHEAD;
   } else if (strstr(line, "\"done\"")) {
     cmd.type = FI_CMD_DONE;
   }
@@ -511,6 +626,7 @@ static int protocol_read_line(char* buf, size_t bufsize) {
 extern "C" void app_main(void) {
   protocol_init_uart();
   setvbuf(stdout, NULL, _IOLBF, 256);
+  fi_cycles_init();
   vTaskDelay(pdMS_TO_TICKS(1500));
 
   // ---- Allocate and load model BEFORE announcing boot ----
@@ -578,10 +694,12 @@ extern "C" void app_main(void) {
 #if defined(FI_CAMPAIGN_REGISTER)
   register_fi_init(&g_register_fi_ctx, g_fault_list, g_fault_list_count, kRegisterTimerMinDelayUs,
                    kRegisterTimerGuardUs);
+  register_fi_set_overhead_enabled(&g_register_fi_ctx, true);
 #endif
 
 #if defined(FI_CAMPAIGN_MEMORY)
   memory_fi_init(&g_memory_fi_ctx, g_model_ram, g_fault_list, g_fault_list_count);
+  memory_fi_set_overhead_enabled(&g_memory_fi_ctx, true);
   ESP_LOGI(kTag, "Tensor map entries: %lu", static_cast<unsigned long>(g_tensor_map_count));
 #endif
 
@@ -594,9 +712,10 @@ extern "C" void app_main(void) {
   // ---- Announce boot (neutral — firmware does NOT decide to resume) ----
   protocol_send_boot();
 
-  proto_printf("{\"event\":\"arena_info\",\"arena_size\":%lu,\"arena_used\":%lu}\n",
+  proto_printf("{\"event\":\"arena_info\",\"arena_size\":%lu,\"arena_used\":%lu,\"cpu_freq_hz\":%lu}\n",
                static_cast<unsigned long>(g_tensor_arena_size),
-               static_cast<unsigned long>(arena_used));
+               static_cast<unsigned long>(arena_used),
+               static_cast<unsigned long>(g_fi_cpu_freq_hz));
 
 #if defined(FI_CAMPAIGN_MEMORY)
   proto_printf("{\"event\":\"memory_map\","
@@ -646,6 +765,17 @@ extern "C" void app_main(void) {
         if (samples == 0u || mean_us == 0u) continue;
         protocol_send_operator_profile(op_index, g_register_op_names[i].op_name, mean_us, samples);
       }
+      /* Reset overhead accumulators so the final `overhead_summary`
+       * only reflects the fault-injection phase.  During the golden
+       * phase each `register_fi_before_op` call also performs an
+       * `esp_timer_get_time()` (profiling) which inflates the
+       * accumulator with cycles that are unrelated to fault
+       * injection — the microFI paper's "per injection" figure
+       * intentionally excludes that monitoring noise. */
+      register_fi_reset_overhead(&g_register_fi_ctx);
+#endif
+#if defined(FI_CAMPAIGN_MEMORY)
+      memory_fi_reset_overhead(&g_memory_fi_ctx);
 #endif
 
       golden_done = true;
@@ -821,8 +951,171 @@ extern "C" void app_main(void) {
       continue;
     }
 
+    // ---- get_overhead: emit aggregate overhead snapshot ----
+    if (cmd.type == FI_CMD_GET_OVERHEAD) {
+#if defined(FI_CAMPAIGN_REGISTER)
+      register_fi_overhead_t snap{};
+      register_fi_get_overhead(&g_register_fi_ctx, &snap);
+      protocol_send_overhead_summary_register(&snap);
+#elif defined(FI_CAMPAIGN_MEMORY)
+      memory_fi_overhead_t snap{};
+      memory_fi_get_overhead(&g_memory_fi_ctx, &snap);
+      protocol_send_overhead_summary_memory(&snap);
+#endif
+      continue;
+    }
+
+    // ---- measure_overhead: microFI-style calibration ---------------
+    // Runs `reps` baseline inferences (no fault injection) and `reps`
+    // inferences with the supplied fault, then reports the delta in
+    // CPU cycles per injection.  This is the number directly
+    // comparable to the microFI paper's "~1300 cycles / 8.1 µs per
+    // injection" figure.
+    if (cmd.type == FI_CMD_MEASURE_OVERHEAD) {
+      const int32_t fi = cmd.fault_idx;
+      int32_t img = cmd.image_id;
+      if (img < 0) img = 0;
+      if (static_cast<uint32_t>(img) >= kNumCampaignImages) img = 0;
+      const uint32_t reps = static_cast<uint32_t>(cmd.reps);
+      const float* image_ptr = &g_mnist_images[img * image_size];
+
+      ESP_LOGI(kTag, "Overhead calibration: fault=%ld img=%ld reps=%lu",
+               static_cast<long>(fi), static_cast<long>(img),
+               static_cast<unsigned long>(reps));
+
+      uint64_t baseline_cycles = 0u;
+      uint64_t fi_cycles = 0u;
+      uint32_t baseline_injections_before = 0u;
+      uint32_t fi_injections_before = 0u;
+      uint32_t baseline_injections_after = 0u;
+      uint32_t fi_injections_after = 0u;
+
+#if defined(FI_CAMPAIGN_REGISTER)
+      {
+        register_fi_overhead_t snap{};
+        register_fi_get_overhead(&g_register_fi_ctx, &snap);
+        baseline_injections_before = snap.injections;
+      }
+#endif
+#if defined(FI_CAMPAIGN_MEMORY)
+      {
+        memory_fi_overhead_t snap{};
+        memory_fi_get_overhead(&g_memory_fi_ctx, &snap);
+        baseline_injections_before = snap.injections;
+      }
+#endif
+
+      /* Phase A — baseline (no FI). Reuses the standard run_inference
+       * codepath with fault_index = -1 so the hooks early-out and the
+       * timer is never armed. */
+      for (uint32_t r = 0; r < reps; ++r) {
+        const uint32_t t0 = fi_read_cycles();
+#if defined(FI_CAMPAIGN_REGISTER)
+        (void)run_inference(&interpreter, image_ptr, image_size, -1);
+#elif defined(FI_CAMPAIGN_MEMORY)
+        (void)run_inference(&interpreter, image_ptr, image_size, -1);
+#endif
+        const uint32_t t1 = fi_read_cycles();
+        baseline_cycles += static_cast<uint64_t>(t1 - t0);
+      }
+
+#if defined(FI_CAMPAIGN_REGISTER)
+      {
+        register_fi_overhead_t snap{};
+        register_fi_get_overhead(&g_register_fi_ctx, &snap);
+        baseline_injections_after = snap.injections;
+        fi_injections_before = snap.injections;
+      }
+#endif
+#if defined(FI_CAMPAIGN_MEMORY)
+      {
+        memory_fi_overhead_t snap{};
+        memory_fi_get_overhead(&g_memory_fi_ctx, &snap);
+        baseline_injections_after = snap.injections;
+        fi_injections_before = snap.injections;
+      }
+#endif
+
+      /* Phase B — same inferences, this time with the chosen fault.
+       * For Memory-FI the bit-flip is applied around `Invoke`, so we
+       * must build a fresh model copy each rep to guarantee the byte
+       * is restored — `run_inference` already does that internally. */
+#if defined(FI_CAMPAIGN_REGISTER)
+      if (fi >= 0 && static_cast<uint32_t>(fi) < g_fault_list_count) {
+        const tflite::Model* fi_model = tflite::GetModel(g_model_data);
+        tflite::MicroInterpreter fi_interp(fi_model, resolver, g_tensor_arena, g_tensor_arena_size);
+        if (fi_interp.AllocateTensors() == kTfLiteOk) {
+          for (uint32_t r = 0; r < reps; ++r) {
+            const uint32_t t0 = fi_read_cycles();
+            (void)run_inference(&fi_interp, image_ptr, image_size, fi);
+            const uint32_t t1 = fi_read_cycles();
+            fi_cycles += static_cast<uint64_t>(t1 - t0);
+            esp_task_wdt_reset();
+          }
+        }
+      }
+#endif
+#if defined(FI_CAMPAIGN_MEMORY)
+      if (fi >= 0 && static_cast<uint32_t>(fi) < g_fault_list_count) {
+        for (uint32_t r = 0; r < reps; ++r) {
+          memcpy(g_model_ram, g_model_data, g_model_data_len);
+          const uint32_t t0 = fi_read_cycles();
+          (void)run_inference(&interpreter, image_ptr, image_size, fi);
+          const uint32_t t1 = fi_read_cycles();
+          fi_cycles += static_cast<uint64_t>(t1 - t0);
+          esp_task_wdt_reset();
+        }
+      }
+#endif
+
+#if defined(FI_CAMPAIGN_REGISTER)
+      {
+        register_fi_overhead_t snap{};
+        register_fi_get_overhead(&g_register_fi_ctx, &snap);
+        fi_injections_after = snap.injections;
+        protocol_send_overhead_calibration(
+            "register", fi, img, reps, baseline_cycles, fi_cycles,
+            baseline_injections_after - baseline_injections_before,
+            fi_injections_after - fi_injections_before);
+        protocol_send_overhead_summary_register(&snap);
+      }
+#endif
+#if defined(FI_CAMPAIGN_MEMORY)
+      {
+        memory_fi_overhead_t snap{};
+        memory_fi_get_overhead(&g_memory_fi_ctx, &snap);
+        fi_injections_after = snap.injections;
+        protocol_send_overhead_calibration(
+            "memory", fi, img, reps, baseline_cycles, fi_cycles,
+            baseline_injections_after - baseline_injections_before,
+            fi_injections_after - fi_injections_before);
+        protocol_send_overhead_summary_memory(&snap);
+      }
+#endif
+      continue;
+    }
+
     // ---- done: host signals campaign end ----
     if (cmd.type == FI_CMD_DONE) {
+      /* Silence ESP-IDF logging on the campaign UART before emitting
+       * the final structured events.  Otherwise FreeRTOS / esp_log
+       * messages (e.g. "Returned from app_main()") can interleave with
+       * the last `proto_printf` and corrupt the JSON line — the host
+       * then drops the whole overhead_summary as "Non-JSON". */
+      esp_log_level_set("*", ESP_LOG_NONE);
+#if defined(FI_CAMPAIGN_REGISTER)
+      {
+        register_fi_overhead_t snap{};
+        register_fi_get_overhead(&g_register_fi_ctx, &snap);
+        protocol_send_overhead_summary_register(&snap);
+      }
+#elif defined(FI_CAMPAIGN_MEMORY)
+      {
+        memory_fi_overhead_t snap{};
+        memory_fi_get_overhead(&g_memory_fi_ctx, &snap);
+        protocol_send_overhead_summary_memory(&snap);
+      }
+#endif
       break;
     }
 
@@ -845,4 +1138,23 @@ extern "C" void app_main(void) {
 #endif
 
   protocol_send_done();
+
+  /* Make sure the last two JSON lines (overhead_summary + done) have
+   * fully left the UART FIFO before the FreeRTOS task scheduler
+   * destroys app_main and emits its own "Returned from app_main()"
+   * log line that would otherwise interleave with our final payload. */
+#if defined(FI_TRANSPORT_USB_SERIAL_JTAG)
+  vTaskDelay(pdMS_TO_TICKS(300));
+#else
+  uart_wait_tx_done(UART_NUM_0, pdMS_TO_TICKS(1000));
+  vTaskDelay(pdMS_TO_TICKS(200));
+#endif
+
+  /* Park the task instead of returning so the FreeRTOS scheduler does
+   * not announce the app_main return on the same UART the host is
+   * still draining.  The host already saw {"event":"done"} and closes
+   * the serial port; the chip reboots on the next host campaign. */
+  while (true) {
+    vTaskDelay(portMAX_DELAY);
+  }
 }

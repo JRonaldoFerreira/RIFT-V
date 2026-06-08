@@ -1,0 +1,397 @@
+"""Fault-injection overhead reporting.
+
+Extracts the ``overhead_summary`` and ``overhead_calibration`` events
+that the firmware emits into ``results.jsonl`` and turns them into a
+small report directly comparable to microFI's "around 1300 CPU cycles,
+or 8.1 µs per injection" figure.
+
+The firmware ships two complementary measurements:
+
+1.  **Aggregate accumulators (`overhead_summary`)** — always-on
+    per-stage counters maintained while the campaign is running.
+    Reports the average cycles spent in
+    ``microfi_before_op`` (timer arm + monitoring),
+    ``microfi_after_op`` (timer tear-down + monitoring),
+    the interrupt service routine (the bit-flip itself) and the
+    interrupt dispatch latency ("context switching" in the microFI
+    paper).  Their sum / injection count is the per-injection overhead.
+
+2.  **Differential calibration (`overhead_calibration`)** — triggered
+    by a dedicated ``measure_overhead`` command.  Runs ``reps``
+    inferences with no fault and ``reps`` inferences with the chosen
+    fault on the same image; per-injection overhead = (Δcycles between
+    the two batches) / injections per inference.
+
+The differential measurement is what microFI reports.  Both numbers
+should agree within a few percent — when they do, the accumulator
+breakdown shows *where* the cycles are being spent.
+
+Typical usage::
+
+    from riftv.overhead import load_overhead_report
+    report = load_overhead_report("runs/lenet5_registerfi/results.jsonl")
+    print(report.format())
+    report.to_csv("runs/lenet5_registerfi/overhead.csv")
+    report.compare_to_microfi(microfi_cycles=1300, microfi_us=8.1)
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Union
+
+# ---------------------------------------------------------------------------
+# Constants — microFI reference numbers (paper table 1 / §IV-B)
+# ---------------------------------------------------------------------------
+
+MICROFI_CYCLES_PER_INJECTION = 1300.0
+MICROFI_US_PER_INJECTION = 8.1
+MICROFI_CPU_FREQ_HZ = int(round(MICROFI_CYCLES_PER_INJECTION / MICROFI_US_PER_INJECTION * 1e6))
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
+@dataclass
+class OverheadSummary:
+    """Snapshot of the per-component accumulators."""
+
+    fault_model: str
+    cpu_freq_hz: int
+    injections: int
+    before_op_cycles: int
+    before_op_count: int
+    after_op_cycles: int
+    after_op_count: int
+    total_cycles: int
+    cycles_per_injection: float
+    us_per_injection: float
+    isr_cycles: Optional[int] = None
+    isr_count: Optional[int] = None
+    isr_entry_cycles: Optional[int] = None
+    isr_entry_count: Optional[int] = None
+
+    @classmethod
+    def from_event(cls, payload: Dict[str, Any]) -> "OverheadSummary":
+        return cls(
+            fault_model=str(payload.get("fault_model", "unknown")),
+            cpu_freq_hz=int(payload.get("cpu_freq_hz", 0)),
+            injections=int(payload.get("injections", 0)),
+            before_op_cycles=int(payload.get("before_op_cycles", 0)),
+            before_op_count=int(payload.get("before_op_count", 0)),
+            after_op_cycles=int(payload.get("after_op_cycles", 0)),
+            after_op_count=int(payload.get("after_op_count", 0)),
+            isr_cycles=_opt_int(payload.get("isr_cycles")),
+            isr_count=_opt_int(payload.get("isr_count")),
+            isr_entry_cycles=_opt_int(payload.get("isr_entry_cycles")),
+            isr_entry_count=_opt_int(payload.get("isr_entry_count")),
+            total_cycles=int(payload.get("total_cycles", 0)),
+            cycles_per_injection=float(payload.get("cycles_per_injection", 0.0)),
+            us_per_injection=float(payload.get("us_per_injection", 0.0)),
+        )
+
+    # --- Per-stage averages, in cycles --------------------------------
+    @property
+    def avg_before_op_cycles(self) -> float:
+        return self.before_op_cycles / self.before_op_count if self.before_op_count else 0.0
+
+    @property
+    def avg_after_op_cycles(self) -> float:
+        return self.after_op_cycles / self.after_op_count if self.after_op_count else 0.0
+
+    @property
+    def avg_isr_cycles(self) -> float:
+        if not self.isr_count or not self.isr_cycles:
+            return 0.0
+        return self.isr_cycles / self.isr_count
+
+    @property
+    def avg_isr_entry_cycles(self) -> float:
+        if not self.isr_entry_count or not self.isr_entry_cycles:
+            return 0.0
+        return self.isr_entry_cycles / self.isr_entry_count
+
+    def per_stage_table(self) -> List[Dict[str, Any]]:
+        """Return a list of stage rows for tabular display.
+
+        The fields mirror exactly the four sources of overhead listed in
+        the microFI paper, so the row totals are directly comparable.
+        """
+        rows: List[Dict[str, Any]] = [
+            {
+                "stage": "before_op (operation monitoring + timer set-up)",
+                "samples": self.before_op_count,
+                "total_cycles": self.before_op_cycles,
+                "avg_cycles_per_call": round(self.avg_before_op_cycles, 1),
+                "avg_us_per_call": round(_cycles_to_us(self.avg_before_op_cycles, self.cpu_freq_hz), 3),
+            },
+            {
+                "stage": "after_op (operation monitoring + timer tear-down)",
+                "samples": self.after_op_count,
+                "total_cycles": self.after_op_cycles,
+                "avg_cycles_per_call": round(self.avg_after_op_cycles, 1),
+                "avg_us_per_call": round(_cycles_to_us(self.avg_after_op_cycles, self.cpu_freq_hz), 3),
+            },
+        ]
+        if self.isr_count is not None:
+            rows.append({
+                "stage": "ISR work (bit flip)",
+                "samples": self.isr_count or 0,
+                "total_cycles": self.isr_cycles or 0,
+                "avg_cycles_per_call": round(self.avg_isr_cycles, 1),
+                "avg_us_per_call": round(_cycles_to_us(self.avg_isr_cycles, self.cpu_freq_hz), 3),
+            })
+        if self.isr_entry_count is not None:
+            rows.append({
+                "stage": "ISR entry latency (context switching)",
+                "samples": self.isr_entry_count or 0,
+                "total_cycles": self.isr_entry_cycles or 0,
+                "avg_cycles_per_call": round(self.avg_isr_entry_cycles, 1),
+                "avg_us_per_call": round(_cycles_to_us(self.avg_isr_entry_cycles, self.cpu_freq_hz), 3),
+            })
+        rows.append({
+            "stage": "TOTAL per injection",
+            "samples": self.injections,
+            "total_cycles": self.total_cycles,
+            "avg_cycles_per_call": round(self.cycles_per_injection, 1),
+            "avg_us_per_call": round(self.us_per_injection, 3),
+        })
+        return rows
+
+
+@dataclass
+class OverheadCalibration:
+    """microFI-style differential measurement (baseline vs. with-FI)."""
+
+    fault_model: str
+    fault_id: int
+    image_id: int
+    reps: int
+    cpu_freq_hz: int
+    baseline_cycles_total: int
+    fi_cycles_total: int
+    baseline_cycles_per_inference: float
+    fi_cycles_per_inference: float
+    delta_cycles_per_inference: float
+    baseline_injections: int
+    fi_injections: int
+    injections_per_inference: int
+    cycles_per_injection: float
+    us_per_injection: float
+
+    @classmethod
+    def from_event(cls, payload: Dict[str, Any]) -> "OverheadCalibration":
+        return cls(
+            fault_model=str(payload.get("fault_model", "unknown")),
+            fault_id=int(payload.get("fault_id", -1)),
+            image_id=int(payload.get("image_id", -1)),
+            reps=int(payload.get("reps", 0)),
+            cpu_freq_hz=int(payload.get("cpu_freq_hz", 0)),
+            baseline_cycles_total=int(payload.get("baseline_cycles_total", 0)),
+            fi_cycles_total=int(payload.get("fi_cycles_total", 0)),
+            baseline_cycles_per_inference=float(payload.get("baseline_cycles_per_inference", 0.0)),
+            fi_cycles_per_inference=float(payload.get("fi_cycles_per_inference", 0.0)),
+            delta_cycles_per_inference=float(payload.get("delta_cycles_per_inference", 0.0)),
+            baseline_injections=int(payload.get("baseline_injections", 0)),
+            fi_injections=int(payload.get("fi_injections", 0)),
+            injections_per_inference=int(payload.get("injections_per_inference", 0)),
+            cycles_per_injection=float(payload.get("cycles_per_injection", 0.0)),
+            us_per_injection=float(payload.get("us_per_injection", 0.0)),
+        )
+
+
+@dataclass
+class OverheadReport:
+    """All overhead events captured during a campaign."""
+
+    source: Path
+    summaries: List[OverheadSummary] = field(default_factory=list)
+    calibrations: List[OverheadCalibration] = field(default_factory=list)
+
+    def primary_summary(self) -> Optional[OverheadSummary]:
+        """The most recent `overhead_summary` event (per-fault-model)."""
+        if not self.summaries:
+            return None
+        return self.summaries[-1]
+
+    def primary_calibration(self) -> Optional[OverheadCalibration]:
+        if not self.calibrations:
+            return None
+        return self.calibrations[-1]
+
+    # --- Pretty printing ---------------------------------------------
+    def format(self, microfi_cycles: float = MICROFI_CYCLES_PER_INJECTION,
+               microfi_us: float = MICROFI_US_PER_INJECTION) -> str:
+        lines: List[str] = []
+        lines.append(f"Overhead report — {self.source.name}")
+        lines.append("=" * 72)
+
+        summ = self.primary_summary()
+        if summ is not None:
+            lines.append(
+                f"Aggregate accumulators  (fault_model={summ.fault_model}, "
+                f"CPU={summ.cpu_freq_hz/1e6:.0f} MHz, injections={summ.injections})"
+            )
+            lines.append("-" * 72)
+            lines.append(
+                f"{'stage':<48}{'avg cycles':>13}{'avg µs':>10}"
+            )
+            for row in summ.per_stage_table():
+                lines.append(
+                    f"{row['stage']:<48}"
+                    f"{row['avg_cycles_per_call']:>13.1f}"
+                    f"{row['avg_us_per_call']:>10.3f}"
+                )
+            lines.append("")
+
+        cal = self.primary_calibration()
+        if cal is not None:
+            lines.append(
+                f"Differential calibration (microFI-style)  "
+                f"fault_id={cal.fault_id}  image={cal.image_id}  reps={cal.reps}"
+            )
+            lines.append("-" * 72)
+            lines.append(f"  baseline cycles/inference : {cal.baseline_cycles_per_inference:12,.0f}")
+            lines.append(f"  with-FI  cycles/inference : {cal.fi_cycles_per_inference:12,.0f}")
+            lines.append(f"  Δ (overhead)/inference    : {cal.delta_cycles_per_inference:12,.0f}")
+            lines.append(f"  injections per inference  : {cal.injections_per_inference:12d}")
+            lines.append(
+                f"  ⇒ overhead per injection  : "
+                f"{cal.cycles_per_injection:12,.1f} cycles  "
+                f"({cal.us_per_injection:.3f} µs)"
+            )
+            lines.append("")
+
+        # Always print the side-by-side comparison if we have at least one number.
+        ours_cycles, ours_us, label = self._best_per_injection()
+        if ours_cycles is not None:
+            lines.append("Side-by-side vs. microFI paper")
+            lines.append("-" * 72)
+            lines.append(f"  microFI                       : {microfi_cycles:8.0f} cycles  ({microfi_us:.3f} µs)")
+            lines.append(f"  This framework ({label:<14}): {ours_cycles:8.0f} cycles  ({ours_us:.3f} µs)")
+            ratio = ours_cycles / microfi_cycles if microfi_cycles else float("nan")
+            lines.append(f"  ratio (ours / microFI)        : {ratio:8.2f}×")
+        return "\n".join(lines)
+
+    def _best_per_injection(self):
+        """Pick the most authoritative per-injection number to compare."""
+        cal = self.primary_calibration()
+        if cal is not None and cal.injections_per_inference > 0:
+            return cal.cycles_per_injection, cal.us_per_injection, "differential"
+        summ = self.primary_summary()
+        if summ is not None and summ.injections > 0:
+            return summ.cycles_per_injection, summ.us_per_injection, "accumulators"
+        return None, None, ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "source": str(self.source),
+            "summaries": [s.__dict__ for s in self.summaries],
+            "calibrations": [c.__dict__ for c in self.calibrations],
+        }
+
+    def to_csv(self, path: Union[str, Path]) -> Path:
+        """Write a flat CSV with one row per per-stage measurement."""
+        import csv
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fields = [
+            "kind", "fault_model", "stage", "samples",
+            "total_cycles", "avg_cycles_per_call", "avg_us_per_call",
+            "cpu_freq_hz",
+        ]
+        with path.open("w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=fields)
+            w.writeheader()
+            for s in self.summaries:
+                for row in s.per_stage_table():
+                    w.writerow({
+                        "kind": "summary",
+                        "fault_model": s.fault_model,
+                        "stage": row["stage"],
+                        "samples": row["samples"],
+                        "total_cycles": row["total_cycles"],
+                        "avg_cycles_per_call": row["avg_cycles_per_call"],
+                        "avg_us_per_call": row["avg_us_per_call"],
+                        "cpu_freq_hz": s.cpu_freq_hz,
+                    })
+            for c in self.calibrations:
+                w.writerow({
+                    "kind": "calibration",
+                    "fault_model": c.fault_model,
+                    "stage": f"differential reps={c.reps} fault_id={c.fault_id}",
+                    "samples": c.injections_per_inference,
+                    "total_cycles": int(c.delta_cycles_per_inference),
+                    "avg_cycles_per_call": round(c.cycles_per_injection, 1),
+                    "avg_us_per_call": round(c.us_per_injection, 3),
+                    "cpu_freq_hz": c.cpu_freq_hz,
+                })
+        return path
+
+    def compare_to_microfi(self, microfi_cycles: float = MICROFI_CYCLES_PER_INJECTION,
+                           microfi_us: float = MICROFI_US_PER_INJECTION) -> Dict[str, Any]:
+        """Return a side-by-side dictionary for further processing."""
+        cycles, us, label = self._best_per_injection()
+        result = {
+            "microfi": {"cycles_per_injection": microfi_cycles, "us_per_injection": microfi_us},
+            "this_framework": {
+                "source": str(self.source),
+                "cycles_per_injection": cycles,
+                "us_per_injection": us,
+                "measurement": label,
+            },
+        }
+        if cycles is not None and microfi_cycles:
+            result["ratio"] = cycles / microfi_cycles
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Loading
+# ---------------------------------------------------------------------------
+
+def load_overhead_report(jsonl_path: Union[str, Path]) -> OverheadReport:
+    """Parse a results.jsonl and return its OverheadReport."""
+    p = Path(jsonl_path)
+    if not p.exists():
+        raise FileNotFoundError(f"No JSONL at {p}")
+
+    summaries: List[OverheadSummary] = []
+    calibrations: List[OverheadCalibration] = []
+    with p.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            evt = payload.get("event")
+            if evt == "overhead_summary":
+                summaries.append(OverheadSummary.from_event(payload))
+            elif evt == "overhead_calibration":
+                calibrations.append(OverheadCalibration.from_event(payload))
+    return OverheadReport(source=p, summaries=summaries, calibrations=calibrations)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _opt_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _cycles_to_us(cycles: float, cpu_freq_hz: int) -> float:
+    if not cpu_freq_hz:
+        return 0.0
+    return cycles * 1e6 / cpu_freq_hz

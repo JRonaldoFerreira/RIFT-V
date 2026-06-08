@@ -1,5 +1,7 @@
 #include "memory_fi.h"
 
+#include "fi_cycles.h"
+
 #if defined(FI_CAMPAIGN_MEMORY)
 static memory_fi_context_t* g_memory_ctx = nullptr;
 #endif
@@ -18,6 +20,8 @@ void memory_fi_init(memory_fi_context_t* ctx,
   ctx->injected_this_inference = false;
   ctx->saved_original_byte = 0u;
   ctx->injection_active = false;
+  ctx->overhead_enabled = false;
+  ctx->overhead = {};
 
 #ifdef MULTI_FI_MAX_COUNT
   ctx->group_fault_count = 0;
@@ -95,6 +99,33 @@ void memory_fi_before_op(memory_fi_context_t* ctx, uint32_t op_index) {
     return;
   }
 
+  const uint32_t entry_cycle = ctx->overhead_enabled ? fi_read_cycles() : 0u;
+  uint32_t injected_now = 0u;
+
+  do {
+  /* FAST PATH — same rationale as register_fi: during a single
+   * inference only one operator carries a scheduled fault, so the
+   * remaining ~15 hook calls must be as cheap as possible to keep the
+   * per-injection overhead comparable to microFI. */
+  {
+    bool has_work = false;
+#ifdef MULTI_FI_MAX_COUNT
+    if (ctx->group_fault_count > 0u) {
+      has_work = true;
+    }
+#endif
+    if (!has_work) {
+      const int32_t fi = ctx->active_fault_index;
+      if (fi < 0 || static_cast<uint32_t>(fi) >= ctx->fault_count) {
+        break;
+      }
+      const uint32_t target_op = ctx->fault_list[fi].op_index;
+      if (target_op != op_index && target_op != FI_OP_INDEX_WILDCARD) {
+        break;
+      }
+    }
+  }
+
 #ifdef MULTI_FI_MAX_COUNT
   if (ctx->group_fault_count > 0) {
     for (uint8_t i = 0; i < ctx->group_fault_count; ++i) {
@@ -111,6 +142,7 @@ void memory_fi_before_op(memory_fi_context_t* ctx, uint32_t op_index) {
         *addr ^= static_cast<uint8_t>(1u << f->bit_index);
         ctx->group_injection_active[i] = true;
         ctx->injected_this_inference = true;
+        injected_now += 1u;
       }
     }
     for (uint8_t i = 0; i < ctx->group_fault_count; ++i) {
@@ -123,14 +155,15 @@ void memory_fi_before_op(memory_fi_context_t* ctx, uint32_t op_index) {
       }
       _force_stuck_bit(addr, ctx->saved_group_bytes[i], f->bit_index);
       ctx->injected_this_inference = true;
+      injected_now += 1u;
     }
-    return;
+    break;
   }
 #endif
 
   if (ctx->active_fault_index < 0 ||
       static_cast<uint32_t>(ctx->active_fault_index) >= ctx->fault_count) {
-    return;
+    break;
   }
   const memory_fault_t* fault = &ctx->fault_list[ctx->active_fault_index];
 
@@ -142,11 +175,12 @@ void memory_fi_before_op(memory_fi_context_t* ctx, uint32_t op_index) {
     }
     _force_stuck_bit(addr, ctx->saved_original_byte, fault->bit_index);
     ctx->injected_this_inference = true;
-    return;
+    injected_now += 1u;
+    break;
   }
 
   if (fault->op_index != op_index) {
-    return;
+    break;
   }
 
   uint8_t* addr = memory_fi_resolve_addr(ctx, fault);
@@ -154,6 +188,15 @@ void memory_fi_before_op(memory_fi_context_t* ctx, uint32_t op_index) {
   *addr ^= static_cast<uint8_t>(1u << fault->bit_index);
   ctx->injection_active = true;
   ctx->injected_this_inference = true;
+  injected_now += 1u;
+  } while (0);
+
+  if (ctx->overhead_enabled) {
+    const uint32_t exit_cycle = fi_read_cycles();
+    ctx->overhead.before_op_cycles += static_cast<uint32_t>(exit_cycle - entry_cycle);
+    ctx->overhead.before_op_count  += 1u;
+    ctx->overhead.injections       += injected_now;
+  }
 }
 
 void memory_fi_after_op(memory_fi_context_t* ctx, uint32_t op_index) {
@@ -161,35 +204,81 @@ void memory_fi_after_op(memory_fi_context_t* ctx, uint32_t op_index) {
     return;
   }
 
+  const uint32_t entry_cycle = ctx->overhead_enabled ? fi_read_cycles() : 0u;
+
+  do {
+  /* FAST PATH — bail out early when nothing was injected this op.
+   * The single-fault path is keyed on `injection_active`, set by
+   * before_op only when this op matched.  The multi-fault path needs
+   * to check the group bitmap. */
+  {
+    bool has_work = false;
 #ifdef MULTI_FI_MAX_COUNT
-  if (ctx->group_fault_count > 0) {
-    for (int8_t i = static_cast<int8_t>(ctx->group_fault_count) - 1; i >= 0; --i) {
-      if (ctx->group_injection_active[i] && ctx->group_faults[i]->op_index == op_index) {
-        uint8_t* addr = memory_fi_resolve_addr(ctx, ctx->group_faults[i]);
-        *addr = ctx->saved_group_bytes[i];
-        ctx->group_injection_active[i] = false;
-      }
+    if (ctx->group_fault_count > 0u) {
+      has_work = true;
     }
-    return;
+#endif
+    if (!has_work && !ctx->injection_active) {
+      break;
+    }
   }
+
+#ifdef MULTI_FI_MAX_COUNT
+    if (ctx->group_fault_count > 0) {
+      for (int8_t i = static_cast<int8_t>(ctx->group_fault_count) - 1; i >= 0; --i) {
+        if (ctx->group_injection_active[i] && ctx->group_faults[i]->op_index == op_index) {
+          uint8_t* addr = memory_fi_resolve_addr(ctx, ctx->group_faults[i]);
+          *addr = ctx->saved_group_bytes[i];
+          ctx->group_injection_active[i] = false;
+        }
+      }
+      break;
+    }
 #endif
 
-  if (!ctx->injection_active) {
-    return;
-  }
+    if (!ctx->injection_active) {
+      break;
+    }
 
-  if (ctx->active_fault_index < 0 ||
-      static_cast<uint32_t>(ctx->active_fault_index) >= ctx->fault_count) {
-    return;
-  }
-  const memory_fault_t* fault = &ctx->fault_list[ctx->active_fault_index];
-  if (fault->op_index != op_index) {
-    return;
-  }
+    if (ctx->active_fault_index < 0 ||
+        static_cast<uint32_t>(ctx->active_fault_index) >= ctx->fault_count) {
+      break;
+    }
+    const memory_fault_t* fault = &ctx->fault_list[ctx->active_fault_index];
+    if (fault->op_index != op_index) {
+      break;
+    }
 
-  uint8_t* addr = memory_fi_resolve_addr(ctx, fault);
-  *addr = ctx->saved_original_byte;
-  ctx->injection_active = false;
+    uint8_t* addr = memory_fi_resolve_addr(ctx, fault);
+    *addr = ctx->saved_original_byte;
+    ctx->injection_active = false;
+  } while (0);
+
+  if (ctx->overhead_enabled) {
+    const uint32_t exit_cycle = fi_read_cycles();
+    ctx->overhead.after_op_cycles += static_cast<uint32_t>(exit_cycle - entry_cycle);
+    ctx->overhead.after_op_count  += 1u;
+  }
+}
+
+void memory_fi_set_overhead_enabled(memory_fi_context_t* ctx, bool enabled) {
+  if (ctx != nullptr) {
+    ctx->overhead_enabled = enabled;
+  }
+}
+
+void memory_fi_reset_overhead(memory_fi_context_t* ctx) {
+  if (ctx != nullptr) {
+    ctx->overhead = {};
+  }
+}
+
+void memory_fi_get_overhead(const memory_fi_context_t* ctx,
+                            memory_fi_overhead_t* out) {
+  if (ctx == nullptr || out == nullptr) {
+    return;
+  }
+  *out = ctx->overhead;
 }
 
 #ifdef MULTI_FI_MAX_COUNT

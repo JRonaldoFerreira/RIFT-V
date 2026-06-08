@@ -71,6 +71,51 @@ _REGISTER_COLS = [
 _PROFILE_COLS = ["mean_duration_us", "samples"]
 
 
+def _try_recover_partial_json(line: str) -> Optional[Dict[str, Any]]:
+    """Attempt to extract a complete JSON object from the start of *line*.
+
+    The firmware sometimes loses an arbitration on the UART when an
+    ESP-IDF log message is emitted in the middle of a ``proto_printf``
+    write (e.g. the FreeRTOS "Returned from app_main()" notice landing
+    inside the final ``overhead_summary`` line).  The host then reads
+    something like::
+
+        {"event":"overhead_summary",..."before_op_cycles":144018,"before_oI (3541) main_task: Returned from app_main()
+
+    The well-formed prefix is unrecoverable as-is, but when the
+    interrupting log message ALSO ends with ``}\n`` from a previous
+    proto_printf the line can still contain a complete object near the
+    start.  We walk forward and try to balance braces / strings
+    incrementally, returning the first complete object found.
+    """
+    if not line or not line.startswith("{"):
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for i, ch in enumerate(line):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(line[: i + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None
+
+
 def _columns_for(
     campaign_type: str,
     is_multi: bool,
@@ -790,6 +835,15 @@ def capture(
         try:
             payload = json.loads(line)
         except json.JSONDecodeError:
+            # Last-chance salvage: if an ESP-IDF log message was emitted
+            # in the middle of one of our JSON lines (race between
+            # proto_printf and the FreeRTOS / esp_log driver), the host
+            # gets a single line with a valid JSON prefix followed by
+            # log noise.  Try to extract the leading well-formed JSON
+            # object before falling back to the warning markers.
+            payload = _try_recover_partial_json(line)
+            if payload is not None:
+                return payload, None
             low = line.lower()
             is_panic = any(m in low for m in _PANIC_MARKERS)
             is_warn = any(m in low for m in _SYSTEM_WARNING_MARKERS)
@@ -816,15 +870,20 @@ def capture(
                 return True
         return False
 
+    
+    golden_prev_t: Optional[float] = None
+    golden_elapsed_ms: Dict[int, float] = {}
+
     # Cache of golden results: image_id -> (pred_class, top1_prob)
     golden_cache: Dict[int, Tuple[int, float]] = {}
 
     def _run_golden(is_first: bool = True) -> bool:
         """Send run_golden and block until golden_done. Returns success."""
-        nonlocal valid
+        nonlocal valid, golden_prev_t, golden_elapsed_ms
         _send_cmd({"cmd": "run_golden"})
         print("[uart] Running golden phase...", file=sys.stderr)
         golden_deadline = time.monotonic() + GOLDEN_TIMEOUT_S
+        golden_prev_t = time.monotonic()
 
         while True:
             remaining = golden_deadline - time.monotonic()
@@ -850,6 +909,17 @@ def capture(
                 continue
 
             if event in ("result", "op_profile") and is_first:
+                if event == "result" and payload.get("phase") == "golden":
+                    now_t = time.monotonic()
+                    elapsed = None
+                    if golden_prev_t is not None:
+                        elapsed = (now_t - golden_prev_t) * 1000.0
+                    golden_prev_t = now_t
+                    img_id = payload.get("image_id")
+                    if img_id is not None and elapsed is not None:
+                        ms = round(float(elapsed), 3)
+                        golden_elapsed_ms[int(img_id)] = ms
+                        payload["elapsed_ms"] = ms
                 _append_jsonl(jsonl_path, payload)
                 valid += 1
 
@@ -1640,13 +1710,29 @@ def capture(
                 break
 
         # ---- Signal campaign end ----
+        # The firmware emits an `overhead_summary` (and possibly other
+        # bookkeeping events) immediately before the final `done`, so
+        # keep persisting payloads to the JSONL until we see `done` or
+        # the deadline elapses.
         _send_cmd({"cmd": "done"})
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
             payload, err = _read_event(timeout=max(0.1, deadline - time.monotonic()))
             if err:
                 break
-            if payload and payload.get("event") == "done":
+            if payload is None:
+                continue
+            evt = payload.get("event")
+            if evt in ("overhead_summary", "overhead_calibration"):
+                _append_jsonl(jsonl_path, payload)
+                print(
+                    f"[uart] {evt}: "
+                    f"{payload.get('cycles_per_injection', '?')} cycles/injection "
+                    f"({payload.get('us_per_injection', '?')} µs)",
+                    file=sys.stderr,
+                )
+                continue
+            if evt == "done":
                 break
 
         print(

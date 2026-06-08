@@ -18,6 +18,7 @@ from riftv import builder as pio_builder
 from riftv.uart import capture as uart_capture
 from riftv.classify import classify_results
 from riftv.analysis import generate_physical_report, PhysicalAnalysisReport
+from riftv.overhead import OverheadReport, load_overhead_report
 from riftv.model_utils import (
     quantize_model as _quantize_model,
     prepare_test_subset as _prepare_test_subset,
@@ -485,6 +486,215 @@ class Experiment:
         saved = report.save(target_dir)
         print(f"[experiment] Physical analysis: {len(saved)} files saved.", file=sys.stderr)
         print(report.summary(), file=sys.stderr)
+        return report
+
+    # ------------------------------------------------------------------ #
+    # Step 5c: OVERHEAD — microFI-comparable injection-cost report
+    # ------------------------------------------------------------------ #
+
+    def overhead(
+        self,
+        run_dir: Optional[Path] = None,
+        write_csv: bool = True,
+        print_report: bool = True,
+    ) -> OverheadReport:
+        """Load the firmware-emitted overhead events for an existing run.
+
+        Parses ``results.jsonl`` for ``overhead_summary`` and
+        ``overhead_calibration`` events (emitted automatically when the
+        campaign reaches its ``done`` command, and by
+        :meth:`measure_overhead`).  Returns an
+        :class:`~riftv.overhead.OverheadReport` and optionally writes
+        ``overhead.csv`` next to the JSONL.
+
+        Parameters
+        ----------
+        run_dir:
+            Run directory containing ``results.jsonl``.  Defaults to the
+            experiment's own ``out_dir``.
+        write_csv:
+            When True, writes ``overhead.csv`` alongside the JSONL.
+        print_report:
+            When True, prints the human-readable formatted report
+            (microFI side-by-side included) to stderr.
+
+        Returns
+        -------
+        OverheadReport
+
+        Notes
+        -----
+        If the campaign was interrupted before reaching ``done`` the
+        firmware never gets a chance to emit ``overhead_summary`` and
+        the returned report will be empty.  In that case run
+        :meth:`measure_overhead` directly to get a microFI-style
+        differential calibration without re-running the full campaign.
+        """
+        target = run_dir or self.out_dir
+        jsonl = target / "results.jsonl"
+        print(f"[experiment] Loading overhead events from {jsonl}...", file=sys.stderr)
+        report = load_overhead_report(jsonl)
+
+        if not report.summaries and not report.calibrations:
+            print(
+                "[experiment] Warning: no overhead_summary / overhead_calibration "
+                "events were found in this run.\n"
+                "             The firmware only emits them when the campaign "
+                "reaches the `done` command (i.e. it ran to completion) or\n"
+                "             when measure_overhead() is invoked.  For an "
+                "interrupted run, use:\n"
+                "                 exp.measure_overhead(fault_idx=1, image_id=0, reps=200)",
+                file=sys.stderr,
+            )
+            return report
+
+        if print_report:
+            print(report.format(), file=sys.stderr)
+
+        if write_csv:
+            csv_out = target / "overhead.csv"
+            report.to_csv(csv_out)
+            print(f"[experiment] Overhead CSV → {csv_out}", file=sys.stderr)
+
+        return report
+
+    # ------------------------------------------------------------------ #
+    # Step 5d: MEASURE_OVERHEAD — microFI-style differential calibration
+    # ------------------------------------------------------------------ #
+
+    def measure_overhead(
+        self,
+        fault_idx: int = 0,
+        image_id: int = 0,
+        reps: int = 100,
+        run_dir: Optional[Path] = None,
+        skip_golden: bool = True,
+        port: Optional[str] = None,
+        timeout_s: float = 600.0,
+    ) -> OverheadReport:
+        """Trigger a microFI-style differential overhead calibration on
+        the flashed board, then return the parsed report.
+
+        Sends a ``measure_overhead`` command over the serial port to the
+        firmware (must already be flashed for the current campaign type).
+        The firmware runs *reps* baseline inferences (no FI) and *reps*
+        inferences with the chosen fault on the same image, then emits
+        an ``overhead_calibration`` event whose
+        ``cycles_per_injection`` field is directly comparable to the
+        ~1300 cycles / 8.1 µs figure published by the microFI paper.
+
+        Parameters
+        ----------
+        fault_idx:
+            Index into the campaign's fault list to inject.
+        image_id:
+            Image index from the test subset to use for every rep.
+        reps:
+            Number of inferences per phase (baseline + with-FI).  100
+            is usually enough; larger values reduce noise.
+        run_dir:
+            Where to write ``overhead_calibration.jsonl`` and
+            ``overhead.csv``.  Defaults to ``self.out_dir``.
+        skip_golden:
+            When True (default) sends ``skip_golden`` before the
+            calibration command so the firmware unlocks job dispatch
+            without running the full golden phase.
+        port:
+            Override the serial port; defaults to ``cfg.serial.port``.
+        timeout_s:
+            Maximum time to wait for the firmware to finish the
+            calibration and report back.
+
+        Returns
+        -------
+        OverheadReport
+        """
+        import json
+        import time
+        import serial
+
+        target = Path(run_dir) if run_dir else self.out_dir
+        target.mkdir(parents=True, exist_ok=True)
+        jsonl_path = target / "overhead_calibration.jsonl"
+
+        ser_port = port or self.cfg.serial.port
+        baud = self.cfg.serial.baud
+        print(
+            f"[experiment] measure_overhead → port={ser_port} baud={baud} "
+            f"fault_idx={fault_idx} image_id={image_id} reps={reps}",
+            file=sys.stderr,
+        )
+
+        ser = serial.Serial(ser_port, baud, timeout=2.0)
+        try:
+            # Wait for boot announcement.
+            boot_deadline = time.monotonic() + 30.0
+            while time.monotonic() < boot_deadline:
+                raw = ser.readline().decode("utf-8", errors="replace").strip()
+                if not raw:
+                    continue
+                try:
+                    if json.loads(raw).get("event") == "boot":
+                        break
+                except json.JSONDecodeError:
+                    continue
+
+            if skip_golden:
+                ser.write((json.dumps({"cmd": "skip_golden"}) + "\n").encode("utf-8"))
+                # Wait for the firmware to acknowledge.
+                ack_deadline = time.monotonic() + 5.0
+                while time.monotonic() < ack_deadline:
+                    raw = ser.readline().decode("utf-8", errors="replace").strip()
+                    if not raw:
+                        continue
+                    try:
+                        if json.loads(raw).get("event") == "golden_done":
+                            break
+                    except json.JSONDecodeError:
+                        continue
+
+            cmd = {"cmd": "measure_overhead", "fi": fault_idx,
+                   "img": image_id, "reps": reps}
+            ser.write((json.dumps(cmd) + "\n").encode("utf-8"))
+            print(f"[experiment] Sent {cmd}", file=sys.stderr)
+
+            deadline = time.monotonic() + timeout_s
+            seen_summary = False
+            seen_calibration = False
+            with jsonl_path.open("a", encoding="utf-8") as fh:
+                while time.monotonic() < deadline:
+                    raw = ser.readline().decode("utf-8", errors="replace").strip()
+                    if not raw:
+                        continue
+                    try:
+                        payload = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    evt = payload.get("event")
+                    if evt not in ("overhead_summary", "overhead_calibration"):
+                        continue
+                    fh.write(json.dumps(payload) + "\n")
+                    fh.flush()
+                    print(
+                        f"[experiment] {evt}: "
+                        f"{payload.get('cycles_per_injection', '?')} cycles "
+                        f"({payload.get('us_per_injection', '?')} µs)",
+                        file=sys.stderr,
+                    )
+                    if evt == "overhead_summary":
+                        seen_summary = True
+                    if evt == "overhead_calibration":
+                        seen_calibration = True
+                    if seen_calibration and seen_summary:
+                        break
+        finally:
+            ser.close()
+
+        report = load_overhead_report(jsonl_path)
+        print("\n" + report.format(), file=sys.stderr)
+        csv_out = target / "overhead.csv"
+        report.to_csv(csv_out)
+        print(f"[experiment] Overhead CSV → {csv_out}", file=sys.stderr)
         return report
 
     # ------------------------------------------------------------------ #

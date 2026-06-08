@@ -20,6 +20,14 @@ Usage examples:
 
     # Analyze existing results:
     riftv configs/registerfi_example.yaml --step analyze --results runs/my_run/results.csv
+
+    # Generate a microFI-comparable overhead report from a finished run:
+    riftv configs/registerfi_example.yaml --step overhead --run-dir runs/my_run
+
+    # Trigger a microFI-style differential calibration on the flashed
+    # board (does not require a full campaign):
+    riftv configs/registerfi_example.yaml --step measure-overhead \\
+          --overhead-fault 1 --overhead-image 0 --overhead-reps 100
 """
 from __future__ import annotations
 
@@ -42,7 +50,10 @@ def main() -> None:
     parser.add_argument(
         "--step",
         action="append",
-        choices=["prepare", "build", "flash", "run", "rebuild-csv", "analyze", "all"],
+        choices=[
+            "prepare", "build", "flash", "run", "rebuild-csv",
+            "analyze", "overhead", "measure-overhead", "all",
+        ],
         help="Steps to execute (default: all). Can be repeated.",
     )
     parser.add_argument("--verbose", action="store_true", help="Verbose PlatformIO output")
@@ -50,6 +61,18 @@ def main() -> None:
     parser.add_argument("--results", type=Path, default=None, help="Existing results CSV for analyze step")
     parser.add_argument("--run-dir", type=Path, default=None, help="Existing run directory (for rebuild-csv / analyze)")
     parser.add_argument("--upload-port", type=str, default=None, help="Override serial upload port")
+    parser.add_argument(
+        "--overhead-fault", type=int, default=0,
+        help="Fault index to use for the differential overhead calibration (default 0).",
+    )
+    parser.add_argument(
+        "--overhead-image", type=int, default=0,
+        help="Image index to use for the differential overhead calibration (default 0).",
+    )
+    parser.add_argument(
+        "--overhead-reps", type=int, default=100,
+        help="Number of repetitions per phase in the differential overhead calibration (default 100).",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -67,7 +90,10 @@ def main() -> None:
     # the register sub-campaign and silently drops the memory side, so we
     # block those steps here and steer the user to the full pipeline.
     if cfg.campaign.type == "hybrid":
-        unsafe = steps & {"build", "flash", "run", "analyze", "rebuild-csv"}
+        unsafe = steps & {
+            "build", "flash", "run", "analyze", "rebuild-csv",
+            "overhead", "measure-overhead",
+        }
         if unsafe:
             print(
                 "[riftv] Hybrid campaigns must be driven through the full "
@@ -102,6 +128,112 @@ def main() -> None:
         if run_dir and not results:
             results = run_dir / "results.csv"
         exp.analyze(results_csv=results)
+
+    if "overhead" in steps:
+        from riftv.overhead import load_overhead_report
+
+        run_dir = args.run_dir or exp.out_dir
+        jsonl = run_dir / "results.jsonl"
+        report = load_overhead_report(jsonl)
+        print(report.format())
+        csv_out = run_dir / "overhead.csv"
+        report.to_csv(csv_out)
+        print(f"\n[overhead] CSV written → {csv_out}", file=sys.stderr)
+
+    if "measure-overhead" in steps:
+        _run_measure_overhead(
+            cfg,
+            fault_idx=args.overhead_fault,
+            image_id=args.overhead_image,
+            reps=args.overhead_reps,
+            run_dir=args.run_dir or exp.out_dir,
+        )
+
+
+def _run_measure_overhead(cfg, fault_idx: int, image_id: int, reps: int, run_dir: Path) -> None:
+    """Send a measure_overhead command to the flashed firmware and
+    persist the resulting events.
+
+    Assumes the firmware is already flashed for the active campaign
+    type.  Use ``riftv config --step flash`` first if needed.
+    """
+    import json
+    import sys
+    import time
+    import serial
+
+    from riftv.overhead import load_overhead_report
+
+    port = cfg.serial.port
+    baud = cfg.serial.baud
+    print(
+        f"[measure-overhead] Opening {port} @ {baud} baud, "
+        f"fault_idx={fault_idx} image_id={image_id} reps={reps}",
+        file=sys.stderr,
+    )
+
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    jsonl_path = run_dir / "overhead_calibration.jsonl"
+
+    ser = serial.Serial(port, baud, timeout=2.0)
+    try:
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            raw = ser.readline().decode("utf-8", errors="replace").strip()
+            if not raw:
+                continue
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if payload.get("event") == "boot":
+                break
+
+        cmd = {"cmd": "skip_golden"}
+        ser.write((json.dumps(cmd) + "\n").encode("utf-8"))
+
+        cmd = {"cmd": "measure_overhead", "fi": fault_idx,
+               "img": image_id, "reps": reps}
+        ser.write((json.dumps(cmd) + "\n").encode("utf-8"))
+        print(f"[measure-overhead] Sent {cmd}", file=sys.stderr)
+
+        deadline = time.monotonic() + 600.0
+        with jsonl_path.open("a", encoding="utf-8") as fh:
+            seen_summary = False
+            seen_calibration = False
+            while time.monotonic() < deadline:
+                raw = ser.readline().decode("utf-8", errors="replace").strip()
+                if not raw:
+                    continue
+                try:
+                    payload = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                evt = payload.get("event")
+                if evt in ("overhead_summary", "overhead_calibration"):
+                    fh.write(json.dumps(payload) + "\n")
+                    fh.flush()
+                    print(
+                        f"[measure-overhead] {evt}: "
+                        f"{payload.get('cycles_per_injection', '?')} cycles "
+                        f"({payload.get('us_per_injection', '?')} µs)",
+                        file=sys.stderr,
+                    )
+                    if evt == "overhead_summary":
+                        seen_summary = True
+                    if evt == "overhead_calibration":
+                        seen_calibration = True
+                    if seen_calibration and seen_summary:
+                        break
+    finally:
+        ser.close()
+
+    report = load_overhead_report(jsonl_path)
+    print("\n" + report.format())
+    csv_out = run_dir / "overhead.csv"
+    report.to_csv(csv_out)
+    print(f"\n[measure-overhead] CSV written → {csv_out}", file=sys.stderr)
 
 
 if __name__ == "__main__":

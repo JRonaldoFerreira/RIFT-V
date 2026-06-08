@@ -62,6 +62,34 @@ typedef struct {
   uint32_t mean_duration_us;
 } register_fi_op_profile_t;
 
+/* Per-injection overhead accumulators — microFI-style accounting.
+ *
+ * The microFI paper reports "~1300 CPU cycles or 8.1 µs per injection"
+ * (operation monitoring + timer set-up + bit flip + context switching).
+ * The fields below break that same total down into the individual
+ * stages so the two frameworks can be compared component-by-component.
+ *
+ *   before_op_cycles  → operation monitoring + timer set-up
+ *   isr_cycles        → bit flip (work done inside register_timer_isr)
+ *   isr_entry_cycles  → context switching (interrupt dispatch latency
+ *                        beyond the requested delay)
+ *   after_op_cycles   → operation monitoring + timer tear-down
+ *
+ * `injections` counts the number of bit-flips actually applied during
+ * the campaign, so the per-injection averages are simply
+ * `total_cycles / injections`. */
+typedef struct {
+  uint64_t before_op_cycles;
+  uint32_t before_op_count;
+  uint64_t after_op_cycles;
+  uint32_t after_op_count;
+  uint64_t isr_cycles;
+  uint32_t isr_count;
+  uint64_t isr_entry_cycles;
+  uint32_t isr_entry_count;
+  uint32_t injections;
+} register_fi_overhead_t;
+
 typedef struct {
   const register_fault_t* fault_list;
   uint32_t fault_count;
@@ -81,6 +109,15 @@ typedef struct {
 
   volatile bool permanent_active;
   volatile bool permanent_original_bit;
+
+  /* Overhead accounting — see register_fi_overhead_t. Updated from
+   * both task and ISR context; the writes are monotonic and the host
+   * only reads the snapshot after the campaign, so no atomicity
+   * primitives are needed. */
+  bool overhead_enabled;
+  register_fi_overhead_t overhead;
+  volatile uint32_t arm_cycles;        /* mcycle taken when arming  */
+  volatile uint32_t arm_delay_cycles;  /* expected delay in cycles  */
 
 #ifdef MULTI_FI_MAX_COUNT
   const register_fault_t* group_faults[MULTI_FI_MAX_COUNT];
@@ -110,6 +147,12 @@ uint32_t register_fi_get_current_delay_us(const register_fi_context_t* ctx);
 register_fi_injection_status_t register_fi_get_last_status(const register_fi_context_t* ctx);
 const char* register_fi_status_name(register_fi_injection_status_t status);
 const char* register_fi_register_name(uint8_t register_id);
+
+/* Overhead-accounting API. */
+void register_fi_set_overhead_enabled(register_fi_context_t* ctx, bool enabled);
+void register_fi_reset_overhead(register_fi_context_t* ctx);
+void register_fi_get_overhead(const register_fi_context_t* ctx,
+                              register_fi_overhead_t* out);
 
 #ifdef MULTI_FI_MAX_COUNT
 void register_fi_set_group(register_fi_context_t* ctx,

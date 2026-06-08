@@ -12,6 +12,7 @@
 #include "esp_check.h"
 #include "riscv/rvruntime-frames.h"
 #include "freertos/FreeRTOS.h"
+#include "fi_cycles.h"
 
 /* Trampoline globals — written by the ISR, read by _fi_trampoline (asm).
  * sp and gp are NOT restored from RvExcFrame by restore_general_regs
@@ -213,9 +214,27 @@ uint32_t compute_delay_us(register_fi_context_t* ctx, const register_fault_t* fa
 }
 
 IRAM_ATTR void register_timer_isr(void* arg) {
+  /* Snapshot ISR-entry cycle as early as possible so the "context
+   * switch" cost (= cycles between timer arm and ISR entry minus the
+   * requested delay) is accounted with minimum bias. */
+  const uint32_t isr_entry_cycle = fi_read_cycles();
+
   auto* ctx = static_cast<register_fi_context_t*>(arg);
   if (ctx == nullptr || !ctx->op_active) {
     return;
+  }
+
+  /* Account for interrupt dispatch latency (a.k.a. context switching
+   * in the microFI paper). The expected delay (in cycles) is what we
+   * told esp_timer to wait; anything beyond that is overhead added by
+   * the timer scheduler + interrupt entry sequence. */
+  if (ctx->overhead_enabled && ctx->arm_cycles != 0u) {
+    uint32_t observed = isr_entry_cycle - ctx->arm_cycles;
+    if (observed > ctx->arm_delay_cycles) {
+      ctx->overhead.isr_entry_cycles += (observed - ctx->arm_delay_cycles);
+      ctx->overhead.isr_entry_count  += 1u;
+    }
+    ctx->arm_cycles = 0u;
   }
 
   /* pxCurrentTCBs[0]->pxTopOfStack points to the RvExcFrame that
@@ -282,6 +301,13 @@ IRAM_ATTR void register_timer_isr(void* arg) {
     ctx->op_fault_next_idx = end;
     ctx->last_injection_status = REGISTER_FI_INJECTED;
 
+    if (ctx->overhead_enabled) {
+      const uint32_t multi_exit_cycle = fi_read_cycles();
+      ctx->overhead.isr_cycles += (uint32_t)(multi_exit_cycle - isr_entry_cycle);
+      ctx->overhead.isr_count  += 1u;
+      ctx->overhead.injections += (uint32_t)(end - start);
+    }
+
     // If more fault batches remain, re-arm the timer for the next
     // batch using the delta between delays.
     if (end < ctx->op_fault_count) {
@@ -289,6 +315,11 @@ IRAM_ATTR void register_timer_isr(void* arg) {
       uint32_t delta = (next_delay > current_delay) ? (next_delay - current_delay) : 1u;
       ctx->current_delay_us = next_delay;
       auto* timer = static_cast<esp_timer_handle_t>(ctx->timer_handle);
+      if (ctx->overhead_enabled) {
+        ctx->arm_cycles = fi_read_cycles();
+        const uint32_t hz = g_fi_cpu_freq_hz;
+        ctx->arm_delay_cycles = (hz > 0u) ? (uint32_t)((uint64_t)delta * hz / 1000000ull) : 0u;
+      }
       if (esp_timer_start_once(timer, delta) == ESP_OK) {
         ctx->timer_armed = true;
         ctx->last_injection_status = REGISTER_FI_ARMED;
@@ -362,6 +393,13 @@ IRAM_ATTR void register_timer_isr(void* arg) {
 
   ctx->last_injection_status = REGISTER_FI_INJECTED;
   ctx->timer_armed = false;
+
+  if (ctx->overhead_enabled) {
+    const uint32_t exit_cycle = fi_read_cycles();
+    ctx->overhead.isr_cycles += (uint32_t)(exit_cycle - isr_entry_cycle);
+    ctx->overhead.isr_count  += 1u;
+    ctx->overhead.injections += 1u;
+  }
 }
 
 }  // namespace
@@ -392,6 +430,10 @@ void register_fi_init(register_fi_context_t* ctx,
   ctx->timer_handle = nullptr;
   ctx->permanent_active = false;
   ctx->permanent_original_bit = false;
+  ctx->overhead_enabled = false;
+  ctx->overhead = {};
+  ctx->arm_cycles = 0u;
+  ctx->arm_delay_cycles = 0u;
 
 #ifdef REGISTER_FI_RUNTIME_CHECK
   g_regcheck = {};
@@ -491,13 +533,66 @@ void register_fi_end_inference(register_fi_context_t* ctx) {
   ctx->permanent_original_bit = false;
 }
 
+/* Helper: arm the esp_timer and (when overhead accounting is on)
+ * snapshot `arm_cycles` + the expected delay in cycles so the ISR can
+ * later compute the context-switch portion of the per-injection cost. */
+static inline bool arm_timer_with_accounting(register_fi_context_t* ctx,
+                                             uint32_t delay_us) {
+  if (ctx->overhead_enabled) {
+    const uint32_t hz = g_fi_cpu_freq_hz;
+    ctx->arm_delay_cycles = (hz > 0u)
+        ? static_cast<uint32_t>(static_cast<uint64_t>(delay_us) * hz / 1000000ull)
+        : 0u;
+    ctx->arm_cycles = fi_read_cycles();
+  }
+  auto* timer = static_cast<esp_timer_handle_t>(ctx->timer_handle);
+  return esp_timer_start_once(timer, delay_us) == ESP_OK;
+}
+
 void register_fi_before_op(register_fi_context_t* ctx, uint32_t op_index) {
   if (ctx == nullptr || op_index >= kMaxTrackedOps) {
     return;
   }
 
+  const uint32_t before_entry_cycle = ctx->overhead_enabled ? fi_read_cycles() : 0u;
+
   if (ctx->profiling_enabled) {
     ctx->op_start_time_us[op_index] = static_cast<uint64_t>(esp_timer_get_time());
+  }
+
+  /* Body wrapped in do/while(0) so every early-exit path passes
+   * through a single accounting block below.  This keeps the overhead
+   * counter consistent across the multi-FI, permanent-fault and
+   * single-fault branches without sprinkling exit-accounting at
+   * every `return`. */
+  do {
+  /* FAST PATH — detect "no work for this op" and break out before
+   * touching any expensive state.  This is the common case during a
+   * fault-injection campaign: a single inference fires ~16 hook calls
+   * but only one of them targets the faulted operator.  Making the
+   * remaining 15 calls cheap is what brings the per-injection cost
+   * close to microFI's reported 1300 cycles. */
+  {
+    bool has_work = false;
+#ifdef MULTI_FI_MAX_COUNT
+    if (ctx->group_fault_count > 0u) {
+      has_work = true;
+    }
+#endif
+#if !defined(FI_FAULT_TRANSIENT)
+    if (ctx->permanent_active) {
+      has_work = true;
+    }
+#endif
+    if (!has_work) {
+      const int32_t fi = ctx->active_fault_index;
+      if (fi < 0 || static_cast<uint32_t>(fi) >= ctx->fault_count) {
+        break;
+      }
+      if (ctx->fault_list[fi].op_index != op_index) {
+        break;
+      }
+    }
   }
 
 #ifdef MULTI_FI_MAX_COUNT
@@ -534,7 +629,7 @@ void register_fi_before_op(register_fi_context_t* ctx, uint32_t op_index) {
 #endif
 
     if (!has_faults || ctx->timer_handle == nullptr) {
-      return;
+      break;
     }
 
     // Insertion-sort op_faults by delay (ascending) so the ISR can
@@ -561,19 +656,18 @@ void register_fi_before_op(register_fi_context_t* ctx, uint32_t op_index) {
       first_delay = ctx->min_timer_delay_us;
       if (first_delay == 0u) {
         ctx->last_injection_status = REGISTER_FI_TIMING_WINDOW_TOO_SHORT;
-        return;
+        break;
       }
     }
 
     ctx->current_delay_us = first_delay;
-    auto* timer = static_cast<esp_timer_handle_t>(ctx->timer_handle);
-    if (esp_timer_start_once(timer, first_delay) == ESP_OK) {
+    if (arm_timer_with_accounting(ctx, first_delay)) {
       ctx->timer_armed = true;
       ctx->last_injection_status = REGISTER_FI_ARMED;
     } else {
       ctx->last_injection_status = REGISTER_FI_TIMER_NOT_FIRED;
     }
-    return;
+    break;
   }
 #endif
 
@@ -582,18 +676,17 @@ void register_fi_before_op(register_fi_context_t* ctx, uint32_t op_index) {
     ctx->active_op_index = static_cast<int32_t>(op_index);
     ctx->op_active = true;
     ctx->current_delay_us = ctx->min_timer_delay_us;
-    auto* timer = static_cast<esp_timer_handle_t>(ctx->timer_handle);
-    if (esp_timer_start_once(timer, ctx->min_timer_delay_us) == ESP_OK) {
+    if (arm_timer_with_accounting(ctx, ctx->min_timer_delay_us)) {
       ctx->timer_armed = true;
       ctx->last_injection_status = REGISTER_FI_ARMED;
     }
-    return;
+    break;
   }
 #endif
 
   const register_fault_t* fault = current_fault(ctx);
   if (fault == nullptr || fault->op_index != op_index || ctx->timer_handle == nullptr) {
-    return;
+    break;
   }
 
   uint32_t delay_us = compute_delay_us(ctx, fault);
@@ -607,16 +700,22 @@ void register_fi_before_op(register_fi_context_t* ctx, uint32_t op_index) {
       ctx->current_delay_us = delay_us;
     } else {
       ctx->last_injection_status = REGISTER_FI_TIMING_WINDOW_TOO_SHORT;
-      return;
+      break;
     }
   }
 
-  auto* timer = static_cast<esp_timer_handle_t>(ctx->timer_handle);
-  if (esp_timer_start_once(timer, delay_us) == ESP_OK) {
+  if (arm_timer_with_accounting(ctx, delay_us)) {
     ctx->timer_armed = true;
     ctx->last_injection_status = REGISTER_FI_ARMED;
   } else {
     ctx->last_injection_status = REGISTER_FI_TIMER_NOT_FIRED;
+  }
+  } while (0);
+
+  if (ctx->overhead_enabled) {
+    const uint32_t exit_cycle = fi_read_cycles();
+    ctx->overhead.before_op_cycles += static_cast<uint32_t>(exit_cycle - before_entry_cycle);
+    ctx->overhead.before_op_count  += 1u;
   }
 }
 
@@ -624,6 +723,8 @@ void register_fi_after_op(register_fi_context_t* ctx, uint32_t op_index) {
   if (ctx == nullptr || op_index >= kMaxTrackedOps) {
     return;
   }
+
+  const uint32_t after_entry_cycle = ctx->overhead_enabled ? fi_read_cycles() : 0u;
 
   if (ctx->profiling_enabled) {
     const uint64_t start_us = ctx->op_start_time_us[op_index];
@@ -637,46 +738,54 @@ void register_fi_after_op(register_fi_context_t* ctx, uint32_t op_index) {
     }
   }
 
-  if (ctx->active_op_index != static_cast<int32_t>(op_index)) {
-    return;
-  }
+  do {
+    if (ctx->active_op_index != static_cast<int32_t>(op_index)) {
+      break;
+    }
 
 #if !defined(FI_FAULT_TRANSIENT)
-  if (ctx->permanent_active) {
+    if (ctx->permanent_active) {
+      if (ctx->timer_handle != nullptr && ctx->timer_armed) {
+        auto* timer = static_cast<esp_timer_handle_t>(ctx->timer_handle);
+        if (esp_timer_is_active(timer)) {
+          esp_timer_stop(timer);
+        }
+        ctx->timer_armed = false;
+      }
+      ctx->op_active = false;
+      ctx->active_op_index = -1;
+#ifdef MULTI_FI_MAX_COUNT
+      ctx->op_fault_count = 0;
+      ctx->op_fault_next_idx = 0;
+#endif
+      break;
+    }
+#endif
+
     if (ctx->timer_handle != nullptr && ctx->timer_armed) {
       auto* timer = static_cast<esp_timer_handle_t>(ctx->timer_handle);
       if (esp_timer_is_active(timer)) {
         esp_timer_stop(timer);
       }
       ctx->timer_armed = false;
+      if (ctx->last_injection_status == REGISTER_FI_ARMED) {
+        ctx->last_injection_status = REGISTER_FI_TIMER_NOT_FIRED;
+      }
     }
+
     ctx->op_active = false;
     ctx->active_op_index = -1;
 #ifdef MULTI_FI_MAX_COUNT
     ctx->op_fault_count = 0;
     ctx->op_fault_next_idx = 0;
 #endif
-    return;
-  }
-#endif
+  } while (0);
 
-  if (ctx->timer_handle != nullptr && ctx->timer_armed) {
-    auto* timer = static_cast<esp_timer_handle_t>(ctx->timer_handle);
-    if (esp_timer_is_active(timer)) {
-      esp_timer_stop(timer);
-    }
-    ctx->timer_armed = false;
-    if (ctx->last_injection_status == REGISTER_FI_ARMED) {
-      ctx->last_injection_status = REGISTER_FI_TIMER_NOT_FIRED;
-    }
+  if (ctx->overhead_enabled) {
+    const uint32_t exit_cycle = fi_read_cycles();
+    ctx->overhead.after_op_cycles += static_cast<uint32_t>(exit_cycle - after_entry_cycle);
+    ctx->overhead.after_op_count  += 1u;
   }
-
-  ctx->op_active = false;
-  ctx->active_op_index = -1;
-#ifdef MULTI_FI_MAX_COUNT
-  ctx->op_fault_count = 0;
-  ctx->op_fault_next_idx = 0;
-#endif
 }
 
 uint32_t register_fi_get_mean_duration_us(const register_fi_context_t* ctx, uint32_t op_index) {
@@ -720,6 +829,28 @@ const char* register_fi_register_name(uint8_t register_id) {
     return "invalid";
   }
   return kRegisterDescriptors[register_id].name;
+}
+
+void register_fi_set_overhead_enabled(register_fi_context_t* ctx, bool enabled) {
+  if (ctx != nullptr) {
+    ctx->overhead_enabled = enabled;
+  }
+}
+
+void register_fi_reset_overhead(register_fi_context_t* ctx) {
+  if (ctx != nullptr) {
+    ctx->overhead = {};
+    ctx->arm_cycles = 0u;
+    ctx->arm_delay_cycles = 0u;
+  }
+}
+
+void register_fi_get_overhead(const register_fi_context_t* ctx,
+                              register_fi_overhead_t* out) {
+  if (ctx == nullptr || out == nullptr) {
+    return;
+  }
+  *out = ctx->overhead;
 }
 
 #ifdef REGISTER_FI_RUNTIME_CHECK

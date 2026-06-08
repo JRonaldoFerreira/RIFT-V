@@ -23,6 +23,19 @@ typedef struct {
 } memory_fault_t;
 #endif
 
+/* Memory-FI overhead accumulators — see register_fi.h for the matching
+ * register-campaign struct.  Memory injections are synchronous (bit
+ * flip happens directly inside `memory_fi_before_op`), so the
+ * accounting is simpler than the register path: there is no ISR
+ * dispatch latency and no separate timer cost. */
+typedef struct {
+  uint64_t before_op_cycles;
+  uint32_t before_op_count;
+  uint64_t after_op_cycles;
+  uint32_t after_op_count;
+  uint32_t injections;
+} memory_fi_overhead_t;
+
 typedef struct {
   uint8_t* model_base;
   const memory_fault_t* fault_list;
@@ -31,6 +44,9 @@ typedef struct {
   bool injected_this_inference;
   uint8_t saved_original_byte;
   bool injection_active;
+
+  bool overhead_enabled;
+  memory_fi_overhead_t overhead;
 
 #ifdef MULTI_FI_MAX_COUNT
   const memory_fault_t* group_faults[MULTI_FI_MAX_COUNT];
@@ -51,6 +67,11 @@ const memory_fault_t* memory_fi_current_fault(const memory_fi_context_t* ctx);
 
 void memory_fi_before_op(memory_fi_context_t* ctx, uint32_t op_index);
 void memory_fi_after_op(memory_fi_context_t* ctx, uint32_t op_index);
+
+void memory_fi_set_overhead_enabled(memory_fi_context_t* ctx, bool enabled);
+void memory_fi_reset_overhead(memory_fi_context_t* ctx);
+void memory_fi_get_overhead(const memory_fi_context_t* ctx,
+                            memory_fi_overhead_t* out);
 
 static inline uint8_t* memory_fi_resolve_addr(
     const memory_fi_context_t* ctx,

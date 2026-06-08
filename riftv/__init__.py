@@ -24,6 +24,14 @@ from riftv.analysis import (
     find_critical_regions,
     byte_level_vulnerability,
 )
+from riftv.overhead import (
+    OverheadCalibration,
+    OverheadReport,
+    OverheadSummary,
+    load_overhead_report,
+    MICROFI_CYCLES_PER_INJECTION,
+    MICROFI_US_PER_INJECTION,
+)
 
 __all__ = [
     "ExperimentConfig",
@@ -46,4 +54,11 @@ __all__ = [
     "semantic_vs_physical",
     "find_critical_regions",
     "byte_level_vulnerability",
+    # Overhead accounting (microFI-comparable)
+    "OverheadCalibration",
+    "OverheadReport",
+    "OverheadSummary",
+    "load_overhead_report",
+    "MICROFI_CYCLES_PER_INJECTION",
+    "MICROFI_US_PER_INJECTION",
 ]
