@@ -46,11 +46,8 @@ typedef struct {
   const memory_fault_t* fault_list;
   uint32_t fault_count;
   volatile int32_t active_fault_index;
-  const memory_fault_t* active_fault;
+  const memory_fault_t* active_fault_ptr;
   uint32_t active_target_op;
-  uint8_t* active_addr;
-  uint8_t active_mask;
-  bool active_is_wildcard;
   bool injected_this_inference;
   uint8_t saved_original_byte;
   bool injection_active;

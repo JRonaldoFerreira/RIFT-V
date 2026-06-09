@@ -32,8 +32,8 @@ static uint32_t memory_fi_build_active_op_mask(const memory_fi_context_t* ctx) {
   }
 
   uint32_t op_mask = kMicrofiNoOpsMask;
-  if (ctx->active_fault != nullptr) {
-    op_mask = memory_fi_mask_for_op(ctx->active_target_op);
+  if (ctx->active_fault_ptr != nullptr) {
+    op_mask = memory_fi_mask_for_op(ctx->active_fault_ptr->op_index);
   }
 
 #ifdef MULTI_FI_MAX_COUNT
@@ -86,11 +86,8 @@ void memory_fi_init(memory_fi_context_t* ctx,
   ctx->fault_list = fault_list;
   ctx->fault_count = fault_count;
   ctx->active_fault_index = -1;
-  ctx->active_fault = nullptr;
-  ctx->active_target_op = FI_OP_INDEX_WILDCARD;
-  ctx->active_addr = nullptr;
-  ctx->active_mask = 0u;
-  ctx->active_is_wildcard = false;
+  ctx->active_fault_ptr = nullptr;
+  ctx->active_target_op = UINT32_MAX;
   ctx->injected_this_inference = false;
   ctx->saved_original_byte = 0u;
   ctx->injection_active = false;
@@ -120,19 +117,12 @@ void memory_fi_begin_inference(memory_fi_context_t* ctx, int32_t fault_index) {
     return;
   }
   ctx->active_fault_index = fault_index;
-  ctx->active_fault = nullptr;
-  ctx->active_target_op = FI_OP_INDEX_WILDCARD;
-  ctx->active_addr = nullptr;
-  ctx->active_mask = 0u;
-  ctx->active_is_wildcard = false;
+  ctx->active_fault_ptr = nullptr;
+  ctx->active_target_op = UINT32_MAX;
   if (fault_index >= 0 &&
       static_cast<uint32_t>(fault_index) < ctx->fault_count) {
-    const memory_fault_t* f = &ctx->fault_list[fault_index];
-    ctx->active_fault = f;
-    ctx->active_target_op = f->op_index;
-    ctx->active_addr = memory_fi_resolve_addr(ctx, f);
-    ctx->active_mask = static_cast<uint8_t>(1u << f->bit_index);
-    ctx->active_is_wildcard = (f->op_index == FI_OP_INDEX_WILDCARD);
+    ctx->active_fault_ptr = &ctx->fault_list[fault_index];
+    ctx->active_target_op = ctx->active_fault_ptr->op_index;
   }
 
   ctx->injected_this_inference = false;
@@ -146,8 +136,10 @@ void memory_fi_end_inference(memory_fi_context_t* ctx) {
     return;
   }
 
-  if (ctx->injection_active && ctx->active_addr != nullptr) {
-    *ctx->active_addr = ctx->saved_original_byte;
+  if (ctx->injection_active && ctx->active_fault_ptr != nullptr) {
+    const memory_fault_t* fault = ctx->active_fault_ptr;
+    uint8_t* addr = memory_fi_resolve_addr(ctx, fault);
+    *addr = ctx->saved_original_byte;
   }
 
 #ifdef MULTI_FI_MAX_COUNT
@@ -161,11 +153,8 @@ void memory_fi_end_inference(memory_fi_context_t* ctx) {
 #endif
 
   ctx->active_fault_index = -1;
-  ctx->active_fault = nullptr;
-  ctx->active_target_op = FI_OP_INDEX_WILDCARD;
-  ctx->active_addr = nullptr;
-  ctx->active_mask = 0u;
-  ctx->active_is_wildcard = false;
+  ctx->active_fault_ptr = nullptr;
+  ctx->active_target_op = UINT32_MAX;
   ctx->injected_this_inference = false;
   ctx->injection_active = false;
   memory_fi_publish_active_op_mask(ctx);
@@ -175,7 +164,7 @@ const memory_fault_t* memory_fi_current_fault(const memory_fi_context_t* ctx) {
   if (ctx == nullptr) {
     return nullptr;
   }
-  return ctx->active_fault;
+  return ctx->active_fault_ptr;
 }
 
 static inline void _force_stuck_bit(uint8_t* addr, uint8_t original_byte,
@@ -189,11 +178,12 @@ static inline void _force_stuck_bit(uint8_t* addr, uint8_t original_byte,
   }
 }
 
-/* Multi-fault stays outlined; the single-fault hot path uses cached
- * active_addr/active_mask metadata directly. */
-#ifdef MULTI_FI_MAX_COUNT
+/* Outlined memory-FI slow path — same rationale as register_fi: keep
+ * the hot wrapper's prologue minimal so the per-hook tax is dominated
+ * by the cycle reads + accumulator update, not by stacking unused
+ * callee-saved registers. */
 namespace {
-__attribute__((noinline)) static uint32_t memory_fi_before_op_group_slow(
+__attribute__((noinline)) static uint32_t memory_fi_before_op_slow(
     memory_fi_context_t* ctx, uint32_t op_index) {
   uint32_t injected_now = 0u;
 
@@ -232,10 +222,34 @@ __attribute__((noinline)) static uint32_t memory_fi_before_op_group_slow(
   }
 #endif
 
-  return injected_now;
+  const memory_fault_t* fault = ctx->active_fault_ptr;
+  if (fault == nullptr) {
+    return injected_now;
+  }
+
+  if (fault->op_index == FI_OP_INDEX_WILDCARD) {
+    uint8_t* addr = memory_fi_resolve_addr(ctx, fault);
+    if (!ctx->injection_active) {
+      ctx->saved_original_byte = *addr;
+      ctx->injection_active = true;
+    }
+    _force_stuck_bit(addr, ctx->saved_original_byte, fault->bit_index);
+    ctx->injected_this_inference = true;
+    return injected_now + 1u;
+  }
+
+  if (fault->op_index != op_index) {
+    return injected_now;
+  }
+
+  uint8_t* addr = memory_fi_resolve_addr(ctx, fault);
+  ctx->saved_original_byte = *addr;
+  *addr ^= static_cast<uint8_t>(1u << fault->bit_index);
+  ctx->injection_active = true;
+  ctx->injected_this_inference = true;
+  return injected_now + 1u;
 }
 }  // namespace
-#endif
 
 void memory_fi_before_op(memory_fi_context_t* ctx, uint32_t op_index) {
   if (ctx == nullptr) {
@@ -244,34 +258,27 @@ void memory_fi_before_op(memory_fi_context_t* ctx, uint32_t op_index) {
 
   const uint32_t entry_cycle = ctx->overhead_enabled ? fi_read_cycles() : 0u;
 
-  /* Single-fault hot path: use the pre-materialized address and mask. */
-  uint32_t injected_now = 0u;
+  /* FAST PATH — bail out before any expensive work when no fault is
+   * scheduled for this operator (the common case: ~15 of every 16
+   * hook calls). */
+  bool has_work = false;
 #ifdef MULTI_FI_MAX_COUNT
   if (ctx->group_fault_count > 0u) {
-    injected_now = memory_fi_before_op_group_slow(ctx, op_index);
-  } else
+    has_work = true;
+  }
 #endif
-  {
-    const memory_fault_t* fault = ctx->active_fault;
-    if (fault != nullptr && ctx->active_addr != nullptr) {
-      if (ctx->active_is_wildcard) {
-        if (!ctx->injection_active) {
-          ctx->saved_original_byte = *ctx->active_addr;
-          ctx->injection_active = true;
-        }
-        _force_stuck_bit(ctx->active_addr,
-                         ctx->saved_original_byte,
-                         fault->bit_index);
-        ctx->injected_this_inference = true;
-        injected_now = 1u;
-      } else if (ctx->active_target_op == op_index) {
-        ctx->saved_original_byte = *ctx->active_addr;
-        *ctx->active_addr ^= ctx->active_mask;
-        ctx->injection_active = true;
-        ctx->injected_this_inference = true;
-        injected_now = 1u;
-      }
+  if (!has_work) {
+    const memory_fault_t* fault = ctx->active_fault_ptr;
+    if (fault != nullptr &&
+        (ctx->active_target_op == op_index ||
+         ctx->active_target_op == FI_OP_INDEX_WILDCARD)) {
+      has_work = true;
     }
+  }
+
+  uint32_t injected_now = 0u;
+  if (has_work) {
+    injected_now = memory_fi_before_op_slow(ctx, op_index);
   }
 
   if (ctx->overhead_enabled) {
@@ -291,8 +298,22 @@ void memory_fi_after_op(memory_fi_context_t* ctx, uint32_t op_index) {
   const uint32_t entry_cycle = ctx->overhead_enabled ? fi_read_cycles() : 0u;
 
   do {
-  /* Single-fault restore uses pre-materialized metadata.  Wildcard
-   * faults keep their previous lifetime and are restored at inference end. */
+  /* FAST PATH — bail out early when nothing was injected this op.
+   * The single-fault path is keyed on `injection_active`, set by
+   * before_op only when this op matched.  The multi-fault path needs
+   * to check the group bitmap. */
+  {
+    bool has_work = false;
+#ifdef MULTI_FI_MAX_COUNT
+    if (ctx->group_fault_count > 0u) {
+      has_work = true;
+    }
+#endif
+    if (!has_work && !ctx->injection_active) {
+      break;
+    }
+  }
+
 #ifdef MULTI_FI_MAX_COUNT
     if (ctx->group_fault_count > 0) {
       for (int8_t i = static_cast<int8_t>(ctx->group_fault_count) - 1; i >= 0; --i) {
@@ -310,15 +331,16 @@ void memory_fi_after_op(memory_fi_context_t* ctx, uint32_t op_index) {
       break;
     }
 
-    if (ctx->active_fault == nullptr || ctx->active_addr == nullptr ||
-        ctx->active_is_wildcard) {
+    const memory_fault_t* fault = ctx->active_fault_ptr;
+    if (fault == nullptr) {
       break;
     }
-    if (ctx->active_target_op != op_index) {
+    if (fault->op_index != op_index) {
       break;
     }
 
-    *ctx->active_addr = ctx->saved_original_byte;
+    uint8_t* addr = memory_fi_resolve_addr(ctx, fault);
+    *addr = ctx->saved_original_byte;
     ctx->injection_active = false;
   } while (0);
 
