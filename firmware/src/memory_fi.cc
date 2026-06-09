@@ -4,7 +4,76 @@
 
 #if defined(FI_CAMPAIGN_MEMORY)
 static memory_fi_context_t* g_memory_ctx = nullptr;
+
+extern "C" {
+volatile uint32_t g_microfi_active_op_mask = 0u;
+volatile uint8_t g_microfi_profile_all_ops = 0u;
+volatile uint8_t g_microfi_count_skipped_hooks = 0u;
+volatile uint32_t g_microfi_skipped_before_op_count = 0u;
+volatile uint32_t g_microfi_skipped_after_op_count = 0u;
+}
 #endif
+
+namespace {
+
+constexpr uint32_t kMicrofiAllOpsMask = 0xFFFFFFFFu;
+constexpr uint32_t kMicrofiNoOpsMask = 0u;
+
+static inline uint32_t memory_fi_mask_for_op(uint32_t op_index) {
+  if (op_index == FI_OP_INDEX_WILDCARD || op_index >= 32u) {
+    return kMicrofiAllOpsMask;
+  }
+  return 1u << op_index;
+}
+
+static uint32_t memory_fi_build_active_op_mask(const memory_fi_context_t* ctx) {
+  if (ctx == nullptr) {
+    return kMicrofiNoOpsMask;
+  }
+
+  uint32_t op_mask = kMicrofiNoOpsMask;
+  if (ctx->active_fault_ptr != nullptr) {
+    op_mask = memory_fi_mask_for_op(ctx->active_fault_ptr->op_index);
+  }
+
+#ifdef MULTI_FI_MAX_COUNT
+  if (ctx->group_fault_count > 0u) {
+    op_mask = kMicrofiNoOpsMask;
+    for (uint8_t i = 0; i < ctx->group_fault_count; ++i) {
+      const memory_fault_t* f = ctx->group_faults[i];
+      if (f == nullptr) {
+        continue;
+      }
+      const uint32_t fault_mask = memory_fi_mask_for_op(f->op_index);
+      if (fault_mask == kMicrofiAllOpsMask) {
+        return kMicrofiAllOpsMask;
+      }
+      op_mask |= fault_mask;
+    }
+  }
+#endif
+
+  return op_mask;
+}
+
+static void memory_fi_publish_active_op_mask(const memory_fi_context_t* ctx) {
+#if defined(FI_CAMPAIGN_MEMORY)
+  g_microfi_active_op_mask = g_microfi_profile_all_ops
+      ? kMicrofiAllOpsMask
+      : memory_fi_build_active_op_mask(ctx);
+#else
+  (void)ctx;
+#endif
+}
+
+static void memory_fi_reset_callsite_counters(void) {
+#if defined(FI_CAMPAIGN_MEMORY)
+  g_microfi_skipped_before_op_count = 0u;
+  g_microfi_skipped_after_op_count = 0u;
+#endif
+}
+
+}  // namespace
 
 void memory_fi_init(memory_fi_context_t* ctx,
                     uint8_t* model_base,
@@ -17,6 +86,8 @@ void memory_fi_init(memory_fi_context_t* ctx,
   ctx->fault_list = fault_list;
   ctx->fault_count = fault_count;
   ctx->active_fault_index = -1;
+  ctx->active_fault_ptr = nullptr;
+  ctx->active_target_op = UINT32_MAX;
   ctx->injected_this_inference = false;
   ctx->saved_original_byte = 0u;
   ctx->injection_active = false;
@@ -34,7 +105,11 @@ void memory_fi_init(memory_fi_context_t* ctx,
 
 #if defined(FI_CAMPAIGN_MEMORY)
   g_memory_ctx = ctx;
+  g_microfi_profile_all_ops = 0u;
+  g_microfi_count_skipped_hooks = 0u;
 #endif
+  memory_fi_reset_callsite_counters();
+  memory_fi_publish_active_op_mask(ctx);
 }
 
 void memory_fi_begin_inference(memory_fi_context_t* ctx, int32_t fault_index) {
@@ -42,10 +117,18 @@ void memory_fi_begin_inference(memory_fi_context_t* ctx, int32_t fault_index) {
     return;
   }
   ctx->active_fault_index = fault_index;
-  
+  ctx->active_fault_ptr = nullptr;
+  ctx->active_target_op = UINT32_MAX;
+  if (fault_index >= 0 &&
+      static_cast<uint32_t>(fault_index) < ctx->fault_count) {
+    ctx->active_fault_ptr = &ctx->fault_list[fault_index];
+    ctx->active_target_op = ctx->active_fault_ptr->op_index;
+  }
+
   ctx->injected_this_inference = false;
   ctx->saved_original_byte = 0u;
   ctx->injection_active = false;
+  memory_fi_publish_active_op_mask(ctx);
 }
 
 void memory_fi_end_inference(memory_fi_context_t* ctx) {
@@ -53,9 +136,8 @@ void memory_fi_end_inference(memory_fi_context_t* ctx) {
     return;
   }
 
-  if (ctx->injection_active && ctx->active_fault_index >= 0 &&
-      static_cast<uint32_t>(ctx->active_fault_index) < ctx->fault_count) {
-    const memory_fault_t* fault = &ctx->fault_list[ctx->active_fault_index];
+  if (ctx->injection_active && ctx->active_fault_ptr != nullptr) {
+    const memory_fault_t* fault = ctx->active_fault_ptr;
     uint8_t* addr = memory_fi_resolve_addr(ctx, fault);
     *addr = ctx->saved_original_byte;
   }
@@ -71,16 +153,18 @@ void memory_fi_end_inference(memory_fi_context_t* ctx) {
 #endif
 
   ctx->active_fault_index = -1;
+  ctx->active_fault_ptr = nullptr;
+  ctx->active_target_op = UINT32_MAX;
   ctx->injected_this_inference = false;
   ctx->injection_active = false;
+  memory_fi_publish_active_op_mask(ctx);
 }
 
 const memory_fault_t* memory_fi_current_fault(const memory_fi_context_t* ctx) {
-  if (ctx == nullptr || ctx->active_fault_index < 0 ||
-      static_cast<uint32_t>(ctx->active_fault_index) >= ctx->fault_count) {
+  if (ctx == nullptr) {
     return nullptr;
   }
-  return &ctx->fault_list[ctx->active_fault_index];
+  return ctx->active_fault_ptr;
 }
 
 static inline void _force_stuck_bit(uint8_t* addr, uint8_t original_byte,
@@ -138,11 +222,10 @@ __attribute__((noinline)) static uint32_t memory_fi_before_op_slow(
   }
 #endif
 
-  if (ctx->active_fault_index < 0 ||
-      static_cast<uint32_t>(ctx->active_fault_index) >= ctx->fault_count) {
+  const memory_fault_t* fault = ctx->active_fault_ptr;
+  if (fault == nullptr) {
     return injected_now;
   }
-  const memory_fault_t* fault = &ctx->fault_list[ctx->active_fault_index];
 
   if (fault->op_index == FI_OP_INDEX_WILDCARD) {
     uint8_t* addr = memory_fi_resolve_addr(ctx, fault);
@@ -185,12 +268,11 @@ void memory_fi_before_op(memory_fi_context_t* ctx, uint32_t op_index) {
   }
 #endif
   if (!has_work) {
-    const int32_t fi = ctx->active_fault_index;
-    if (fi >= 0 && static_cast<uint32_t>(fi) < ctx->fault_count) {
-      const uint32_t target_op = ctx->fault_list[fi].op_index;
-      if (target_op == op_index || target_op == FI_OP_INDEX_WILDCARD) {
-        has_work = true;
-      }
+    const memory_fault_t* fault = ctx->active_fault_ptr;
+    if (fault != nullptr &&
+        (ctx->active_target_op == op_index ||
+         ctx->active_target_op == FI_OP_INDEX_WILDCARD)) {
+      has_work = true;
     }
   }
 
@@ -203,6 +285,7 @@ void memory_fi_before_op(memory_fi_context_t* ctx, uint32_t op_index) {
     const uint32_t exit_cycle = fi_read_cycles();
     ctx->overhead.before_op_cycles += (exit_cycle - entry_cycle);
     ctx->overhead.before_op_count  += 1u;
+    ctx->overhead.active_op_hook_count += 1u;
     ctx->overhead.injections       += injected_now;
   }
 }
@@ -248,11 +331,10 @@ void memory_fi_after_op(memory_fi_context_t* ctx, uint32_t op_index) {
       break;
     }
 
-    if (ctx->active_fault_index < 0 ||
-        static_cast<uint32_t>(ctx->active_fault_index) >= ctx->fault_count) {
+    const memory_fault_t* fault = ctx->active_fault_ptr;
+    if (fault == nullptr) {
       break;
     }
-    const memory_fault_t* fault = &ctx->fault_list[ctx->active_fault_index];
     if (fault->op_index != op_index) {
       break;
     }
@@ -269,15 +351,31 @@ void memory_fi_after_op(memory_fi_context_t* ctx, uint32_t op_index) {
   }
 }
 
+void memory_fi_set_profiling(memory_fi_context_t* ctx, bool enabled) {
+  if (ctx == nullptr) {
+    return;
+  }
+#if defined(FI_CAMPAIGN_MEMORY)
+  g_microfi_profile_all_ops = enabled ? 1u : 0u;
+#else
+  (void)enabled;
+#endif
+  memory_fi_publish_active_op_mask(ctx);
+}
+
 void memory_fi_set_overhead_enabled(memory_fi_context_t* ctx, bool enabled) {
   if (ctx != nullptr) {
     ctx->overhead_enabled = enabled;
+#if defined(FI_CAMPAIGN_MEMORY)
+    g_microfi_count_skipped_hooks = enabled ? 1u : 0u;
+#endif
   }
 }
 
 void memory_fi_reset_overhead(memory_fi_context_t* ctx) {
   if (ctx != nullptr) {
     ctx->overhead = {};
+    memory_fi_reset_callsite_counters();
   }
 }
 
@@ -287,6 +385,10 @@ void memory_fi_get_overhead(const memory_fi_context_t* ctx,
     return;
   }
   *out = ctx->overhead;
+#if defined(FI_CAMPAIGN_MEMORY)
+  out->skipped_before_op_count = g_microfi_skipped_before_op_count;
+  out->skipped_after_op_count = g_microfi_skipped_after_op_count;
+#endif
 }
 
 #ifdef MULTI_FI_MAX_COUNT
@@ -307,6 +409,7 @@ void memory_fi_set_group(memory_fi_context_t* ctx,
     ctx->group_injection_active[i] = false;
   }
   ctx->group_fault_count = n;
+  memory_fi_publish_active_op_mask(ctx);
 }
 
 void memory_fi_clear_group(memory_fi_context_t* ctx) {
@@ -314,17 +417,15 @@ void memory_fi_clear_group(memory_fi_context_t* ctx) {
     return;
   }
   ctx->group_fault_count = 0;
+  memory_fi_publish_active_op_mask(ctx);
 }
 #endif
 
 // ---- Operator hooks for memory campaign ---------------------------------
 #if defined(FI_CAMPAIGN_MEMORY)
 
-/* Call-site gating in micro_interpreter_graph.cc — memory FI does not
- * use per-op masks; keep hooks on every operator (mask all ones). */
-extern "C" volatile uint32_t g_microfi_active_op_mask = 0xFFFFFFFFu;
-extern "C" volatile uint8_t g_microfi_profile_all_ops = 0u;
-
+/* Call-site gating in micro_interpreter_graph.cc reads the active-op
+ * mask published by memory_fi_begin_inference(). */
 /* `flatten` collapses the wrapper + memory_fi_*_op into one leaf
  * function per hook, matching the register-FI optimization. */
 extern "C" __attribute__((hot, flatten)) void microfi_before_op(int op_index) {

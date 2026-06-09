@@ -84,6 +84,9 @@ class OverheadSummary:
     after_fast_count: Optional[int] = None
     timer_stop_cycles: Optional[int] = None
     timer_stop_count: Optional[int] = None
+    skipped_before_op_count: Optional[int] = None
+    skipped_after_op_count: Optional[int] = None
+    active_op_hook_count: Optional[int] = None
 
     @classmethod
     def from_event(cls, payload: Dict[str, Any]) -> "OverheadSummary":
@@ -109,6 +112,9 @@ class OverheadSummary:
             after_fast_count=_opt_int(payload.get("after_fast_count")),
             timer_stop_cycles=_opt_int(payload.get("timer_stop_cycles")),
             timer_stop_count=_opt_int(payload.get("timer_stop_count")),
+            skipped_before_op_count=_opt_int(payload.get("skipped_before_op_count")),
+            skipped_after_op_count=_opt_int(payload.get("skipped_after_op_count")),
+            active_op_hook_count=_opt_int(payload.get("active_op_hook_count")),
             total_cycles=int(payload.get("total_cycles", 0)),
             cycles_per_injection=float(payload.get("cycles_per_injection", 0.0)),
             us_per_injection=float(payload.get("us_per_injection", 0.0)),
@@ -209,6 +215,14 @@ class OverheadSummary:
         _add("  · timer arm (esp_timer_start_once)", self.timer_arm_cycles, self.timer_arm_count)
         _add("  · after_op fast (no-work hook)", self.after_fast_cycles, self.after_fast_count)
         _add("  · timer stop (esp_timer_stop)", self.timer_stop_cycles, self.timer_stop_count)
+        if self.skipped_before_op_count is not None or self.skipped_after_op_count is not None:
+            rows.append({
+                "stage": "  - call-site gated hooks (skipped)",
+                "samples": (self.skipped_before_op_count or 0) + (self.skipped_after_op_count or 0),
+                "total_cycles": 0,
+                "avg_cycles_per_call": 0.0,
+                "avg_us_per_call": 0.0,
+            })
         return rows
 
 

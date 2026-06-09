@@ -41,7 +41,7 @@ extern "C" void microfi_after_op(int op_index);
  * so 15/16 of the per-hook overhead was spent on operators that
  * carried no work.
  *
- * `g_microfi_active_op_mask` is updated by `register_fi_begin_inference`
+ * `g_microfi_active_op_mask` is updated by the active FI campaign
  * to hold one bit per operator that is a fault target for the current
  * inference.  `g_microfi_profile_all_ops` is flipped to 1 during the
  * golden phase so the per-operator timings are still collected by the
@@ -55,6 +55,27 @@ extern "C" void microfi_after_op(int op_index);
  */
 extern "C" volatile uint32_t g_microfi_active_op_mask;
 extern "C" volatile uint8_t g_microfi_profile_all_ops;
+
+#if defined(FI_CAMPAIGN_MEMORY)
+extern "C" volatile uint8_t g_microfi_count_skipped_hooks;
+extern "C" volatile uint32_t g_microfi_skipped_before_op_count;
+extern "C" volatile uint32_t g_microfi_skipped_after_op_count;
+
+static inline __attribute__((always_inline)) void microfi_count_skipped_before() {
+  if (g_microfi_count_skipped_hooks) {
+    ++g_microfi_skipped_before_op_count;
+  }
+}
+
+static inline __attribute__((always_inline)) void microfi_count_skipped_after() {
+  if (g_microfi_count_skipped_hooks) {
+    ++g_microfi_skipped_after_op_count;
+  }
+}
+#else
+#define microfi_count_skipped_before() ((void)0)
+#define microfi_count_skipped_after() ((void)0)
+#endif
 
 static inline __attribute__((always_inline)) bool microfi_should_dispatch(
     uint32_t op_index) {
@@ -345,6 +366,8 @@ TfLiteStatus MicroInterpreterGraph::InvokeSubgraph(int subgraph_idx) {
         microfi_should_dispatch(current_operator_index_);
     if (dispatch_hook) {
       microfi_before_op(static_cast<int>(current_operator_index_));
+    } else {
+      microfi_count_skipped_before();
     }
     /* MicroFI: capture SP immediately before the kernel invoke – this is
      * the tightest instrumentation point on the inference call path. */
@@ -352,6 +375,8 @@ TfLiteStatus MicroInterpreterGraph::InvokeSubgraph(int subgraph_idx) {
     invoke_status = registration->invoke(context_, node);
     if (dispatch_hook) {
       microfi_after_op(static_cast<int>(current_operator_index_));
+    } else {
+      microfi_count_skipped_after();
     }
 #ifdef USE_TFLM_COMPRESSION
     GetMicroContext(context_)->ResetDecompressionMemoryAllocations();

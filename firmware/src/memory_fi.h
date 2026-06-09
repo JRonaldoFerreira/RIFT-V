@@ -35,6 +35,9 @@ typedef struct {
   uint32_t before_op_count;
   uint32_t after_op_cycles;
   uint32_t after_op_count;
+  uint32_t skipped_before_op_count;
+  uint32_t skipped_after_op_count;
+  uint32_t active_op_hook_count;
   uint32_t injections;
 } memory_fi_overhead_t;
 
@@ -43,6 +46,8 @@ typedef struct {
   const memory_fault_t* fault_list;
   uint32_t fault_count;
   volatile int32_t active_fault_index;
+  const memory_fault_t* active_fault_ptr;
+  uint32_t active_target_op;
   bool injected_this_inference;
   uint8_t saved_original_byte;
   bool injection_active;
@@ -69,6 +74,7 @@ const memory_fault_t* memory_fi_current_fault(const memory_fi_context_t* ctx);
 
 void memory_fi_before_op(memory_fi_context_t* ctx, uint32_t op_index);
 void memory_fi_after_op(memory_fi_context_t* ctx, uint32_t op_index);
+void memory_fi_set_profiling(memory_fi_context_t* ctx, bool enabled);
 
 void memory_fi_set_overhead_enabled(memory_fi_context_t* ctx, bool enabled);
 void memory_fi_reset_overhead(memory_fi_context_t* ctx);

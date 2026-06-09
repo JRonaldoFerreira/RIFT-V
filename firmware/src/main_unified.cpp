@@ -505,6 +505,8 @@ void protocol_send_overhead_summary_memory(const memory_fi_overhead_t* o) {
       "\"cpu_freq_hz\":%lu,\"injections\":%lu,"
       "\"before_op_cycles\":%llu,\"before_op_count\":%lu,"
       "\"after_op_cycles\":%llu,\"after_op_count\":%lu,"
+      "\"skipped_before_op_count\":%lu,\"skipped_after_op_count\":%lu,"
+      "\"active_op_hook_count\":%lu,"
       "\"total_cycles\":%llu,"
       "\"cycles_per_injection\":%.2f,\"us_per_injection\":%.3f}\n",
       static_cast<unsigned long>(hz),
@@ -513,6 +515,9 @@ void protocol_send_overhead_summary_memory(const memory_fi_overhead_t* o) {
       static_cast<unsigned long>(o->before_op_count),
       static_cast<unsigned long long>(o->after_op_cycles),
       static_cast<unsigned long>(o->after_op_count),
+      static_cast<unsigned long>(o->skipped_before_op_count),
+      static_cast<unsigned long>(o->skipped_after_op_count),
+      static_cast<unsigned long>(o->active_op_hook_count),
       static_cast<unsigned long long>(total),
       total_per_inj, total_us_per_inj);
 }
@@ -760,6 +765,9 @@ extern "C" void app_main(void) {
 #if defined(FI_CAMPAIGN_REGISTER)
       register_fi_set_profiling(&g_register_fi_ctx, true);
 #endif
+#if defined(FI_CAMPAIGN_MEMORY)
+      memory_fi_set_profiling(&g_memory_fi_ctx, true);
+#endif
 
       protocol_send_progress("golden", 0, kNumCampaignImages);
       for (uint32_t image_id = 0; image_id < kNumCampaignImages; ++image_id) {
@@ -795,6 +803,7 @@ extern "C" void app_main(void) {
       register_fi_reset_overhead(&g_register_fi_ctx);
 #endif
 #if defined(FI_CAMPAIGN_MEMORY)
+      memory_fi_set_profiling(&g_memory_fi_ctx, false);
       memory_fi_reset_overhead(&g_memory_fi_ctx);
 #endif
 
