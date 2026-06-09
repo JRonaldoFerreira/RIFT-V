@@ -1,0 +1,314 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+% The preceding line is only needed to identify funding in the first footnote. If that is unneeded, please comment it out.
+%Template version as of 6/27/2024
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}   % Para \includegraphics e \resizebox
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}   % Para \toprule, \midrule, \bottomrule
+\usepackage{siunitx}
+\sisetup{output-decimal-marker = {,}, group-separator = {\,}, group-minimum-digits=4}
+\usepackage{multirow}   % Para mesclar linhas com \multirow
+\usepackage[caption=false,font=footnotesize]{subfig}
+
+% --- AJUSTES DE TEXTO ---
+\usepackage{hyphenat}
+\hyphenation{Res-Net}
+\sloppy
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+\begin{document}
+\title{RIFT-V: A High-Level Framework for Statistical Fault Injection in TinyML on RISC-V Microcontrollers{\footnotesize \textsuperscript{*}}%
+\thanks{This project was supported by the Ministry of Science, Technology and Innovations, with resources from Law No. 8,248 of October 23, 1991, under the PPI-SOFTEX program, coordinated by Softex, and published as 'Residência em TIC 37' (DOU 01245.001849/2024-76).}
+}
+
+% Author block hidden for double-blind review.
+% \author{\IEEEauthorblockN{1\textsuperscript{st} José Ronaldo}
+% \IEEEauthorblockA{\textit{Laboratório de Sistemas Digitais (LSD)} \\
+% \textit{Federal Institute of Ceará, Maracanaú}\\
+% Maracanaú, Brasil \\
+% ronaldoferrreira.b@gmail.com}
+% \and
+% \IEEEauthorblockN{2\textsuperscript{nd} Otávio Alcântara de Lima}
+% \IEEEauthorblockA{\textit{Laboratório de Sistemas Digitais (LSD)} \\
+% \textit{Federal Institute of Ceará, Maracanaú}\\
+% Maracanaú, Brasil\\
+% otavio@ifce.edu.br }
+% \and
+% \IEEEauthorblockN{3\textsuperscript{rd} Nayra Sousa}
+% \IEEEauthorblockA{\textit{Laboratório de Sistemas Digitais (LSD)} \\
+% \textit{Federal Institute of Ceará, Maracanaú}\\
+% Maracanaú, Brasil\\
+% nayra.sousa07@aluno.ifce.edu.br}
+%
+% }
+\author{\IEEEauthorblockN{}
+\IEEEauthorblockA{\textit{}}
+}
+
+
+\maketitle
+
+\begin{abstract}
+    TinyML inference on resource-constrained microcontrollers has turned on-device DNN dependability into a critical concern for safety-critical and edge applications. Existing TinyML fault-injection approaches are either debug-interface-driven mechanisms that do not scale naturally to Statistical Fault Injection (SFI), or low-level runtime/on-device routines whose injectable population, sampling parameters, and campaign artifacts are not formally specified or preserved, so that SFI is not effectively performed. We present \textbf{RIFT-V}, an open-source, end-to-end Python campaign framework for TensorFlow Lite for Microcontrollers fault injection on real RISC-V microcontrollers, covering the full pipeline from declarative specification to firmware generation, automated execution, and analysis-ready classified outcomes, while elevating SFI to a \emph{first-class} campaign property. Validated on an ESP32-C6 with an INT8 LeNet-5 over MNIST, by applying formal SFI, RIFT-V cuts executed inferences by $\approx$63\% relative to the closest TinyML FI baseline for the same workload, while exposing actionable dependability information: tensor-memory faults are largely masked ($\approx$96.8\%), whereas architectural-register faults are substantially more disruptive ($\approx$52.4\% degrading rate) and frequently manifest as availability failures.
+\end{abstract}
+
+
+
+\begin{IEEEkeywords}
+TinyML, statistical fault injection, RISC-V, TensorFlow Lite for Microcontrollers, dependability, soft errors.
+\end{IEEEkeywords}
+
+% --- INTRODUÇÃO ---
+\section{Introduction}
+\label{sec:introducao}
+
+The growing deployment of TinyML inference on resource-constrained microcontrollers, including safety-critical and edge applications such as predictive maintenance, biomedical wearables, automotive sensing, and aerospace payloads, has turned the dependability of on-device deep neural networks (DNNs) into an explicit design concern. Microcontrollers running TensorFlow Lite for Microcontrollers (TFLM) are exposed to soft errors induced by single-event upsets, voltage and clock disturbances, electromagnetic interference, and aging effects, all of which may corrupt either the tensor data consumed by the network or the architectural state of the underlying CPU. Quantifying how such low-level perturbations propagate through quantized inference is therefore a prerequisite for any informed selective hardening, and Fault Injection (FI) is the most widely used experimental methodology to obtain that evidence.
+ 
+The literature organizes FI into three complementary families. \emph{Simulation-based} FI~\cite{Mahmoudetal2020,chen2018tensorfi,reagen2018ares,Huang2023MRFI,Zheng2023,agarwal_lltfi_2021,Gogebakan,Ruospo2020Pipelined,Porsia2025On} provides high controllability and scale, but abstracts away board-level effects such as I/O protocols, reset behavior, and host-observed crashes. \emph{Physical} FI~\cite{Trindade2020Assessment,Breier2018Practical,FUKUDA2022Fault,Lee2025Clock} maximizes representativeness at the cost of specialized equipment and limited campaign scalability. \emph{Platform-based} FI occupies the middle ground---executing the workload on a concrete substrate while injecting faults through mechanisms that preserve part of the real software/hardware stack---and is itself internally heterogeneous. \emph{Debug-based} variants rely on JTAG/OCD/GDB-like control to halt, modify, and resume processor state~\cite{article,Magliano2025Real}; the resulting stop--inspect--modify--resume loop incurs substantial latency, making them a poor fit for the $10^{3}$--$10^{5}$ executions required by Statistical Fault Injection (SFI)~\cite{leveugle2009statistical,ruospo2023assessing,ruospo2025iterative,Gavarini2023}. \emph{Runtime/on-device} approaches instead embed injection logic directly in the target execution stack and trigger faults during inference, as exemplified by MicroFI for TFLM memory and register faults and by the STM32 TinyML study using timer-interrupt-driven bit flips~\cite{de2025MicroFI,Karakus2024Soft}. Complementary tools---CAROL-FI, MiFIT, code-emulated upsets, and embedded DNN mitigation studies---address additional injection points and target domains, yet none simultaneously combines TFLM specificity, RISC-V/MCU orientation, and a declarative SFI campaign framework~\cite{Oliveira2017CAROL,Aponte2019MiFIT,Williams2025Evaluating,Abich2021Applying}.
+
+
+Despite this diversity, several methodological gaps persist---particularly for TFLM on RISC-V microcontrollers. The campaign layer---fault population, sampled jobs, seeds, firmware artifacts, and classified outcomes---is rarely preserved in a unified, accessible form, hindering audit and bit-for-bit reproduction. Register-level FI is commonly described via stack offsets tied to a specific compiler, ABI, and optimization level, precluding unambiguous attribution to a given architectural register and bit. Crash, hang, and timeout events---manifestations of \emph{availability} failures---are typically treated as post-hoc anomalies rather than first-class campaign outputs. Formal SFI with explicit population enumeration and documented confidence, margin, and seed parameters is also uncommon in TinyML FI on microcontrollers; without preserved sampling artifacts, reported statistical coverage remains unverifiable and non-reproducible.
+ 
+This paper introduces RIFT-V (\emph{Runtime-aware Injection of Faults in TinyML on RISC-V}), an open-source, declarative campaign framework for fault injection on TFLM workloads running on real RISC-V microcontrollers. The contributions of this work can be summarized as follows:
+\begin{itemize}
+    \item A \emph{statistically robust} SFI methodology: explicit population enumeration, documented sampling parameters (confidence, margin, seed), and a preserved artifact chain for full reproducibility.
+    \item A declarative campaign interface automating the full end-to-end pipeline, making each campaign auditable and bit-reproducible from the same configuration.
+    \item Two complementary fault models under the same workflow: operator-aware \emph{MemoryFI} (TFLM tensor bits) and architecture-aware \emph{RegisterFI} (RISC-V processor registers), with configurable transient/permanent duration and optional multi-bit groups.
+    \item Empirical validation on a real ESP32-C6 (RISC-V) with an INT8 LeNet-5 over MNIST, under a benchmark setup aligned with the closest TinyML FI baseline; statistically sized campaigns with explicit population, sample, seed, and confidence artifacts requiring substantially fewer executions than the MicroFI~\cite{de2025MicroFI} campaign sizes for the same workload.
+\end{itemize}
+ 
+The remainder of this paper is organized as follows: Section~\ref{sec:related_work} surveys related work; Section~\ref{sec:riftv_framework} describes the RIFT-V framework; Section~\ref{sec:methodology} details the experimental methodology; Section~\ref{sec:results} presents the results; and Section~\ref{sec:conclusion} concludes.
+ 
+
+\section{Related Work}
+\label{sec:related_work}
+
+\subsection{SFI and FI Background}
+\label{subsec:related_sfi}
+
+Exhaustive bit-level fault injection is infeasible in DNN/TinyML assessment; SFI~\cite{leveugle2009statistical} addresses this by sampling the fault population at a chosen confidence level and margin of error, with Ruospo et al.~\cite{ruospo2023assessing,ruospo2025iterative} adapting it to DNNs across conservative, data-aware, and iterative variants, Gavarini et al.~\cite{Gavarini2023} showing that task and metric shape the setup, and harDNNing~\cite{harDNNing2023} using statistically selected injections for selective DNN protection. At the software level, frameworks such as PyTorchFI, TensorFI, ARES, MRFI, MindFI, LLTFI, and SpikingJET emulate faults in weights, activations, and operators~\cite{Mahmoudetal2020,chen2018tensorfi,reagen2018ares,Huang2023MRFI,Zheng2023,agarwal_lltfi_2021,Gogebakan}, often combined with SFI sampling~\cite{Gavarini2023,ruospo2023assessing}; hardware-level campaigns target RTL and gate-level descriptions via a pipelined HDL injector~\cite{Ruospo2020Pipelined}, a Verilator-based RISC-V campaign~\cite{Porsia2025On}, and VHDL studies of intermittent faults~\cite{Gil2012Studying}; physical FI---via radiation~\cite{Trindade2020Assessment}, laser attacks~\cite{Breier2018Practical}, and clock glitches~\cite{FUKUDA2022Fault,Lee2025Clock}---offers higher representativeness at greater cost and lower scalability, motivating complementary platform-oriented approaches.
+
+\subsection{Fault-Injection Methodologies for DNN and TinyML Reliability}
+\label{subsec:related_fi_methodologies}
+
+\emph{Platform-based FI.}
+\emph{Platform-based} FI executes the workload on a concrete target platform and injects faults either through debug-based control, such as JTAG/OCD/GDB, or through runtime instrumentation embedded in the target firmware or execution stack. Evaluating these works along three axes---(i) scalability to large SFI campaigns, (ii) TFLM specialization on microcontrollers, and (iii) a declarative campaign interface with auditable reproducibility artifacts---reveals a consistent pattern: each existing approach addresses only a subset. JTAG/GDB-based injection~\cite{article} provides high controllability but, as noted by MicroFI~\cite{de2025MicroFI}, the halt/read/write/resume cycle over slow debug links does not scale to large TinyML campaigns. General-purpose tools---CAROL-FI~\cite{Oliveira2017CAROL} (HPC/Xeon Phi), MiFIT~\cite{Aponte2019MiFIT}, and code-emulated upset frameworks~\cite{Williams2025Evaluating} ---are neither specialized for TFLM nor packaged as declarative campaign frameworks for RISC-V microcontrollers. Embedded-ML extensions only partially close the gap: Abich et al.~\cite{Abich2021Applying} target register-allocation mitigation on Arm Cortex-M without a reusable campaign interface; Magliano et al.~\cite{Magliano2025Real} offer a mature JTAG/FreeRTOS framework with multi-bit upsets and PMU profiling, but remain intrusive and address generic real-time rather than TinyML workloads; and Karakuş et al.~\cite{Karakus2024Soft} flip bits via a Cortex-M timer ISR, delivering useful interrupt-driven TinyML reliability data, but without formalizing the injectable population, sampling parameters, or campaign artifacts as auditable SFI objects, and with a mechanism constrained by Cortex-M exception-frame semantics.
+
+MicroFI~\cite{de2025MicroFI}---the most closely related work---targets TFLM on microcontrollers via two hardware-aware mechanisms (MemoryFI and RegisterFI) with low runtime overhead, reporting large campaigns at a 90\% confidence level and establishing the key baseline for low-intrusiveness TinyML FI. Its two principal limitations motivate RIFT-V: first, it does not expose a fully auditable SFI workflow---the injectable population, sample-size derivation, margin of error, sampling seed, stratification, and generated firmware and sampled-fault artifacts are not materialized as replayable outputs; second, its RegisterFI perturbs saved CPU state at stack-resident locations rather than over named architectural registers, weakening outcome attribution (Section~\ref{subsec:registerfi_mechanism}). The differentiating contributions are the architecture-aware RegisterFI and the auditable SFI campaign layer, jointly covering all three axes for TFLM on real RISC-V microcontrollers (Section~\ref{sec:riftv_framework}, Table~\ref{tab:related_work_axes}).
+
+\begin{table}[!htbp]
+\centering
+\caption{Coverage of platform-based FI works along three axes.
+\checkmark: full; $\sim$: partial; $\times$: none.}
+\label{tab:related_work_axes}
+\scriptsize
+\renewcommand{\arraystretch}{0.88}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lccc}
+\hline
+\textbf{Work} & \textbf{(i)} & \textbf{(ii)} & \textbf{(iii)} \\
+\hline
+JTAG/GDB~\cite{article}                       & $\times$   & $\sim$     & $\times$ \\
+CAROL-FI~\cite{Oliveira2017CAROL}             & \checkmark & $\times$   & $\times$ \\
+MiFIT~\cite{Aponte2019MiFIT}                  & \checkmark & $\times$   & $\times$ \\
+Williams et al.~\cite{Williams2025Evaluating} & \checkmark & $\sim$     & $\times$ \\
+Abich et al.~\cite{Abich2021Applying}         & \checkmark & $\sim$     & $\times$ \\
+Magliano et al.~\cite{Magliano2025Real}       & \checkmark & $\times$   & $\times$ \\
+Karakuş et al.~\cite{Karakus2024Soft}         & $\times$   & $\sim$     & $\times$ \\
+MicroFI~\cite{de2025MicroFI}                  & $\sim$     & \checkmark & $\times$ \\
+\textbf{RIFT-V}                               & \checkmark & \checkmark & \checkmark \\
+\hline
+\end{tabular}
+\vspace{2pt}
+\par\noindent\parbox{\linewidth}{\raggedright\scriptsize
+\textit{(i)}~Auditable SFI: population, sampling params, campaign artifacts.\quad
+\textit{(ii)}~TFLM/TinyML on microcontrollers.\quad
+\textit{(iii)}~Declarative campaign interface.}
+\end{table}
+
+\section{RIFT-V Framework}
+\label{sec:riftv_framework}
+
+RIFT-V is an open-source, Python/YAML-driven campaign framework for fault injection on real RISC-V microcontrollers running TFLM on a FreeRTOS/ESP-IDF firmware stack; FreeRTOS task scheduling and exception-context management are a prerequisite for the architecture-aware RegisterFI mechanism (Section~\ref{subsec:registerfi_mechanism}). The user declares the campaign once (TinyML model, fault model, target operators, dataset subset, seeds, sampling parameters), and every downstream artifact---population, sampled injection list, firmware-side headers/tables, build artifacts, per-injection run logs, and classified outcomes---is regenerated deterministically from that configuration.
+
+\subsection{Campaign Workflow and Auditability}
+\label{subsec:campaign_workflow}
+
+A RIFT-V campaign is refined, in a fixed and reproducible order, into the concrete inputs required by the firmware and the host (Fig.~\ref{fig:riftv_overview}), traversing nine stages grouped into five conceptual blocks.
+
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=\columnwidth]{plataforma_geral_reduzida_2.png}
+    \caption{RIFT-V overview. The framework connects high-level campaign specification, firmware instrumentation, host orchestration, target execution, and analysis-ready artifacts.}
+    \label{fig:riftv_overview}
+\end{figure}
+
+As shown in Fig.~\ref{fig:riftv_overview}, each block has a distinct responsibility in the campaign.
+\emph{High-level campaign specification}: \emph{YAML} is the declarative entry point specifying TinyML model, fault model, target operators, dataset subset, seeds, and sampling parameters; \emph{population} materializes the explicit enumeration of all injectable bit-level fault candidates consistent with that scope (the formal object on which the campaign is defined); \emph{sampling} selects the injections to be executed, either statistically (with documented confidence, margin of error, and per-stratum seeds) or deterministically, preserving seed and sampling metadata.
+\emph{Firmware instrumentation}: \emph{headers} translates the sampled campaign into firmware-side C headers/tables; \emph{build} compiles the resulting firmware binary.
+\emph{Host orchestration}: \emph{flash} deploys the campaign-specific firmware to the board, after which the host controller drives \emph{run} over UART, sequencing each injection and collecting the per-injection response.
+\emph{Target execution}: during \emph{run}, the microcontroller executes each faulted inference under the conditions established by the firmware headers, returning outcome data to the host.
+\emph{Analysis-ready artifacts}: \emph{classify} assigns each completed run to an outcome class against the golden reference; \emph{analyze} post-processes per-injection records into aggregated, analysis-ready outputs.
+Because population, sample, seed, generated headers, per-injection logs, and classified outcomes are all preserved as explicit, auditable artifacts, any cited proportion can be traced back to the explicit fault list that produced it.
+
+\subsection{Fault Models}
+\label{subsec:fault_models}
+
+RIFT-V hosts two complementary fault models, MemoryFI and RegisterFI, under the same workflow and the same target operators, so that both can be compared under directly equivalent conditions. Each \emph{operator} (used interchangeably with DNN \emph{layer}, following TFLite/TFLM convention, e.g.\ Conv2D or Dense) is an independently executable unit of the inference graph.
+
+\textbf{MemoryFI} targets the tensor-related data used by TFLM operators during inference. The injectable population is defined at the bit level as
+\begin{equation}
+\begin{aligned}
+N_M = \{\,& \texttt{operator\_index},\; \texttt{tensor\_index}, \\
+          & \texttt{byte\_index},\; \texttt{bit\_index} \,\}.
+\end{aligned}
+\label{eq:memoryfi_population}
+\end{equation}
+A MemoryFI candidate is therefore identified by the operator context in which the tensor is accessed, the tensor identity within that operator, the byte location inside the tensor, and the bit position inside that byte. While the underlying tensor bit-flip mechanism reuses the approach introduced by MicroFI~\cite{de2025MicroFI}, the principal novelty of RIFT-V's MemoryFI lies in providing an explicit, formal definition of the memory fault population (Eq.~\eqref{eq:memoryfi_population}) and in framing every injection as part of a structured SFI campaign---something MicroFI does not formalize. As shown in Fig.~\ref{fig:memoryfi_mechanism}, the target-operator hook invokes the MemoryFI logic at the selected TFLM operator boundary; the MemoryFI hook identifies the active tensor context, resolves the target tensor buffer in RAM, and flips the selected bit in place before the operator consumes the value---materializing the fault target of Eq.~\eqref{eq:memoryfi_population}---after which execution resumes with the corrupted value, propagating the fault through the operator's computation.
+
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=0.92\columnwidth]{memoryFI_two.png}
+    \caption{MemoryFI six-step injection sequence: the target-operator hook (step~\textbf{2}) invokes the MemoryFI logic, which identifies the active tensor context (step~\textbf{3}), flips the selected bit in the RAM tensor buffer (step~\textbf{5}), and resumes execution with the corrupted tensor value (step~\textbf{6}).}
+    \label{fig:memoryfi_mechanism}
+\end{figure}
+
+\textbf{RegisterFI} targets architectural state and injection timing. The injectable population is enumerated as
+\begin{equation}
+\begin{aligned}
+N_R = \{\,& \texttt{operator},\; \texttt{time\_slot}, \\
+          & \texttt{register\_name},\; \texttt{bit} \,\}.
+\end{aligned}
+\label{eq:registerfi_population}
+\end{equation}
+A RegisterFI candidate is therefore identified by the operator context, the temporal injection slot inside that operator, the named architectural register that is perturbed, and the target bit within the register. The injection is realized via a timer ISR that exploits the FreeRTOS exception-context save window on the RISC-V task stack; the mechanism-level distinction that gives this formulation its semantic precision is detailed in Section~\ref{subsec:registerfi_mechanism}.
+
+Both fault models share a single sampling rule applied to $N_M$ and $N_R$. Sampling is \emph{stratified by operator} (\texttt{group\_by: [op\_index, op\_name]}, i.e.\ each DNN layer forms one stratum): the Finite Population Correction (FPC)~\cite{leveugle2009statistical}
+\begin{equation}
+n \;=\;
+\frac{N\,z^{2}\,p(1-p)}
+{e^{2}(N-1)+z^{2}\,p(1-p)},
+\label{eq:finite_sample}
+\end{equation}
+is computed independently per stratum of size $N$, guaranteeing that every operator is covered with margin $e$ at confidence $1{-}\alpha$ ($z$ is the corresponding normal quantile). The per-stratum instantiation is reported in Section~\ref{subsec:statistical_sampling}.
+
+Both models share two campaign-level controls. \emph{Fault duration} (\texttt{campaign.fault\_duration}, flag \texttt{FI\_FAULT\_TRANSIENT}) is \texttt{transient}---activated just before the targeted operator and cleared at its return, MicroFI~\cite{de2025MicroFI}-style---or \texttt{permanent} (default), kept across downstream operators to capture persistent upsets. \emph{Multi-bit injection} draws random groups of size \texttt{count} from the singleton population $N_M$ or $N_R$ without replacement (\texttt{num\_groups}, \texttt{seed}), reusing the same host--target protocol. Both controls preserve population, sampling, UART protocol, and classification pipeline, enabling direct comparison across regimes.
+
+
+\subsection{Architecture-Aware RegisterFI versus Stack-Based Register Targeting}
+\label{subsec:registerfi_mechanism}
+
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=0.95\columnwidth]{registerfi_stack_vs_rvexcframe_3.png}
+    \caption{RIFT-V's architecture-aware RegisterFI injection sequence, from the running TFLM operator (left) through the \texttt{RvExcFrame} on the task stack to the corrupted architectural register restored on interrupt return (right).}
+    \label{fig:registerfi_mechanism}
+\end{figure}
+
+Fig.~\ref{fig:registerfi_mechanism} summarizes the six-step injection sequence. While a TFLM operator is executing on the CPU (step~\textbf{1}), a timer interrupt fires (step~\textbf{2}) and FreeRTOS saves the full RISC-V exception context (step~\textbf{3}). The context is laid out on the task stack as an \texttt{RvExcFrame} struct, pointed to by \texttt{saved\_sp}/\texttt{pxTopOfStack}, exposing one named field per architectural register---\texttt{ra}, \texttt{a0}--\texttt{a7}, \texttt{t0}--\texttt{t6}, \texttt{s0}--\texttt{s11}, \texttt{sp}, \texttt{gp}, \texttt{tp}---(step~\textbf{4}). The injector ISR then flips the target bit in the named context field (e.g.\ \texttt{a0}), materializing the fault target of Eq.~\eqref{eq:registerfi_population} (step~\textbf{5}). On interrupt return (step~\textbf{6}), the corrupted value is restored to the corresponding architectural register in the CPU register file and propagates through the remainder of the operator's computation.
+
+Both RIFT-V's RegisterFI and MicroFI~\cite{de2025MicroFI}-style stack-based register FI exploit the same interrupt-driven save window described above; the key difference is the \emph{semantic precision} of the targeted context. In a stack-based view the experimental unit is a word/offset in a stack frame, whose meaning depends on the compiler, ABI, prologue/epilogue, optimization level, and on whether the value of interest was actually spilled at that exact moment, so an offset \texttt{saved\_sp + N} may correspond to a saved general-purpose register, a local variable, padding, a spilled temporary, or a saved return address---outcomes cannot, in general, be attributed unambiguously to a specific architectural register or bit. RIFT-V, by contrast, targets named fields in the \texttt{RvExcFrame} (steps~\textbf{4}--\textbf{5}), so the experimental unit (Eq.~\eqref{eq:registerfi_population}) is directly architectural: each outcome is attributed to a specific register/bit pair under a specific operator and timing, and the population is constructed only over registers known to participate in the targeted operators (control- and addressing-related registers such as \texttt{sp}, \texttt{gp} are treated with the additional care imposed by their architectural role, while the declared description remains in terms of named registers).
+
+\section{Experimental Methodology}
+\label{sec:methodology}
+
+\subsection{Target Platform}
+\label{subsec:target_platform}
+
+The MemoryFI and RegisterFI campaigns share a single embedded execution environment and host--target protocol, summarized in Table~\ref{tab:experimental_setup}: each fault is injected on a real Kiira-V board running TFLM/ESP-IDF/FreeRTOS, and a host-side controller orchestrates the injection over UART, pairs every faulted run with its golden counterpart, and records the outcome for the classifier of Section~\ref{subsec:fault_classification}.
+
+\begin{table}[t]
+\centering
+\caption{Experimental setup of the MemoryFI and RegisterFI campaigns.}
+\label{tab:experimental_setup}
+\scriptsize
+\renewcommand{\arraystretch}{0.88}
+\begin{tabular}{p{0.30\columnwidth}p{0.62\columnwidth}}
+\hline
+\textbf{Item} & \textbf{Configuration} \\
+\hline
+Hardware & Kiira-V (ESP32-C6, RISC-V), 160\,MHz \\
+Execution & Real MCU, UART link to host (Windows) \\
+Software stack & TFLM v1.3.5 / ESP-IDF v5.5.3 / FreeRTOS (unicore, 100\,Hz) \\
+Model / Dataset & INT8 LeNet-5 / MNIST, 100-image fixed subset \\
+Fault models & MemoryFI (tensor bit-flip); RegisterFI (register bit-flip) \\
+FI candidate tuple & MFI: (op, tensor, byte, bit); RFI: (op, slot, reg, bit) \\
+Population size & $N_M{=}499{,}312$ (MFI); $N_R{=}4{,}960$ (RFI) \\
+Injections (95\%, $e{=}5\%$) & $n_M{=}1{,}811$ (MFI); $n_R{=}1{,}390$ (RFI) \\
+Reference policy & Golden vs.\ faulted execution per image \\
+Outcome classes & See Section~\ref{subsec:fault_classification} \\
+Crash threshold / output & 1 / counts and proportions per target \\
+\hline
+\end{tabular}
+\end{table}
+
+
+
+
+\subsection{Fault Classification}
+\label{subsec:fault_classification}
+
+Inspired by the outcome taxonomy adopted in MicroFI~\cite{de2025MicroFI} and adapted to RIFT-V's host-observed availability failures, each faulted execution is classified as follows. Let $\hat{y}$ and $\hat{p}$ denote the predicted class and top-1 confidence of the faulted run, $\hat{y}_g$ and $\hat{p}_g$ the corresponding golden values, and $y$ the ground-truth label:
+\begin{itemize}
+    \item \textbf{Masked}: $\hat{y}=\hat{y}_g$ and $\hat{p}\approx\hat{p}_g$, i.e.\ the fault produces no observable deviation from the golden output.
+    \item \textbf{Good}: $\hat{y}=y$ while $\hat{y}_g\neq y$; the fault accidentally corrects a golden misclassification and is therefore not harmful.
+    \item \textbf{Acceptable}: $\hat{y}=\hat{y}_g$ but the relative confidence drop $(\hat{p}_g-\hat{p})/\hat{p}_g$ is small (below 5\%); the prediction remains usable.
+    \item \textbf{Warning}: $\hat{y}=\hat{y}_g$ with a relative confidence drop above the \emph{Acceptable} threshold, indicating a non-catastrophic but reliability-relevant degradation.
+    \item \textbf{Critical}: the predicted class is wrong ($\hat{y}\neq y$) or the inference result is severely degraded.
+    \item \textbf{Crash}: the execution does not complete correctly; this includes hardware crashes, hangs, timeouts, reset events, malformed responses, and loss of UART communication with the host. Upon the first crash observed for a given fault index, the remaining images in that fault's batch are synthesized as \textit{Crash} without further dispatch (\texttt{crash\_inference\_threshold=1}), trading marginal statistical faithfulness for execution efficiency.
+\end{itemize}
+The classifier also tags non-injection outcomes (timing-window failures, idle frames, invalid registers) so that they are excluded from the statistical analysis.
+
+\subsection{Statistical Sampling}
+\label{subsec:statistical_sampling}
+
+Building on Eq.~\eqref{eq:finite_sample} (Section~\ref{subsec:fault_models}), we instantiate the \emph{data-unaware} one-step paradigm~\cite{ruospo2023assessing} with $p=0.5$, which maximizes $p(1-p)$ and guarantees the target margin of error \emph{a priori}, removing any dependence on the unknown outcome distribution. Restricting the targets to the five injectable LeNet-5 operators yields the populations reported in Table~\ref{tab:experimental_setup} (with $N_R = 5\times 31\times 32\times 1$, Eq.~\eqref{eq:registerfi_population}). Because exhaustive injection is unfeasible at the MemoryFI scale, a stratified random sample is drawn from each population, with operator instances (one per layer) as strata so that every operator is represented in proportion to its share; with master seed \texttt{1337}, the per-operator allocations are $302, 377, 384, 383, 365$ for MemoryFI and $278$ per operator for RegisterFI. The MemoryFI and RegisterFI outcome distributions obtained under this protocol are reported in Section~\ref{sec:results}.
+
+
+
+\section{Results}
+\label{sec:results}
+
+
+
+\subsection{MemoryFI: Masking Dominates, but Bias Tensors are Disproportionately Critical}
+
+The overall MemoryFI campaign is strongly dominated by \textit{Masked} outcomes, which account for approximately 96.8\% of the $n_{M}=1{,}811$ injections, yielding a degrading rate (\textit{Acceptable}\,+\,\textit{Warning}\,+\,\textit{Critical}\,+\,\textit{Crash}) close to 3.0\%: at a global level, single-bit memory faults on tensor data are largely tolerated by the network.
+
+However, this global average hides substantial structural heterogeneity, as revealed by the per-tensor breakdown in Fig.~\ref{fig:fi_results}(a). Weight tensors are mostly masked across layers (degrading rates between 0.7\% for Conv3/Weights and 5.6\% for Conv1/Weights), but several bias tensors exhibit a disproportionately higher fraction of degrading outcomes on a per-injection basis, with Conv1/Bias reaching 28.1\% and FC2/Bias 18.6\%. The scientific implication is that vulnerability is not proportional to tensor size: bias tensors, although orders of magnitude smaller than the associated weights, can be more critical per injected fault. Consequently, selective hardening should not be driven solely by tensor footprint; it must also consider the semantic role of each tensor and its observed per-target vulnerability.
+
+
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=\columnwidth]{register_memory.png}
+    \caption{Heterogeneity of single-bit fault impact per target. (a) MemoryFI degrading rate (\textit{Acceptable}\,+\,\textit{Warning}\,+\,\textit{Critical}\,+\,\textit{Crash}) per LeNet-5 tensor: bias tensors are consistently more vulnerable than weights despite being orders of magnitude smaller, motivating tensor-aware selective hardening. (b) RegisterFI severe-outcome rate (\textit{Crash}\,+\,\textit{Critical}) per RISC-V architectural register, showing wide variation across the register file.}
+    \label{fig:fi_results}
+\end{figure}
+
+
+
+\subsection{RegisterFI: Architectural-State Faults are Substantially More Severe}
+
+The global RegisterFI campaign is substantially more severe than its MemoryFI counterpart. Out of $n_{R}=1{,}390$ injections, approximately 47.7\% are \textit{Masked}, \textit{Good} outcomes are negligible (0.0\%), \textit{Acceptable} reaches 3.2\%, \textit{Warning} 3.2\%, \textit{Critical} 7.4\%, and \textit{Crash} 38.6\%. The aggregated degrading rate (Acceptable\,+\,Warning\,+\,Critical\,+\,Crash) is approximately 52.4\%, more than an order of magnitude higher than the MemoryFI degrading rate.
+
+This severity must not be interpreted only as accuracy degradation or output-integrity loss. The large \textit{Crash} fraction shows that a significant portion of architectural-state faults produce \emph{availability} failures, as characterized by the \textit{Crash} class (Section~\ref{subsec:fault_classification}). The per-register \textit{Crash}\,+\,\textit{Critical} breakdown in Fig.~\ref{fig:fi_results}(b) reinforces this view and exposes strongly heterogeneous behavior across the RISC-V register file. Control- and addressing-related registers are the most catastrophic: faults in \texttt{sp} and \texttt{gp} collapse almost entirely into severe failures (\textit{Crash}\,+\,\textit{Critical}\,$\approx$\,100\%), and \texttt{ra} reaches 89.5\%, which is consistent with their role in stack addressing, global data addressing, and return control flow. Several temporary, argument, and saved registers (e.g., \texttt{s0}, \texttt{a2}, \texttt{s3}, \texttt{t6}, \texttt{a1}, \texttt{a4}, \texttt{s9}) also exhibit a high \textit{Crash}\,+\,\textit{Critical} fraction (52--71\%), indicating that they actively carry values used by the inference computation when the injection occurs. In contrast, registers such as \texttt{tp}, \texttt{s7}, and \texttt{s5} are almost entirely tolerated (severe-outcome rates below 5\%), reflecting either an unused architectural role during inference or a benign access pattern. This non-uniform distribution makes the per-target breakdown a more informative input for selective mitigation than a single aggregated score.
+
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We introduced RIFT-V, an open-source, declarative campaign framework that turns TFLM fault injection on real RISC-V microcontrollers into a reproducible, analysis-ready experiment with SFI as an auditable artifact. On an ESP32-C6 with an INT8 LeNet-5 over MNIST, RIFT-V reduced the MemoryFI and RegisterFI candidate spaces by $\approx$99.6\% and $\approx$72.0\%, respectively, cutting executed inferences by $\approx$15.2\% (MemoryFI) and $\approx$78.6\% (RegisterFI), or $\approx$63.0\% combined through formal SFI, relative to the LeNet-5/MNIST MicroFI~\cite{de2025MicroFI} baseline, while exposing strong per-target heterogeneity and control/addressing registers (\texttt{sp}, \texttt{gp}, \texttt{ra}) as the most catastrophic.
+
+Future work includes extending RIFT-V to additional RISC-V targets and TFLM workloads, retargeting RegisterFI to non-RISC-V microcontrollers (e.g., Arm Cortex-M), and leveraging the per-target vulnerability profiles to drive selective mitigations.
+
+\bibliographystyle{IEEEtran}
+\bibliography{refs}
+
+
+\vspace{12pt}
+\end{document}
